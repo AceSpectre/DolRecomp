@@ -11,10 +11,13 @@
 #endif
 
 typedef struct {
-    const ChunkJob* jobs;
+    const unsigned char* jobs;
+    size_t job_size;
     u32 job_count;
     u32 next_job;
     int failed;
+    ParallelJobFunction function;
+    void* user;
 #ifdef _WIN32
     CRITICAL_SECTION lock;
 #else
@@ -41,11 +44,15 @@ int emit_chunk_file(const ChunkJob* job) {
     return 1;
 }
 
-int queue_init(WorkerQueue* queue, const ChunkJob* jobs, u32 job_count) {
-    queue->jobs = jobs;
+int queue_init(WorkerQueue* queue, const void* jobs, size_t job_size,
+               u32 job_count, ParallelJobFunction function, void* user) {
+    queue->jobs = (const unsigned char*)jobs;
+    queue->job_size = job_size;
     queue->job_count = job_count;
     queue->next_job = 0;
     queue->failed = 0;
+    queue->function = function;
+    queue->user = user;
 #ifdef _WIN32
     InitializeCriticalSection(&queue->lock);
     return 1;
@@ -78,12 +85,12 @@ void queue_unlock(WorkerQueue* queue) {
 #endif
 }
 
-int queue_take_job(WorkerQueue* queue, const ChunkJob** job) {
+int queue_take_job(WorkerQueue* queue, const void** job) {
     int ok = 0;
 
     queue_lock(queue);
     if (!queue->failed && queue->next_job < queue->job_count) {
-        *job = &queue->jobs[queue->next_job++];
+        *job = queue->jobs + queue->job_size * queue->next_job++;
         ok = 1;
     }
     queue_unlock(queue);
@@ -103,10 +110,10 @@ DWORD WINAPI chunk_worker_main(LPVOID arg) {
 void* chunk_worker_main(void* arg) {
 #endif
     WorkerQueue* queue = (WorkerQueue*)arg;
-    const ChunkJob* job = NULL;
+    const void* job = NULL;
 
     while (queue_take_job(queue, &job)) {
-        if (!emit_chunk_file(job)) {
+        if (!queue->function(job, queue->user)) {
             queue_mark_failed(queue);
             break;
         }
@@ -119,7 +126,9 @@ void* chunk_worker_main(void* arg) {
 #endif
 }
 
-int run_chunk_jobs(const ChunkJob* jobs, u32 job_count, u32 requested_jobs) {
+int run_parallel_jobs(const void* jobs, size_t job_size, u32 job_count,
+                      u32 requested_jobs, ParallelJobFunction function,
+                      void* user) {
     if (job_count == 0)
         return 1;
 
@@ -134,14 +143,15 @@ int run_chunk_jobs(const ChunkJob* jobs, u32 job_count, u32 requested_jobs) {
 
     if (requested_jobs == 1) {
         for (u32 i = 0; i < job_count; i++) {
-            if (!emit_chunk_file(&jobs[i]))
+            const void* job = (const unsigned char*)jobs + job_size * i;
+            if (!function(job, user))
                 return 0;
         }
         return 1;
     }
 
     WorkerQueue queue;
-    if (!queue_init(&queue, jobs, job_count)) {
+    if (!queue_init(&queue, jobs, job_size, job_count, function, user)) {
         fprintf(stderr, "error: can't start worker queue\n");
         return 0;
     }
@@ -197,6 +207,16 @@ int run_chunk_jobs(const ChunkJob* jobs, u32 job_count, u32 requested_jobs) {
     return ok;
 }
 
+static int emit_chunk_job(const void* job, void* user) {
+    (void)user;
+    return emit_chunk_file((const ChunkJob*)job);
+}
+
+int run_chunk_jobs(const ChunkJob* jobs, u32 job_count, u32 requested_jobs) {
+    return run_parallel_jobs(jobs, sizeof(*jobs), job_count, requested_jobs,
+                             emit_chunk_job, NULL);
+}
+
 u32 effective_chunk_jobs(u32 job_count, u32 requested_jobs) {
     if (job_count == 0)
         return 0;
@@ -210,4 +230,3 @@ u32 effective_chunk_jobs(u32 job_count, u32 requested_jobs) {
 #endif
     return requested_jobs;
 }
-

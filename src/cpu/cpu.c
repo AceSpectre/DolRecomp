@@ -6,11 +6,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <fenv.h>
+
+PPCMemWriteJournal g_mem_write_journal = NULL;
+void* g_mem_write_journal_user = NULL;
+
+void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
+    g_mem_write_journal = fn;
+    g_mem_write_journal_user = user;
+}
 
 #if defined(_MSC_VER)
 #include <intrin.h>
+#include <xmmintrin.h>
 #else
 #include <stdatomic.h>
+#if defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 #endif
 
 bool cpu_init(CPUState* cpu) {
@@ -67,6 +80,7 @@ void cpu_reset(CPUState* cpu) {
     PPCExternalWrite external_write = cpu->external_write;
     PPCExternalRead32 external_read32 = cpu->external_read32;
     PPCExternalWrite32 external_write32 = cpu->external_write32;
+    PPCExternalPointer external_pointer = cpu->external_pointer;
     PPCInstructionFallback instruction_fallback = cpu->instruction_fallback;
     PPCHostCall host_call = cpu->host_call;
     void* external_user_data = cpu->external_user_data;
@@ -80,6 +94,7 @@ void cpu_reset(CPUState* cpu) {
     cpu->external_write = external_write;
     cpu->external_read32 = external_read32;
     cpu->external_write32 = external_write32;
+    cpu->external_pointer = external_pointer;
     cpu->instruction_fallback = instruction_fallback;
     cpu->host_call = host_call;
     cpu->external_user_data = external_user_data;
@@ -192,6 +207,8 @@ void mem_write64(CPUState* cpu, u32 addr, u64 value) {
         return;
     }
     clear_matching_reservation(cpu, addr);
+    if (g_mem_write_journal && host >= cpu->ram && host < cpu->ram + cpu->ram_size)
+        g_mem_write_journal((u32)(host - cpu->ram), 8, g_mem_write_journal_user);
     write_be64(host, value);
 }
 
@@ -219,6 +236,8 @@ void mem_write32(CPUState* cpu, u32 addr, u32 value) {
         return;
     }
     clear_matching_reservation(cpu, addr);
+    if (g_mem_write_journal && host >= cpu->ram && host < cpu->ram + cpu->ram_size)
+        g_mem_write_journal((u32)(host - cpu->ram), 4, g_mem_write_journal_user);
     write_be32(host, value);
 }
 
@@ -246,6 +265,8 @@ void mem_write16(CPUState* cpu, u32 addr, u16 value) {
         return;
     }
     clear_matching_reservation(cpu, addr);
+    if (g_mem_write_journal && host >= cpu->ram && host < cpu->ram + cpu->ram_size)
+        g_mem_write_journal((u32)(host - cpu->ram), 2, g_mem_write_journal_user);
     write_be16(host, value);
 }
 
@@ -273,6 +294,8 @@ void mem_write8(CPUState* cpu, u32 addr, u8 value) {
         return;
     }
     clear_matching_reservation(cpu, addr);
+    if (g_mem_write_journal && host >= cpu->ram && host < cpu->ram + cpu->ram_size)
+        g_mem_write_journal((u32)(host - cpu->ram), 1, g_mem_write_journal_user);
     *host = value;
 }
 
@@ -420,6 +443,12 @@ static u16 ppc_spr_storage_index(u16 spr) {
 }
 
 u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia) {
+    if ((cpu->msr & PPC_MSR_PR) && spr != 1 && spr != 8 && spr != 9 &&
+        spr != 268 && spr != 269) {
+        ppc_program_exception(cpu, PPC_PROGRAM_PRIV, cia);
+        return 0;
+    }
+
     switch (spr) {
     case 1:
         return cpu->xer;
@@ -460,6 +489,11 @@ u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia) {
 }
 
 void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
+    if ((cpu->msr & PPC_MSR_PR) && spr != 1 && spr != 8 && spr != 9) {
+        ppc_program_exception(cpu, PPC_PROGRAM_PRIV, cia);
+        return;
+    }
+
     switch (spr) {
     case 1:
         cpu->xer = value;
@@ -514,6 +548,40 @@ void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
     }
 
     ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
+}
+
+static bool wrapped_register_range_contains(u8 first, u32 count, u8 reg) {
+    for (u32 i = 0; i < count; i++)
+        if (((first + i) & 31u) == reg)
+            return true;
+    return false;
+}
+
+void ppc_lswx(CPUState* cpu, u8 rD, u8 rA, u8 rB, u32 cia) {
+    u32 count = cpu->xer & 0x7Fu;
+    u32 reg_count = (count + 3u) / 4u;
+    if (wrapped_register_range_contains(rD, reg_count, rA) ||
+        wrapped_register_range_contains(rD, reg_count, rB)) {
+        ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
+        return;
+    }
+
+    u32 ea = (rA ? cpu->gpr[rA] : 0u) + cpu->gpr[rB];
+    for (u32 n = 0; n < count; n++) {
+        u32 reg = (rD + n / 4u) & 31u;
+        if ((n & 3u) == 0)
+            cpu->gpr[reg] = 0;
+        cpu->gpr[reg] |= (u32)mem_read8(cpu, ea + n) << (24u - 8u * (n & 3u));
+    }
+}
+
+void ppc_cache_control(CPUState* cpu, u8 operation, u32 ea, u32 cia) {
+    if (operation == PPC_CACHE_DCBI && (cpu->msr & PPC_MSR_PR)) {
+        ppc_program_exception(cpu, PPC_PROGRAM_PRIV, cia);
+        return;
+    }
+    if (cpu->cache_control)
+        cpu->cache_control(cpu, operation, ea, cia);
 }
 
 static f32 f32_value(u32 bits) {
@@ -623,16 +691,16 @@ static bool psq_check_enabled(CPUState* cpu, bool indexed, u32 cia) {
     return true;
 }
 
-void ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index, bool indexed, u32 cia) {
+bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index, bool indexed, u32 cia) {
     if (!psq_check_enabled(cpu, indexed, cia))
-        return;
+        return false;
 
     u32 gqr = cpu->gqr[gqr_index & 7u];
     s32 scale = gqr_scale(gqr >> 24);
     u8 type = (u8)((gqr >> 16) & 7u);
     u32 size = psq_type_size(type);
     if (!psq_access_is_valid(cpu, type, ea, cia))
-        return;
+        return false;
 
     cpu->fpr[frD] = psq_load_value(cpu, ea, type, scale);
     if (w) {
@@ -640,29 +708,31 @@ void ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index, bool inde
     } else {
         u32 ps1_ea = ea + size;
         if (!psq_access_is_valid(cpu, type, ps1_ea, cia))
-            return;
+            return false;
         cpu->ps1[frD] = psq_load_value(cpu, ps1_ea, type, scale);
     }
+    return true;
 }
 
-void ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool indexed, u32 cia) {
+bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool indexed, u32 cia) {
     if (!psq_check_enabled(cpu, indexed, cia))
-        return;
+        return false;
 
     u32 gqr = cpu->gqr[gqr_index & 7u];
     s32 scale = gqr_scale(gqr >> 8);
     u8 type = (u8)(gqr & 7u);
     u32 size = psq_type_size(type);
     if (!psq_access_is_valid(cpu, type, ea, cia))
-        return;
+        return false;
 
     psq_store_value(cpu, ea, type, scale, cpu->fpr[frS]);
     if (!w) {
         u32 ps1_ea = ea + size;
         if (!psq_access_is_valid(cpu, type, ps1_ea, cia))
-            return;
+            return false;
         psq_store_value(cpu, ps1_ea, type, scale, cpu->ps1[frS]);
     }
+    return true;
 }
 
 void ppc_rfi(CPUState* cpu, u32 cia) {
@@ -888,6 +958,35 @@ static void set_fp_exception(CPUState* cpu, u32 bit) {
         cpu->fpscr |= 0x80000000u;
     cpu->fpscr |= bit;
     ppc_fpscr_updated(cpu);
+}
+
+void ppc_fpscr_control_updated(CPUState* cpu) {
+    static const int rounding[4] = {
+        FE_TONEAREST, FE_TOWARDZERO, FE_UPWARD, FE_DOWNWARD
+    };
+    ppc_fpscr_updated(cpu);
+    fesetround(rounding[cpu->fpscr & 3u]);
+#if defined(__x86_64__) || defined(_M_X64)
+    u32 csr = _mm_getcsr();
+    csr &= ~0x8040u;
+    if (cpu->fpscr & 4u)
+        csr |= 0x8040u;
+    _mm_setcsr(csr);
+#endif
+}
+
+void ppc_mtfsb0_op(CPUState* cpu, u8 bit) {
+    cpu->fpscr &= ~(0x80000000u >> bit);
+    ppc_fpscr_control_updated(cpu);
+}
+
+void ppc_mtfsb1_op(CPUState* cpu, u8 bit) {
+    u32 mask = 0x80000000u >> bit;
+    if (mask & 0x01F80700u)
+        set_fp_exception(cpu, mask);
+    else
+        cpu->fpscr |= mask;
+    ppc_fpscr_control_updated(cpu);
 }
 
 static bool is_snan(f64 value) {
@@ -1156,4 +1255,167 @@ bool ppc_fctiw(CPUState* cpu, f64 value, bool toward_zero, u64* output) {
     *output = 0xFFF8000000000000ull | result |
               ((result == 0 && signbit(value)) ? 0x100000000ull : 0ull);
     return true;
+}
+
+void ppc_fcmp(CPUState* cpu, u8 crfd, f64 a, f64 b, bool ordered) {
+    u32 compare;
+    if (isnan(a) || isnan(b)) {
+        compare = 1u;
+        if (is_snan(a) || is_snan(b)) {
+            set_fp_exception(cpu, 0x01000000u);
+            if (ordered && (cpu->fpscr & 0x80u) == 0)
+                set_fp_exception(cpu, 0x00080000u);
+        } else if (ordered) {
+            set_fp_exception(cpu, 0x00080000u);
+        }
+    } else if (a < b) {
+        compare = 8u;
+    } else if (a > b) {
+        compare = 4u;
+    } else {
+        compare = 2u;
+    }
+    cpu->fpscr |= compare << 12;
+    u32 shift = 4u * (7u - crfd);
+    cpu->cr = (cpu->cr & ~(0xFu << shift)) | (compare << shift);
+}
+
+static void write_single_result(CPUState* cpu, u8 d, f32 value) {
+    cpu->fpr[d] = (f64)value;
+    cpu->ps1[d] = (f64)value;
+    set_fprf(cpu, classify_f32(value));
+}
+
+void ppc_fadds(CPUState* cpu, u8 d, u8 a, u8 b) {
+    write_single_result(cpu, d, (f32)(cpu->fpr[a] + cpu->fpr[b]));
+}
+
+void ppc_fsubs(CPUState* cpu, u8 d, u8 a, u8 b) {
+    write_single_result(cpu, d, (f32)(cpu->fpr[a] - cpu->fpr[b]));
+}
+
+void ppc_fmuls(CPUState* cpu, u8 d, u8 a, u8 c) {
+    write_single_result(cpu, d, (f32)(cpu->fpr[a] * force_25_bit(cpu->fpr[c])));
+    cpu->fpscr &= ~0x00060000u;
+}
+
+void ppc_fdivs(CPUState* cpu, u8 d, u8 a, u8 b) {
+    write_single_result(cpu, d, (f32)(cpu->fpr[a] / cpu->fpr[b]));
+}
+
+void ppc_fadd(CPUState* cpu, u8 d, u8 a, u8 b) {
+    cpu->fpr[d] = cpu->fpr[a] + cpu->fpr[b];
+    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+}
+
+void ppc_fsub(CPUState* cpu, u8 d, u8 a, u8 b) {
+    cpu->fpr[d] = cpu->fpr[a] - cpu->fpr[b];
+    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+}
+
+void ppc_fmul(CPUState* cpu, u8 d, u8 a, u8 c) {
+    cpu->fpr[d] = cpu->fpr[a] * cpu->fpr[c];
+    cpu->fpscr &= ~0x00060000u;
+    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+}
+
+void ppc_fdiv(CPUState* cpu, u8 d, u8 a, u8 b) {
+    cpu->fpr[d] = cpu->fpr[a] / cpu->fpr[b];
+    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+}
+
+void ppc_frsp(CPUState* cpu, u8 d, u8 b) {
+    write_single_result(cpu, d, (f32)cpu->fpr[b]);
+}
+
+static void write_paired_result(CPUState* cpu, u8 d, f64 ps0, f64 ps1) {
+    cpu->fpr[d] = (f64)(f32)ps0;
+    cpu->ps1[d] = (f64)(f32)ps1;
+    set_fprf(cpu, classify_f32((f32)ps0));
+}
+
+void ppc_ps_add_op(CPUState* cpu, u8 d, u8 a, u8 b) {
+    write_paired_result(cpu, d, cpu->fpr[a] + cpu->fpr[b],
+                        cpu->ps1[a] + cpu->ps1[b]);
+}
+
+void ppc_ps_sub_op(CPUState* cpu, u8 d, u8 a, u8 b) {
+    write_paired_result(cpu, d, cpu->fpr[a] - cpu->fpr[b],
+                        cpu->ps1[a] - cpu->ps1[b]);
+}
+
+void ppc_ps_mul_op(CPUState* cpu, u8 d, u8 a, u8 c) {
+    write_paired_result(cpu, d, cpu->fpr[a] * force_25_bit(cpu->fpr[c]),
+                        cpu->ps1[a] * force_25_bit(cpu->ps1[c]));
+}
+
+void ppc_ps_div_op(CPUState* cpu, u8 d, u8 a, u8 b) {
+    write_paired_result(cpu, d, cpu->fpr[a] / cpu->fpr[b],
+                        cpu->ps1[a] / cpu->ps1[b]);
+}
+
+void ppc_ps_madd_op(CPUState* cpu, u8 d, u8 a, u8 c, u8 b,
+                    bool subtract, bool negative) {
+    f64 ps0 = fma(cpu->fpr[a], force_25_bit(cpu->fpr[c]),
+                  subtract ? -cpu->fpr[b] : cpu->fpr[b]);
+    f64 ps1 = fma(cpu->ps1[a], force_25_bit(cpu->ps1[c]),
+                  subtract ? -cpu->ps1[b] : cpu->ps1[b]);
+    if (negative && !isnan(ps0))
+        ps0 = -ps0;
+    if (negative && !isnan(ps1))
+        ps1 = -ps1;
+    write_paired_result(cpu, d, ps0, ps1);
+}
+
+void ppc_ps_madds0(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
+    f64 scalar = force_25_bit(cpu->fpr[c]);
+    write_paired_result(cpu, d, fma(cpu->fpr[a], scalar, cpu->fpr[b]),
+                        fma(cpu->ps1[a], scalar, cpu->ps1[b]));
+}
+
+void ppc_ps_madds1(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
+    f64 scalar = force_25_bit(cpu->ps1[c]);
+    write_paired_result(cpu, d, fma(cpu->fpr[a], scalar, cpu->fpr[b]),
+                        fma(cpu->ps1[a], scalar, cpu->ps1[b]));
+}
+
+void ppc_ps_sum0(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
+    write_paired_result(cpu, d, cpu->fpr[a] + cpu->ps1[b], cpu->ps1[c]);
+}
+
+void ppc_ps_sum1(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
+    write_paired_result(cpu, d, cpu->fpr[c], cpu->fpr[a] + cpu->ps1[b]);
+}
+
+void ppc_ps_muls0(CPUState* cpu, u8 d, u8 a, u8 c) {
+    f64 scalar = force_25_bit(cpu->fpr[c]);
+    write_paired_result(cpu, d, cpu->fpr[a] * scalar, cpu->ps1[a] * scalar);
+}
+
+void ppc_ps_muls1(CPUState* cpu, u8 d, u8 a, u8 c) {
+    f64 scalar = force_25_bit(cpu->ps1[c]);
+    write_paired_result(cpu, d, cpu->fpr[a] * scalar, cpu->ps1[a] * scalar);
+}
+
+void ppc_ps_res_op(CPUState* cpu, u8 d, u8 b) {
+    ppc_ps_res(cpu, cpu->fpr[b], cpu->ps1[b], &cpu->fpr[d], &cpu->ps1[d]);
+}
+
+void ppc_ps_rsqrte_op(CPUState* cpu, u8 d, u8 b) {
+    ppc_ps_rsqrte(cpu, cpu->fpr[b], cpu->ps1[b], &cpu->fpr[d], &cpu->ps1[d]);
+}
+
+void ppc_stwcx_op(CPUState* cpu, u8 s, u32 ea, u32 cia) {
+    if (ea & 3u) {
+        ppc_alignment_exception(cpu, ea, cia);
+        return;
+    }
+    u32 so = (cpu->xer >> 31) & 1u;
+    bool success = cpu->reserve_valid && ea == cpu->reserve_addr;
+    if (success) {
+        mem_write32(cpu, ea, cpu->gpr[s]);
+        cpu->reserve_valid = false;
+    }
+    cpu->cr = (cpu->cr & 0x0FFFFFFFu) |
+              ((success ? 2u : 0u) | so) << 28;
 }

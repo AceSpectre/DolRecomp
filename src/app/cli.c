@@ -15,6 +15,7 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -jN                            Use N worker jobs for split C output (e.g. -j14)\n");
     fprintf(stderr, "  --cpu gekko|broadway|espresso  Select CPU profile (default: broadway)\n");
+    fprintf(stderr, "  --backend c|llvm               Select generated-code backend (default: c)\n");
     fprintf(stderr, "  --gamecube                     GameCube mode (no title ID required)\n");
     fprintf(stderr, "  --rel-base <addr>              Override first virtual load address for REL codegen\n");
     fprintf(stderr, "  --map <path>                   Load optional function names from a linker MAP\n");
@@ -130,6 +131,7 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
 
     memset(opts, 0, sizeof(*opts));
     opts->cpu = DOLRECOMP_CPU_GEKKO;
+    opts->backend = DOLRECOMP_BACKEND_C;
     opts->jobs = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -148,6 +150,36 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
 
         if (strcmp(arg, "--gamecube") == 0 || strcmp(arg, "-gc") == 0) {
             opts->gamecube_mode = 1;
+            continue;
+        }
+
+        if (strcmp(arg, "--backend") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --backend needs c or llvm\n");
+                return 0;
+            }
+            arg = argv[++i];
+            if (ascii_case_equal(arg, "c"))
+                opts->backend = DOLRECOMP_BACKEND_C;
+            else if (ascii_case_equal(arg, "llvm"))
+                opts->backend = DOLRECOMP_BACKEND_LLVM;
+            else {
+                fprintf(stderr, "error: unknown backend '%s'\n", arg);
+                return 0;
+            }
+            continue;
+        }
+
+        if (strncmp(arg, "--backend=", 10) == 0) {
+            const char* name = arg + 10;
+            if (ascii_case_equal(name, "c"))
+                opts->backend = DOLRECOMP_BACKEND_C;
+            else if (ascii_case_equal(name, "llvm"))
+                opts->backend = DOLRECOMP_BACKEND_LLVM;
+            else {
+                fprintf(stderr, "error: unknown backend '%s'\n", name);
+                return 0;
+            }
             continue;
         }
 
@@ -277,6 +309,13 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
         fprintf(stderr, "error: --gamecube cannot be used with espresso\n");
         return 0;
     }
+
+#ifndef DOLRECOMP_ENABLE_LLVM
+    if (opts->backend == DOLRECOMP_BACKEND_LLVM) {
+        fprintf(stderr, "error: LLVM backend is not built; configure with -DDOLRECOMP_ENABLE_LLVM=ON\n");
+        return 0;
+    }
+#endif
 
     opts->input_path = positional[0];
 

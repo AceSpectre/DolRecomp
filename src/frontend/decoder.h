@@ -3,6 +3,10 @@
 
 #include "../common/types.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // PPC instruction decoder
 // current CPU opcode set
 
@@ -296,5 +300,9 @@ static inline bool ppc_op_uses_fpu(PPCOpcode op) {
 
 // disassemble to buf, returns buf
 char* ppc_disasm(char* buf, size_t buf_size, const PPCInst* inst);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* DOLRECOMP_DECODER_H */

@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
 
         printf("\nwriting output to: %s\n", output_path);
         if (!emit_rpx_split(&rpx, output_path, effective_cpu, opts.jobs,
-                            local_chunks_dir)) {
+                            local_chunks_dir, opts.backend)) {
             rpx_free(&rpx);
             return 1;
         }
@@ -150,7 +150,7 @@ int main(int argc, char** argv) {
         printf("REL base start: 0x%08X\n", rel_start_base);
         if (!emit_rel_directory(input_path, output_arg, title_id,
                                 titleless_mode, effective_cpu, opts.jobs,
-                                rel_start_base)) {
+                                rel_start_base, opts.backend)) {
             return 1;
         }
         return 0;
@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
 
         printf("\nwriting output to: %s\n", output_path);
         if (!emit_rel_split(&rel, output_path, effective_cpu, opts.jobs,
-                            local_chunks_dir)) {
+                            local_chunks_dir, opts.backend)) {
             rel_free(&rel);
             return 1;
         }
@@ -237,7 +237,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!emit_dol_split(&dol, output_path, effective_cpu, opts.jobs, local_chunks_dir,
-                        opts.map_path ? &symbols : NULL)) {
+                        opts.map_path ? &symbols : NULL, opts.backend)) {
         symbol_map_free(&symbols);
         dol_free(&dol);
         return 1;

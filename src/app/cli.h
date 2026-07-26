@@ -5,12 +5,18 @@
 #include "common/types.h"
 #include "backend/emitter.h"
 
+typedef enum {
+    DOLRECOMP_BACKEND_C,
+    DOLRECOMP_BACKEND_LLVM,
+} DolRecompBackend;
+
 typedef struct {
     const char* input_path;
     const char* title_id_arg;
     const char* output_arg;
     const char* map_path;
     DolRecompCPU cpu;
+    DolRecompBackend backend;
     u32 jobs;
     u32 rel_base;
     int gamecube_mode;

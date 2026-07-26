@@ -3,6 +3,7 @@ project(DolRecomp C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+option(DOLRECOMP_ENABLE_LLVM "Build the x86-64 LLVM object backend" OFF)
 
 # Portable warnings for local development and CI.
 if(MSVC)
@@ -68,6 +69,36 @@ if(ZLIB_FOUND)
     target_link_libraries(dr_frontend PUBLIC ZLIB::ZLIB)
 endif()
 
+add_library(dr_ir STATIC
+    src/ir/dolir.c
+    src/ir/dolir_builder.c
+)
+target_include_directories(dr_ir PUBLIC ${DOLRECOMP_SRC})
+target_link_libraries(dr_ir PUBLIC dr_frontend)
+
+if(DOLRECOMP_ENABLE_LLVM)
+    enable_language(CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    find_package(LLVM CONFIG REQUIRED)
+    if(LLVM_PACKAGE_VERSION VERSION_LESS 19 OR LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL 21)
+        message(FATAL_ERROR "DolRecomp LLVM backend requires LLVM 19 or 20 (found ${LLVM_PACKAGE_VERSION})")
+    endif()
+    add_library(dr_llvm STATIC src/backend/llvm/llvm_backend.cpp)
+    target_include_directories(dr_llvm PUBLIC ${DOLRECOMP_SRC})
+    target_include_directories(dr_llvm SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+    target_compile_definitions(dr_llvm PUBLIC DOLRECOMP_ENABLE_LLVM=1)
+    target_compile_definitions(dr_llvm PRIVATE ${LLVM_DEFINITIONS})
+    target_link_libraries(dr_llvm PUBLIC dr_ir)
+    if(TARGET LLVM)
+        target_link_libraries(dr_llvm PRIVATE LLVM)
+    else()
+        llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS
+            Core Support Analysis Passes Target MC native nativecodegen)
+        target_link_libraries(dr_llvm PRIVATE ${DOLRECOMP_LLVM_LIBS})
+    endif()
+endif()
+
 add_library(dr_analysis STATIC
     src/analysis/embedded_data.c
     src/analysis/smc.c
@@ -96,10 +127,19 @@ add_library(dr_app STATIC
     src/app/pipeline.c
 )
 target_include_directories(dr_app PUBLIC ${DOLRECOMP_SRC})
-target_link_libraries(dr_app PUBLIC dr_backend dr_analysis dr_frontend dr_platform)
+target_link_libraries(dr_app PUBLIC dr_backend dr_analysis dr_frontend dr_platform dr_ir)
+if(DOLRECOMP_ENABLE_LLVM)
+    target_link_libraries(dr_app PUBLIC dr_llvm)
+endif()
 
 add_executable(dolrecomp src/app/main.c)
 target_link_libraries(dolrecomp PRIVATE dr_app)
+if(DOLRECOMP_ENABLE_LLVM)
+    set_property(TARGET dolrecomp PROPERTY LINKER_LANGUAGE CXX)
+endif()
+
+add_executable(dolir_stats tools/dolir_stats.c)
+target_link_libraries(dolir_stats PRIVATE dr_ir dr_frontend dr_analysis)
 
 enable_testing()
 
@@ -162,3 +202,33 @@ add_test(NAME codegen_compile
         -DHOST_BUILD_CONFIG=$<CONFIG>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/codegen_compile.cmake
 )
+
+add_executable(test_dolir tests/test_dolir.c)
+target_link_libraries(test_dolir PRIVATE dr_ir)
+add_test(NAME dolir COMMAND test_dolir)
+
+if(DOLRECOMP_ENABLE_LLVM)
+    add_executable(test_llvm_backend tests/test_llvm_backend.cpp)
+    target_link_libraries(test_llvm_backend PRIVATE dr_llvm)
+    add_test(NAME llvm_backend COMMAND test_llvm_backend
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.o
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll)
+    set(DOLRECOMP_TEST_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.o)
+    set(DOLRECOMP_TEST_IR ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.ll)
+    add_custom_command(
+        OUTPUT ${DOLRECOMP_TEST_OBJECT} ${DOLRECOMP_TEST_IR}
+        COMMAND test_llvm_backend ${DOLRECOMP_TEST_OBJECT} ${DOLRECOMP_TEST_IR}
+        DEPENDS test_llvm_backend
+        VERBATIM
+    )
+    set_source_files_properties(${DOLRECOMP_TEST_OBJECT}
+        PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    add_executable(test_llvm_execute tests/test_llvm_execute.c ${DOLRECOMP_TEST_OBJECT})
+    target_link_libraries(test_llvm_execute PRIVATE dr_cpu)
+    add_test(NAME llvm_execute COMMAND test_llvm_execute)
+    add_executable(test_llvm_pipeline tests/test_llvm_pipeline.c)
+    target_include_directories(test_llvm_pipeline PRIVATE ${DOLRECOMP_SRC})
+    add_test(NAME llvm_pipeline COMMAND test_llvm_pipeline
+             $<TARGET_FILE:dolrecomp>
+             ${CMAKE_CURRENT_BINARY_DIR}/llvm_pipeline)
+endif()

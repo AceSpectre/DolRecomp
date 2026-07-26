@@ -790,7 +790,9 @@ PPCInst ppc_decode(u32 raw, u32 address) {
                 inst.nb = PPC_RB(raw);
             } else inst.op = PPC_OP_UNKNOWN;
             break;
-        case 598: inst.op = raw == 0x7C0004ACu ? PPC_OP_SYNC : PPC_OP_UNKNOWN; break;
+        case 598:
+            inst.op = (raw & 0xFF9FFFFFu) == 0x7C0004ACu ? PPC_OP_SYNC : PPC_OP_UNKNOWN;
+            break;
         case 599: decode_x_rt_ra_rb_norc(&inst, PPC_OP_LFDX, raw); break;
         case 631: decode_x_frt_ra_rb_update(&inst, PPC_OP_LFDUX, raw); break;
         case 595:

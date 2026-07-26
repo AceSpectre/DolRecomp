@@ -566,7 +566,6 @@ static int test_invalid_new_forms(void) {
         0x4C432203u, /* crand with reserved Rc */
         0x4C432383u, /* cror with reserved Rc */
         0x4C000420u, /* bcctr with CTR-decrementing BO */
-        0x7C2004ACu, /* sync with reserved rD */
         0x7C0106ACu, /* eieio with reserved rA */
         0x4C20012Cu, /* isync with reserved rD */
         0x84600000u, /* lwzu with rA = 0 */

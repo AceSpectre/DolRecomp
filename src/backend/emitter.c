@@ -1478,9 +1478,8 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_STWCX:
         fprintf(out, "    {\n        u32 ea = ");
         emit_xform_ea(out, inst->rA, inst->rB, false);
-        fprintf(out, ";\n        bool success = ctx->reserve_valid;\n");
-        fprintf(out, "        ctx->reserve_valid = false;\n");
-        fprintf(out, "        if (success) mem_write32(ctx, ea, ctx->gpr[%u]);\n", inst->rS);
+        fprintf(out, ";\n        bool success = ctx->reserve_valid && ea == ctx->reserve_addr;\n");
+        fprintf(out, "        if (success) { mem_write32(ctx, ea, ctx->gpr[%u]); ctx->reserve_valid = false; }\n", inst->rS);
         fprintf(out, "        ctx->cr = (ctx->cr & 0x0FFFFFFFu) | ((success ? 2u : 0u) << 28) | ((ctx->xer >> 3) & 0x10000000u);\n");
         fprintf(out, "    }\n");
         break;
