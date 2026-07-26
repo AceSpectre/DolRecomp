@@ -90,7 +90,20 @@ if(DOLRECOMP_ENABLE_LLVM)
     target_compile_definitions(dr_llvm PUBLIC DOLRECOMP_ENABLE_LLVM=1)
     target_compile_definitions(dr_llvm PRIVATE ${LLVM_DEFINITIONS})
     target_link_libraries(dr_llvm PUBLIC dr_ir)
-    if(TARGET LLVM)
+    if(MINGW)
+        find_library(DOLRECOMP_LLVM_SHARED_IMPORT
+            NAMES LLVM-${LLVM_VERSION_MAJOR} LLVM
+            HINTS ${LLVM_LIBRARY_DIRS}
+            NO_DEFAULT_PATH)
+        if(NOT DOLRECOMP_LLVM_SHARED_IMPORT OR
+           NOT DOLRECOMP_LLVM_SHARED_IMPORT MATCHES "[.]dll[.]a$")
+            message(FATAL_ERROR
+                "DolRecomp requires LLVM's shared import library on MinGW; "
+                "install the matching MSYS2 llvm-libs package")
+        endif()
+        target_link_libraries(dr_llvm PRIVATE
+            "${DOLRECOMP_LLVM_SHARED_IMPORT}")
+    elseif(TARGET LLVM)
         target_link_libraries(dr_llvm PRIVATE LLVM)
     else()
         llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS
