@@ -2,8 +2,7 @@
 // Copyright (C) 2026 ExpansionPak
 
 #include "emitter.h"
-
-#include <stdlib.h>
+#include "backend/c_cfg.h"
 
 static u32 cr_field_shift(u8 crf) {
     return 4u * (7u - (u32)crf);
@@ -308,18 +307,37 @@ static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
     return target >= func_start && target < func_end && ((target - func_start) & 3u) == 0;
 }
 
-static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target) {
+static void emit_direct_branch(FILE* out, const PPCInst* inst,
+                               bool local_target, bool direct_backedge) {
     bool local_backward = local_target && inst->branch_target <= inst->address;
 
     if (inst->lk) {
         fprintf(out, "            ctx->lr = 0x%08Xu;\n", inst->address + 4);
-        fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
-        fprintf(out, "            return;\n");
+        if (local_target) {
+            if (local_backward) {
+                fprintf(out, "            if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) {\n");
+                fprintf(out, "                ctx->pc = 0x%08Xu;\n", inst->branch_target);
+                fprintf(out, "                return;\n");
+                fprintf(out, "            }\n");
+            }
+            fprintf(out, "            goto label_%08X;\n", inst->branch_target);
+        } else {
+            fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
+            fprintf(out, "            return;\n");
+        }
         return;
     }
     if (local_backward) {
-        fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
-        fprintf(out, "            return;\n");
+        if (direct_backedge) {
+            fprintf(out, "            if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) {\n");
+            fprintf(out, "                ctx->pc = 0x%08Xu;\n", inst->branch_target);
+            fprintf(out, "                return;\n");
+            fprintf(out, "            }\n");
+            fprintf(out, "            goto label_%08X;\n", inst->branch_target);
+        } else {
+            fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
+            fprintf(out, "            return;\n");
+        }
     } else if (local_target) {
         fprintf(out, "            goto label_%08X;\n", inst->branch_target);
     } else {
@@ -329,7 +347,9 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst, bool local_target
 }
 
 static void emit_dynamic_branch(FILE* out, const PPCInst* inst,
-                                const char* target_expr) {
+                                const char* target_expr,
+                                bool route_local_returns,
+                                u32 function_address) {
     fprintf(out, "    {\n");
     fprintf(out, "        u32 target = %s;\n", target_expr);
     emit_branch_condition(out, inst->bo, inst->bi);
@@ -338,7 +358,10 @@ static void emit_dynamic_branch(FILE* out, const PPCInst* inst,
         fprintf(out, "            ctx->lr = 0x%08Xu;\n", inst->address + 4);
     }
     fprintf(out, "            ctx->pc = target;\n");
-    fprintf(out, "            return;\n");
+    if (route_local_returns)
+        fprintf(out, "            goto return_dispatch_%08X;\n", function_address);
+    else
+        fprintf(out, "            return;\n");
     fprintf(out, "        }\n");
     fprintf(out, "    }\n");
 }
@@ -401,6 +424,10 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "#endif\n"
         "#include DOLRECOMP_CPU_HEADER\n"
         "\n"
+        "#ifndef DOLRECOMP_C_LOOP_CYCLE_BUDGET\n"
+        "#define DOLRECOMP_C_LOOP_CYCLE_BUDGET 256\n"
+        "#endif\n"
+        "\n"
         "static inline u32 dolrecomp_rotl32(u32 value, u32 sh) {\n"
         "    sh &= 31u;\n"
         "    return sh ? ((value << sh) | (value >> (32u - sh))) : value;\n"
@@ -457,7 +484,9 @@ void emit_footer(FILE* out) {
 }
 
 static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
-                                        u32 func_start, u32 func_end) {
+                                        u32 func_start, u32 func_end,
+                                        bool direct_backedge,
+                                        bool route_local_returns) {
     char disasm[64];
     ppc_disasm(disasm, sizeof(disasm), inst);
     fprintf(out, "    // %08X: %s\n", inst->address, disasm);
@@ -1541,7 +1570,8 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_B:
         fprintf(out, "    {\n");
         emit_direct_branch(out, inst,
-                           branch_target_is_local(func_start, func_end, inst->branch_target));
+                           branch_target_is_local(func_start, func_end, inst->branch_target),
+                           direct_backedge);
         fprintf(out, "    }\n");
         break;
 
@@ -1550,17 +1580,19 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         emit_branch_condition(out, inst->bo, inst->bi);
         fprintf(out, "        if (ctr_ok && cr_ok) {\n");
         emit_direct_branch(out, inst,
-                           branch_target_is_local(func_start, func_end, inst->branch_target));
+                           branch_target_is_local(func_start, func_end, inst->branch_target),
+                           direct_backedge);
         fprintf(out, "        }\n");
         fprintf(out, "    }\n");
         break;
 
     case PPC_OP_BCLR:
-        emit_dynamic_branch(out, inst, "ctx->lr & ~3u");
+        emit_dynamic_branch(out, inst, "ctx->lr & ~3u",
+                            route_local_returns, func_start);
         break;
 
     case PPC_OP_BCCTR:
-        emit_dynamic_branch(out, inst, "ctx->ctr & ~3u");
+        emit_dynamic_branch(out, inst, "ctx->ctr & ~3u", false, func_start);
         break;
 
     case PPC_OP_TWI:
@@ -1772,171 +1804,93 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 }
 
 void emit_instruction(FILE* out, const PPCInst* inst) {
-    emit_instruction_with_range(out, inst, 0, (u32)-1);
+    emit_instruction_with_range(out, inst, 0, (u32)-1, false, false);
 }
 
-static bool mfspr_is_modeled(u16 spr) {
-    switch (spr) {
-    case 1: case 8: case 9: case 26: case 27:
-    case 268: case 269: case 282:
-    case 912: case 913: case 914: case 915:
-    case 916: case 917: case 918: case 919: case 920:
-        return true;
-    default:
-        return false;
+static void emit_counted_loop(FILE* out, const PPCInst* insts,
+                              const CFunctionCFG* cfg, u32 function_address,
+                              u32 function_end, u32 first, u32 last) {
+    u32 loop_address = insts[first].address;
+    u32 continuation = insts[last].address + 4u;
+
+    fprintf(out, "static void loop_%08X(CPUState* ctx) {\n", loop_address);
+    fprintf(out, "label_%08X:\n", loop_address);
+    fprintf(out, "    ctx->downcount -= %u;\n", cfg->block_cycles[first]);
+    for (u32 i = first; i <= last; ++i) {
+        if (cfg->materialize_pc[i])
+            fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
+        emit_instruction_with_range(out, &insts[i], function_address,
+                                    function_end, i == last, false);
     }
+    fprintf(out, "    ctx->pc = 0x%08Xu;\n", continuation);
+    fprintf(out, "}\n\n");
 }
 
-static bool mtspr_is_modeled(u16 spr) {
-    switch (spr) {
-    case 1: case 8: case 9: case 26: case 27: case 282:
-    case 912: case 913: case 914: case 915:
-    case 916: case 917: case 918: case 919: case 920:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool inst_routes_to_fallback(const PPCInst* inst) {
-    switch (inst->op) {
-    case PPC_OP_DCBST:
-    case PPC_OP_DCBF:
-    case PPC_OP_DCBI:
-    case PPC_OP_ICBI:
-    case PPC_OP_UNKNOWN:
-        return true;
-    case PPC_OP_MFSPR:
-        return !mfspr_is_modeled(inst->spr);
-    case PPC_OP_MTSPR:
-        return !mtspr_is_modeled(inst->spr);
-    default:
-        return false;
-    }
-}
-
-static bool inst_ends_block(const PPCInst* inst) {
-    switch (inst->op) {
-    case PPC_OP_B:
-    case PPC_OP_BC:
-    case PPC_OP_BCLR:
-    case PPC_OP_BCCTR:
-    case PPC_OP_SC:
-    case PPC_OP_RFI:
-        return true;
-    default:
-        return inst_routes_to_fallback(inst);
-    }
-}
-
-static u32 inst_cycle_cost(const PPCInst* inst) {
-    if (inst->embedded_data || inst_routes_to_fallback(inst))
-        return 0;
-
-    switch (inst->op) {
-    case PPC_OP_MULLI:
-        return 3;
-    case PPC_OP_SC:
-    case PPC_OP_RFI:
-    case PPC_OP_TW:
-        return 2;
-    case PPC_OP_LMW:
-    case PPC_OP_STMW:
-        return 11;
-    case PPC_OP_MULLW:
-    case PPC_OP_MULLWO:
-    case PPC_OP_MULHW:
-    case PPC_OP_MULHWU:
-        return 5;
-    case PPC_OP_DIVW:
-    case PPC_OP_DIVWO:
-    case PPC_OP_DIVWU:
-    case PPC_OP_DIVWUO:
-        return 40;
-    case PPC_OP_DCBZ:
-        return 5;
-    case PPC_OP_DCBTST:
-    case PPC_OP_DCBT:
-        return 2;
-    case PPC_OP_MFSR:
-    case PPC_OP_MFSRIN:
-        return 3;
-    case PPC_OP_MTSPR:
-        return 2;
-    case PPC_OP_SYNC:
-        return 3;
-    case PPC_OP_MTFSB0:
-    case PPC_OP_MTFSB1:
-    case PPC_OP_MTFSF:
-    case PPC_OP_MTFSFI:
-        return 3;
-    case PPC_OP_FDIVS:
-        return 17;
-    case PPC_OP_FDIV:
-        return 31;
-    case PPC_OP_PS_DIV:
-        return 17;
-    case PPC_OP_PS_RSQRTE:
-        return 2;
-    default:
-        return 1;
-    }
-}
-
-void emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
-    u32 i;
+bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     u32 func_end = func_addr + count * 4u;
-
-    u8* leader = (u8*)calloc(count ? count : 1u, sizeof(u8));
-    u32* block_cost = (u32*)calloc(count ? count : 1u, sizeof(u32));
-
-    if (count)
-        leader[0] = 1;
-    for (i = 0; i < count; i++) {
-        const PPCInst* inst = &insts[i];
-        if (inst->embedded_data)
-            continue;
-        if (inst_ends_block(inst) && i + 1u < count)
-            leader[i + 1u] = 1;
-        if ((inst->op == PPC_OP_B || inst->op == PPC_OP_BC) &&
-            branch_target_is_local(func_addr, func_end, inst->branch_target)) {
-            leader[(inst->branch_target - func_addr) / 4u] = 1;
-        }
+    CFunctionCFG cfg;
+    if (!c_function_cfg_build(&cfg, insts, count, func_addr)) {
+        fprintf(stderr, "error: out of memory while analyzing function %08X\n",
+                func_addr);
+        return false;
     }
-    for (i = 0; i < count; i++) {
-        u32 j;
-        if (!leader[i])
-            continue;
-        for (j = i;;) {
-            block_cost[i] += inst_cycle_cost(&insts[j]);
-            if (inst_ends_block(&insts[j]))
-                break;
-            j++;
-            if (j >= count || leader[j])
-                break;
-        }
+    bool has_local_returns = false;
+    for (u32 i = 0; i < count; ++i)
+        has_local_returns |= cfg.return_targets[i] != 0;
+
+    for (u32 i = 0; i < count; ++i) {
+        if (cfg.loop_ends[i] != UINT32_MAX)
+            emit_counted_loop(out, insts, &cfg, func_addr, func_end, i,
+                              cfg.loop_ends[i]);
     }
 
     fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
     fprintf(out, "    switch (ctx->pc) {\n");
-    for (i = 0; i < count; i++) {
+    for (u32 i = 0; i < count; i++) {
         fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
                 insts[i].address, insts[i].address);
     }
     fprintf(out, "    default: return;\n");
     fprintf(out, "    }\n");
 
-    for (i = 0; i < count; i++) {
+    for (u32 i = 0; i < count; i++) {
         fprintf(out, "label_%08X:\n", insts[i].address);
-        fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
-        if (leader[i] && block_cost[i] != 0)
-            fprintf(out, "    ctx->downcount -= %u;\n", block_cost[i]);
-        emit_instruction_with_range(out, &insts[i], func_addr, func_end);
+        if (cfg.loop_ends[i] != UINT32_MAX) {
+            u32 continuation = insts[cfg.loop_ends[i]].address + 4u;
+            fprintf(out, "    loop_%08X(ctx);\n", insts[i].address);
+            if (continuation < func_end) {
+                fprintf(out, "    if (ctx->pc == 0x%08Xu) goto label_%08X;\n",
+                        continuation, continuation);
+            }
+            fprintf(out, "    return;\n");
+            continue;
+        }
+        if (cfg.materialize_pc[i])
+            fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
+        if (cfg.leaders[i] && cfg.block_cycles[i] != 0)
+            fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[i]);
+        emit_instruction_with_range(
+            out, &insts[i], func_addr, func_end,
+            c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
+            has_local_returns);
     }
 
-    free(leader);
-    free(block_cost);
-
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", func_end);
+    if (has_local_returns) {
+        fprintf(out, "    return;\n");
+        fprintf(out, "return_dispatch_%08X:\n", func_addr);
+        fprintf(out, "    if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) return;\n");
+        fprintf(out, "    switch (ctx->pc) {\n");
+        for (u32 i = 0; i < count; ++i) {
+            if (cfg.return_targets[i]) {
+                fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
+                        insts[i].address, insts[i].address);
+            }
+        }
+        fprintf(out, "    default: return;\n");
+        fprintf(out, "    }\n");
+    }
     fprintf(out, "}\n\n");
+    c_function_cfg_destroy(&cfg);
+    return true;
 }

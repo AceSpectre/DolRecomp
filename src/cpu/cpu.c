@@ -139,7 +139,9 @@ static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
 }
 
 static void clear_matching_reservation(CPUState* cpu, u32 addr) {
-    if (cpu->reserve_valid && ((cpu->reserve_addr ^ addr) & ~31u) == 0)
+    const u32 reserve_addr = cpu->reserve_addr & ~0x40000000u;
+    const u32 store_addr = addr & ~0x40000000u;
+    if (cpu->reserve_valid && ((reserve_addr ^ store_addr) & ~31u) == 0)
         cpu->reserve_valid = false;
 }
 

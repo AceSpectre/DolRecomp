@@ -84,7 +84,13 @@ if(DOLRECOMP_ENABLE_LLVM)
     if(LLVM_PACKAGE_VERSION VERSION_LESS 19 OR LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL 21)
         message(FATAL_ERROR "DolRecomp LLVM backend requires LLVM 19 or 20 (found ${LLVM_PACKAGE_VERSION})")
     endif()
-    add_library(dr_llvm STATIC src/backend/llvm/llvm_backend.cpp)
+    add_library(dr_llvm STATIC
+        src/backend/llvm/llvm_backend.cpp
+        src/backend/llvm/llvm_control_flow.cpp
+        src/backend/llvm/llvm_function_emitter.cpp
+        src/backend/llvm/llvm_memory_lowering.cpp
+        src/backend/llvm/llvm_runtime_lowering.cpp
+    )
     target_include_directories(dr_llvm PUBLIC ${DOLRECOMP_SRC})
     target_include_directories(dr_llvm SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
     target_compile_definitions(dr_llvm PUBLIC DOLRECOMP_ENABLE_LLVM=1)
@@ -121,6 +127,7 @@ target_include_directories(dr_analysis PUBLIC ${DOLRECOMP_SRC})
 target_link_libraries(dr_analysis PUBLIC dr_frontend)
 
 add_library(dr_backend STATIC
+    src/backend/c_cfg.c
     src/backend/emitter.c
     src/backend/dispatch.c
     src/backend/codegen.c
@@ -196,6 +203,10 @@ add_executable(test_dispatch tests/test_dispatch.c)
 target_link_libraries(test_dispatch PRIVATE dr_backend)
 add_test(NAME dispatch COMMAND test_dispatch)
 
+add_executable(test_c_cfg tests/test_c_cfg.c)
+target_link_libraries(test_c_cfg PRIVATE dr_backend)
+add_test(NAME c_cfg COMMAND test_c_cfg)
+
 add_executable(test_symbols tests/test_symbols.c)
 target_link_libraries(test_symbols PRIVATE dr_backend)
 add_test(NAME symbols COMMAND test_symbols
@@ -215,6 +226,20 @@ add_test(NAME codegen_compile
         -DHOST_BUILD_CONFIG=$<CONFIG>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/codegen_compile.cmake
 )
+
+set(DOLRECOMP_C_TEST_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/c_execute_generated.c)
+add_custom_command(
+    OUTPUT ${DOLRECOMP_C_TEST_SOURCE}
+    COMMAND test_codegen_emit ${DOLRECOMP_C_TEST_SOURCE}
+    DEPENDS test_codegen_emit
+    VERBATIM
+)
+add_executable(test_c_execute
+    tests/test_c_execute.c
+    ${DOLRECOMP_C_TEST_SOURCE}
+)
+target_link_libraries(test_c_execute PRIVATE dr_cpu)
+add_test(NAME c_execute COMMAND test_c_execute)
 
 add_executable(test_dolir tests/test_dolir.c)
 target_link_libraries(test_dolir PRIVATE dr_ir)

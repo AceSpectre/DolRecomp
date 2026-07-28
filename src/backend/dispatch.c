@@ -100,6 +100,11 @@ static void emit_lookup_run(FILE* out, const FunctionList* funcs,
 void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point) {
     fprintf(out, "\n#define DOLRECOMP_ENTRY_POINT 0x%08Xu\n", entry_point);
     fprintf(out, "\ntypedef void (*DolRecompFunction)(CPUState* ctx);\n");
+    fprintf(out, "\n#if defined(__GNUC__) || defined(__clang__)\n");
+    fprintf(out, "#define DOLRECOMP_UNUSED __attribute__((unused))\n");
+    fprintf(out, "#else\n");
+    fprintf(out, "#define DOLRECOMP_UNUSED\n");
+    fprintf(out, "#endif\n");
     fprintf(out, "\n#if defined(DOLRECOMP_ENABLE_REPLACEMENTS)\n");
     fprintf(out, "int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address);\n");
     fprintf(out, "#else\n");
@@ -145,7 +150,7 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     fprintf(out, "    }\n");
     fprintf(out, "    return 0;\n");
     fprintf(out, "}\n");
-    fprintf(out, "\nstatic inline int dolrecomp_run_blocks(CPUState* ctx, u32 max_blocks) {\n");
+    fprintf(out, "\nstatic inline DOLRECOMP_UNUSED int dolrecomp_run_blocks(CPUState* ctx, u32 max_blocks) {\n");
     fprintf(out, "    u32 blocks = 0;\n");
     fprintf(out, "    while (max_blocks == 0u || blocks < max_blocks) {\n");
     fprintf(out, "        if (!dolrecomp_call(ctx, ctx->pc)) return 0;\n");
@@ -154,4 +159,5 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     fprintf(out, "    }\n");
     fprintf(out, "    return 1;\n");
     fprintf(out, "}\n");
+    fprintf(out, "\n#undef DOLRECOMP_UNUSED\n");
 }

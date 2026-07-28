@@ -30,6 +30,26 @@
 #include <process.h>
 #endif
 
+#define DOLC_DEFAULT_CHUNK_INSTRUCTIONS 4096u
+
+static u32 c_chunk_instructions(void) {
+    const char* configured = getenv("DOLRECOMP_C_CHUNK_INSTRUCTIONS");
+    if (!configured || !configured[0])
+        return DOLC_DEFAULT_CHUNK_INSTRUCTIONS;
+
+    char* end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(configured, &end, 10);
+    if (errno || !end || *end || value < 128u || value > 4096u) {
+        fprintf(stderr,
+                "warning: DOLRECOMP_C_CHUNK_INSTRUCTIONS must be 128..4096; "
+                "using %u\n",
+                DOLC_DEFAULT_CHUNK_INSTRUCTIONS);
+        return DOLC_DEFAULT_CHUNK_INSTRUCTIONS;
+    }
+    return (u32)value;
+}
+
 #ifdef DOLRECOMP_ENABLE_LLVM
 #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 1024u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
@@ -849,6 +869,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
     fprintf(header, "\n// Function entry points\n");
 
     u32 file_count = 0;
+    const u32 chunk_instructions = c_chunk_instructions();
     FunctionList funcs = {0};
     SMCAnalysis smc = {0};
 
@@ -919,7 +940,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
         }
 
         u32 section_job_count =
-            (num_insts + EMIT_CHUNK_INSTRUCTIONS - 1u) / EMIT_CHUNK_INSTRUCTIONS;
+            (num_insts + chunk_instructions - 1u) / chunk_instructions;
         ChunkJob* chunk_jobs = (ChunkJob*)calloc(section_job_count, sizeof(ChunkJob));
         if (!chunk_jobs) {
             fprintf(stderr, "error: out of memory\n");
@@ -931,14 +952,14 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             return 0;
         }
 
-        for (u32 start = 0; start < num_insts; start += EMIT_CHUNK_INSTRUCTIONS) {
+        for (u32 start = 0; start < num_insts; start += chunk_instructions) {
             u32 chunk_count = num_insts - start;
             u32 func_addr = base_addr + start * 4u;
             char chunk_name[128];
-            u32 job_index = start / EMIT_CHUNK_INSTRUCTIONS;
+            u32 job_index = start / chunk_instructions;
 
-            if (chunk_count > EMIT_CHUNK_INSTRUCTIONS)
-                chunk_count = EMIT_CHUNK_INSTRUCTIONS;
+            if (chunk_count > chunk_instructions)
+                chunk_count = chunk_instructions;
 
             if (snprintf(chunk_name, sizeof(chunk_name),
                          "chunk_%04u_%s%u_%08X.c", file_count,

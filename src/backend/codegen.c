@@ -34,7 +34,11 @@ int emit_chunk_file(const ChunkJob* job) {
 
     fprintf(chunk, "// DolRecomp output\n");
     fprintf(chunk, "#include \"../%s\"\n\n", job->include_name);
-    emit_function(chunk, job->insts, job->count, job->func_addr);
+    if (!emit_function(chunk, job->insts, job->count, job->func_addr)) {
+        fclose(chunk);
+        remove(job->path);
+        return 0;
+    }
 
     if (fclose(chunk) != 0) {
         fprintf(stderr, "error: failed writing '%s'\n", job->path);

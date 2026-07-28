@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -57,6 +58,7 @@ int main(int argc, char** argv) {
     pid_t child = fork();
     CHECK(child >= 0);
     if (child == 0) {
+        setenv("DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS", "512", 1);
         execl(argv[1], argv[1], "--gamecube", "--backend=llvm", "-j2", dol,
               output, NULL);
         _exit(127);
