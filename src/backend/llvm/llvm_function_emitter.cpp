@@ -336,6 +336,10 @@ void FunctionEmitter::emitEntry() {
       builder_.CreateAlloca(Type::getInt64Ty(context_), nullptr, "cycles");
   builder_.CreateStore(ConstantInt::get(Type::getInt64Ty(context_), 0),
                        cycles_);
+  guard_steps_ =
+      builder_.CreateAlloca(Type::getInt64Ty(context_), nullptr, "guard_steps");
+  builder_.CreateStore(ConstantInt::get(Type::getInt64Ty(context_), 0),
+                       guard_steps_);
   Value *pc = loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, pc));
   BasicBlock *bad = BasicBlock::Create(context_, "entry_miss", function_);
   auto *dispatch = builder_.CreateSwitch(pc, bad, source_.block_count);
@@ -379,8 +383,18 @@ void FunctionEmitter::sideExit(u32 pc) {
 
 void FunctionEmitter::emitBudgetGuard(u32 pc) {
   Value *cycles = builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
-  Value *exhausted = builder_.CreateICmpUGE(
+  Value *over_cycles = builder_.CreateICmpUGE(
       cycles, ConstantInt::get(Type::getInt64Ty(context_), 256));
+  // Blocks are emitted one per guest instruction, so this bounds a single native
+  // entry to a few thousand guest instructions even when every iteration crosses
+  // a call and clears cycles_.
+  Value *steps = builder_.CreateLoad(Type::getInt64Ty(context_), guard_steps_);
+  Value *next_steps = builder_.CreateAdd(
+      steps, ConstantInt::get(Type::getInt64Ty(context_), 1));
+  builder_.CreateStore(next_steps, guard_steps_);
+  Value *over_steps = builder_.CreateICmpUGE(
+      next_steps, ConstantInt::get(Type::getInt64Ty(context_), 2048));
+  Value *exhausted = builder_.CreateOr(over_cycles, over_steps);
   BasicBlock *run = BasicBlock::Create(context_, "budget_run", function_);
   BasicBlock *exit = BasicBlock::Create(context_, "budget_exit", function_);
   builder_.CreateCondBr(exhausted, exit, run);

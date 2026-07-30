@@ -111,6 +111,13 @@ private:
   llvm::Argument *ctx_ = nullptr;
   llvm::BasicBlock *entry_ = nullptr;
   llvm::AllocaInst *cycles_ = nullptr;
+  // Blocks entered since the dispatcher handed control to this function.
+  // Nothing resets it, unlike cycles_, which every call and helper resume point
+  // clears. That clearing is correct for charging -- materialize() has already
+  // flushed those cycles into downcount -- but it also means a loop containing a
+  // call can never reach the cycle threshold, so this counter is what actually
+  // guarantees the dispatcher gets control back.
+  llvm::AllocaInst *guard_steps_ = nullptr;
   std::array<llvm::AllocaInst *, DOLIR_STATE_COUNT> state_{};
   std::array<bool, DOLIR_STATE_COUNT> used_{};
   std::array<bool, DOLIR_STATE_COUNT> dirty_{};
