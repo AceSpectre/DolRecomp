@@ -156,6 +156,13 @@ add_executable(dolrecomp src/app/main.c)
 target_link_libraries(dolrecomp PRIVATE dr_app)
 if(DOLRECOMP_ENABLE_LLVM)
     set_property(TARGET dolrecomp PROPERTY LINKER_LANGUAGE CXX)
+    # LLVM's IR builders and pass pipeline recurse deeply enough to exhaust
+    # MSVC's default 1 MiB stack while emitting a large DOL, which aborts the
+    # run with STATUS_STACK_OVERFLOW (0xC00000FD) rather than a diagnostic.
+    # Other toolchains default to 8 MiB, so only MSVC needs raising.
+    if(MSVC)
+        target_link_options(dolrecomp PRIVATE /STACK:8388608)
+    endif()
 endif()
 
 add_executable(dolir_stats tools/dolir_stats.c)
