@@ -133,7 +133,14 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
     passBuilder.crossRegisterProxies(lam, fam, cgam, mam);
     llvm::ModulePassManager passes;
     std::string pipeline =
-        "function(mem2reg,early-cse<memssa>,instcombine,simplifycfg,sccp,"
+        // instcombine's fixpoint check is a self-diagnostic for the pass, not a
+        // correctness property of the IR. Recompiled Gekko functions contain
+        // long straight-line integer and condition-flag sequences that can still
+        // be changing after one iteration, which makes the pass call
+        // report_fatal_error and take the whole recompilation down. Suppressing
+        // the check leaves the optimization itself intact.
+        "function(mem2reg,early-cse<memssa>,instcombine<no-verify-fixpoint>,"
+        "simplifycfg,sccp,"
         "correlated-propagation,jump-threading,gvn,dse,adce,loop-simplify,"
         "loop-rotate,loop-mssa(licm),loop-vectorize,slp-vectorizer,vector-"
         "combine,"
