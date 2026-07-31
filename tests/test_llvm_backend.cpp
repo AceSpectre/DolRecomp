@@ -115,7 +115,14 @@ int main(int argc, char** argv) {
     unsigned char magic[4]{};
     CHECK(std::fread(magic, 1, sizeof(magic), object) == sizeof(magic));
     std::fclose(object);
+    // The object format follows the default target triple, so this cannot assume
+    // ELF: a Windows host emits COFF, whose x86-64 objects begin with the machine
+    // type IMAGE_FILE_MACHINE_AMD64 (0x8664) stored little-endian.
+#if defined(_WIN32)
+    CHECK(magic[0] == 0x64 && magic[1] == 0x86);
+#else
     CHECK(magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F');
+#endif
     std::ifstream ir(argv[2]);
     const std::string irText((std::istreambuf_iterator<char>(ir)),
                              std::istreambuf_iterator<char>());
