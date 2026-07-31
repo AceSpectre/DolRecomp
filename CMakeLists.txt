@@ -5,6 +5,14 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(DOLRECOMP_ENABLE_LLVM "Build the x86-64 LLVM object backend" OFF)
 
+# The prebuilt LLVM Windows release libraries are compiled against the static
+# CRT (/MT); match it here or the exe link fails with unresolved __imp__* CRT
+# symbols (fseek, ftell, _ftelli64, _mkdir, system). Scoped to this subproject
+# only.
+if(MSVC AND DOLRECOMP_ENABLE_LLVM)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 # Portable warnings for local development and CI.
 if(MSVC)
     add_compile_options(/W3)
@@ -188,6 +196,13 @@ add_test(NAME rel COMMAND test_rel)
 
 add_executable(test_rpx tests/test_rpx.c)
 target_link_libraries(test_rpx PRIVATE dr_frontend)
+if(MSVC AND DOLRECOMP_ENABLE_LLVM AND NOT CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    # An embedding project can supply a zlib built against the DLL CRT even
+    # when DolRecomp's LLVM-linked tools require /MT. This test pulls zlib's
+    # aligned-allocation path into the final executable, so match the parent.
+    set_property(TARGET test_rpx PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
 add_test(NAME rpx COMMAND test_rpx)
 
 add_executable(test_disc_extract tests/test_disc_extract.c)
