@@ -320,6 +320,16 @@ void ppc_take_exception(CPUState* cpu, u32 exception, u32 vector, u32 srr0, u32 
     cpu->pc = exception_vector_address(cpu->msr, vector);
 }
 
+void ppc_external_interrupt_exception(CPUState* cpu) {
+    ppc_take_exception(cpu, PPC_EXC_EXTERNAL_INTERRUPT,
+                       PPC_VECTOR_EXTERNAL_INTERRUPT, cpu->pc, 0);
+}
+
+void ppc_decrementer_exception(CPUState* cpu) {
+    ppc_take_exception(cpu, PPC_EXC_DECREMENTER,
+                       PPC_VECTOR_DECREMENTER, cpu->pc, 0);
+}
+
 void ppc_program_exception(CPUState* cpu, u32 cause, u32 cia) {
     cpu->program_exception |= cause;
     ppc_take_exception(cpu, PPC_EXC_PROGRAM, PPC_VECTOR_PROGRAM, cia, cause);
@@ -746,6 +756,7 @@ void ppc_rfi(CPUState* cpu, u32 cia) {
     cpu->msr = (cpu->msr & ~PPC_MSR_RFI_MASK) | (cpu->srr1 & PPC_MSR_RFI_MASK);
     cpu->msr &= ~PPC_MSR_POW;
     cpu->pc = cpu->srr0 & ~3u;
+    cpu->rfi_count++;
 }
 
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia) {
@@ -1134,6 +1145,27 @@ static f64 force_25_bit(f64 value) {
     return f64_value(bits);
 }
 
+/* Fused multiply-add for results that are subsequently rounded to single
+ * precision. The double fma result is nudged to odd when it lands exactly on
+ * the double-rounding boundary so the final f64->f32 conversion rounds the
+ * way one direct infinite-precision->single rounding would (Gekko behavior).
+ * c must already be rounded to 25 bits. */
+static f64 fma_single(f64 a, f64 c, f64 addend) {
+    f64 result = fma(a, c, addend);
+    u64 bits = f64_bits(result);
+    if ((bits & 0x000000001FFFFFFFull) == 0x0000000010000000ull) {
+        f64 a_prime = addend - result;
+        f64 b_prime = result + a_prime;
+        f64 error = fma(a, c, a_prime) + (addend - b_prime);
+        if (error != 0.0) {
+            if ((error > 0.0) == (result > 0.0)) bits++;
+            else bits--;
+            result = f64_value(bits);
+        }
+    }
+    return result;
+}
+
 bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
              bool subtract, bool negative, f64* output) {
     f64 addend = subtract ? -b : b;
@@ -1142,20 +1174,7 @@ bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
     if (!single) {
         result = fma(a, c, addend);
     } else {
-        f64 rounded_c = force_25_bit(c);
-        result = fma(a, rounded_c, addend);
-        u64 bits = f64_bits(result);
-        if ((bits & 0x000000001FFFFFFFull) == 0x0000000010000000ull) {
-            f64 a_prime = addend - result;
-            f64 b_prime = result + a_prime;
-            f64 error = fma(a, rounded_c, a_prime) + (addend - b_prime);
-            if (error != 0.0) {
-                if ((error > 0.0) == (result > 0.0)) bits++;
-                else bits--;
-                result = f64_value(bits);
-            }
-        }
-        result = (f64)(f32)result;
+        result = (f64)(f32)fma_single(a, force_25_bit(c), addend);
     }
 
     if (isnan(result)) {
@@ -1358,10 +1377,10 @@ void ppc_ps_div_op(CPUState* cpu, u8 d, u8 a, u8 b) {
 
 void ppc_ps_madd_op(CPUState* cpu, u8 d, u8 a, u8 c, u8 b,
                     bool subtract, bool negative) {
-    f64 ps0 = fma(cpu->fpr[a], force_25_bit(cpu->fpr[c]),
-                  subtract ? -cpu->fpr[b] : cpu->fpr[b]);
-    f64 ps1 = fma(cpu->ps1[a], force_25_bit(cpu->ps1[c]),
-                  subtract ? -cpu->ps1[b] : cpu->ps1[b]);
+    f64 ps0 = fma_single(cpu->fpr[a], force_25_bit(cpu->fpr[c]),
+                         subtract ? -cpu->fpr[b] : cpu->fpr[b]);
+    f64 ps1 = fma_single(cpu->ps1[a], force_25_bit(cpu->ps1[c]),
+                         subtract ? -cpu->ps1[b] : cpu->ps1[b]);
     if (negative && !isnan(ps0))
         ps0 = -ps0;
     if (negative && !isnan(ps1))
@@ -1371,14 +1390,14 @@ void ppc_ps_madd_op(CPUState* cpu, u8 d, u8 a, u8 c, u8 b,
 
 void ppc_ps_madds0(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
     f64 scalar = force_25_bit(cpu->fpr[c]);
-    write_paired_result(cpu, d, fma(cpu->fpr[a], scalar, cpu->fpr[b]),
-                        fma(cpu->ps1[a], scalar, cpu->ps1[b]));
+    write_paired_result(cpu, d, fma_single(cpu->fpr[a], scalar, cpu->fpr[b]),
+                        fma_single(cpu->ps1[a], scalar, cpu->ps1[b]));
 }
 
 void ppc_ps_madds1(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
     f64 scalar = force_25_bit(cpu->ps1[c]);
-    write_paired_result(cpu, d, fma(cpu->fpr[a], scalar, cpu->fpr[b]),
-                        fma(cpu->ps1[a], scalar, cpu->ps1[b]));
+    write_paired_result(cpu, d, fma_single(cpu->fpr[a], scalar, cpu->fpr[b]),
+                        fma_single(cpu->ps1[a], scalar, cpu->ps1[b]));
 }
 
 void ppc_ps_sum0(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {

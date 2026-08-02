@@ -17,6 +17,8 @@
 #define PPC_EXC_SYSTEM_CALL   0x00000008u
 #define PPC_EXC_MACHINE_CHECK 0x00000010u
 #define PPC_EXC_FP_UNAVAILABLE 0x00000020u
+#define PPC_EXC_EXTERNAL_INTERRUPT 0x00000040u
+#define PPC_EXC_DECREMENTER    0x00000080u
 
 #define PPC_PROGRAM_FP        0x00100000u
 #define PPC_PROGRAM_ILLEGAL   0x00080000u
@@ -30,6 +32,8 @@
 #define PPC_VECTOR_ALIGNMENT     0x00600u
 #define PPC_VECTOR_PROGRAM       0x00700u
 #define PPC_VECTOR_FP_UNAVAILABLE 0x00800u
+#define PPC_VECTOR_EXTERNAL_INTERRUPT 0x00500u
+#define PPC_VECTOR_DECREMENTER    0x00900u
 #define PPC_VECTOR_SYSTEM_CALL   0x00C00u
 
 #define PPC_HID2_LSQE   0x80000000u
@@ -78,6 +82,7 @@ struct CPUState {
     u32 sr[16];
     u32 gqr[8];
     u32 exception;
+    u64 rfi_count;
     u32 program_exception;
     u32 tlb_last_vps;
     u32 tlb_last_index;
@@ -173,6 +178,8 @@ bool ppc_add_overflowed(u32 a, u32 b, u32 result);
 bool ppc_trap_condition(u8 to, u32 a, u32 b);
 void ppc_set_xer_ov(CPUState* cpu, bool ov);
 void ppc_take_exception(CPUState* cpu, u32 exception, u32 vector, u32 srr0, u32 srr1_info);
+void ppc_external_interrupt_exception(CPUState* cpu);
+void ppc_decrementer_exception(CPUState* cpu);
 void ppc_program_exception(CPUState* cpu, u32 cause, u32 cia);
 bool ppc_fp_available(CPUState* cpu, u32 cia);
 void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia);
