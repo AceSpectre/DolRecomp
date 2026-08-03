@@ -53,7 +53,9 @@ static u32 c_chunk_instructions(void) {
 #ifdef DOLRECOMP_ENABLE_LLVM
 #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 1024u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
-#define DOLLLVM_CACHE_VERSION "dolllvm-v4"
+// v5: the budget guard gained guard_steps_, so v4 objects yield on the wrong
+// bound and must not be reused.
+#define DOLLLVM_CACHE_VERSION "dolllvm-v5"
 
 typedef struct {
     const PPCInst* insts;
