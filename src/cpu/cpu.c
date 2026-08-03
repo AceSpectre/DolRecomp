@@ -1277,7 +1277,10 @@ void ppc_fcmp(CPUState* cpu, u8 crfd, f64 a, f64 b, bool ordered) {
     } else {
         compare = 2u;
     }
-    cpu->fpscr |= compare << 12;
+    // FPCC is the low four bits of FPRF (bits 12-15 here); bit 16 is the C
+    // class bit, which a compare leaves alone. Replace rather than OR, or a
+    // less-than followed by an equal reads back as 0xA instead of 0x2.
+    cpu->fpscr = (cpu->fpscr & ~(0xFu << 12)) | (compare << 12);
     u32 shift = 4u * (7u - crfd);
     cpu->cr = (cpu->cr & ~(0xFu << shift)) | (compare << shift);
 }
