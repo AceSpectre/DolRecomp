@@ -5,12 +5,24 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(DOLRECOMP_ENABLE_LLVM "Build the x86-64 LLVM object backend" OFF)
 
-# The prebuilt LLVM Windows release libraries are compiled against the static
-# CRT (/MT); match it here or the exe link fails with unresolved __imp__* CRT
-# symbols (fseek, ftell, _ftelli64, _mkdir, system). Scoped to this subproject
-# only.
-if(MSVC AND DOLRECOMP_ENABLE_LLVM)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# LLVM is discovered before any target exists because LLVMConfig.cmake ends with
+# an unqualified `set(CMAKE_MSVC_RUNTIME_LIBRARY ...)` naming the CRT LLVM was
+# built against — the prebuilt Windows release libraries say MultiThreaded (/MT).
+# That assignment lands in this directory scope and applies to every target
+# declared after it, so discovering LLVM in the middle of the file splits the
+# tree: the libraries above it get one CRT, everything below gets another, and
+# the shared static libraries then carry two CRTs into a single link. Matching
+# LLVM is what makes the tools link at all (otherwise the exe ends in unresolved
+# __imp__* CRT symbols: fseek, ftell, _ftelli64, _mkdir, system), so let LLVM
+# name the CRT and let it apply to all of DolRecomp uniformly.
+if(DOLRECOMP_ENABLE_LLVM)
+    enable_language(CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    find_package(LLVM CONFIG REQUIRED)
+    if(LLVM_PACKAGE_VERSION VERSION_LESS 19 OR LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL 21)
+        message(FATAL_ERROR "DolRecomp LLVM backend requires LLVM 19 or 20 (found ${LLVM_PACKAGE_VERSION})")
+    endif()
 endif()
 
 # Portable warnings for local development and CI.
@@ -85,13 +97,6 @@ target_include_directories(dr_ir PUBLIC ${DOLRECOMP_SRC})
 target_link_libraries(dr_ir PUBLIC dr_frontend)
 
 if(DOLRECOMP_ENABLE_LLVM)
-    enable_language(CXX)
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    find_package(LLVM CONFIG REQUIRED)
-    if(LLVM_PACKAGE_VERSION VERSION_LESS 19 OR LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL 21)
-        message(FATAL_ERROR "DolRecomp LLVM backend requires LLVM 19 or 20 (found ${LLVM_PACKAGE_VERSION})")
-    endif()
     add_library(dr_llvm STATIC
         src/backend/llvm/llvm_backend.cpp
         src/backend/llvm/llvm_control_flow.cpp
@@ -196,13 +201,6 @@ add_test(NAME rel COMMAND test_rel)
 
 add_executable(test_rpx tests/test_rpx.c)
 target_link_libraries(test_rpx PRIVATE dr_frontend)
-if(MSVC AND DOLRECOMP_ENABLE_LLVM AND NOT CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
-    # An embedding project can supply a zlib built against the DLL CRT even
-    # when DolRecomp's LLVM-linked tools require /MT. This test pulls zlib's
-    # aligned-allocation path into the final executable, so match the parent.
-    set_property(TARGET test_rpx PROPERTY
-        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-endif()
 add_test(NAME rpx COMMAND test_rpx)
 
 add_executable(test_disc_extract tests/test_disc_extract.c)
