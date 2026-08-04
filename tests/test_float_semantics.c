@@ -93,10 +93,16 @@ int main(void) {
            diff_single, trials, 100.0 * (double)diff_single / (double)trials);
     printf("                 : C full f64   %u/%u differ (%.1f%%)\n",
            diff_double, trials, 100.0 * (double)diff_double / (double)trials);
+    // Pinned, not merely "> 0". The LCG is fixed and every operation here is
+    // IEEE-defined, so these counts are exact and reproducible. Asserting only
+    // non-zero would let the truncation break badly -- 12,545 collapsing to 3 --
+    // and still pass, which is most of the value of measuring it at all.
     CHECK(diff_single == 0,
-          "a single-representable C operand should survive truncation intact");
-    CHECK(diff_double > 0,
-          "a full-mantissa C operand should diverge from the inline form");
+          "a single-representable C operand should survive truncation intact, "
+          "got %u/%u differing", diff_single, trials);
+    CHECK(diff_double == 12545u,
+          "expected 12545/%u divergent full-mantissa products, got %u",
+          trials, diff_double);
 
     // 2. ps1. A single-precision result occupies both halves of a paired-single
     //    register, and the ps_* instructions read ps1. Poison it, then check
@@ -144,6 +150,40 @@ int main(void) {
            vxvc_ordered, vxvc_unordered);
     CHECK(vxvc_unordered == 0, "fcmpu should not signal on a quiet NaN");
     CHECK(vxvc_ordered != 0, "fcmpo should signal on a quiet NaN");
+
+    // 5. The whole chain, which is what reaches the screen. A ps_* instruction
+    //    reads both halves of its operands, and a scalar single-precision result
+    //    is supposed to occupy both. So a scalar op feeding a paired-single op is
+    //    the route by which "fmuls forgot ps1" becomes a wrong vertex: the
+    //    corruption is not in the instruction that dropped ps1, it is in the one
+    //    that reads it afterwards.
+    //
+    //    Poison ps1[1], produce f1 with fmuls, then consume f1 from ps_add.
+    cpu.fpr[2] = 3.0;
+    cpu.fpr[3] = 4.0;   // f1 = 3 * 4 = 12 in both lanes
+    cpu.ps1[1] = poison;
+    ppc_fmuls(&cpu, 1, 2, 3);
+    cpu.fpr[4] = 1.0;
+    cpu.ps1[4] = 10.0;
+    ppc_ps_add_op(&cpu, 5, 1, 4);   // f5 = f1 + f4, both lanes
+
+    printf("ps_* consumer    : ps0 %g (want 13), ps1 %g (want 22)\n",
+           cpu.fpr[5], cpu.ps1[5]);
+    CHECK(cpu.fpr[5] == 13.0, "ps_add ps0 lane got %g", cpu.fpr[5]);
+    CHECK(cpu.ps1[5] == 22.0,
+          "ps_add ps1 lane got %g -- fmuls left ps1 stale and this is where "
+          "that surfaces", cpu.ps1[5]);
+
+    // The same chain with the inline form standing in for fmuls: ps1[1] keeps
+    // the poison, so the ps1 lane is wrong while ps0 looks perfectly fine. That
+    // asymmetry is why the corruption is geometric rather than a visibly broken
+    // number -- half of every paired operation stays correct.
+    cpu.ps1[1] = poison;
+    cpu.fpr[1] = inline_fmuls(cpu.fpr[2], cpu.fpr[3]);
+    ppc_ps_add_op(&cpu, 6, 1, 4);
+    CHECK(cpu.fpr[6] == 13.0, "inline chain ps0 lane should still be right");
+    CHECK(cpu.ps1[6] != 22.0,
+          "inline chain should corrupt only the ps1 lane, got %g", cpu.ps1[6]);
 
     cpu_free(&cpu);
     return failures != 0;
