@@ -25,6 +25,12 @@ typedef struct {
 bool dolllvm_emit_object(const DolIRModule* module, const char* object_path,
                          const DolLLVMOptions* options, FILE* diagnostics);
 
+// Resolve an optional target to the triple used for emission.
+bool dolllvm_effective_triple(const char* requested, char* out, size_t size);
+
+// Validate an object's magic against the effective target triple.
+bool dolllvm_object_matches_triple(const char* path, const char* requested);
+
 #ifdef __cplusplus
 }
 #endif

@@ -49,6 +49,7 @@ private:
   void scanLoopHeaders();
 
   void emitEntry();
+  bool emitWrapper(llvm::raw_ostream &diagnostics);
   void chargeCycles(u32 cycles);
   void materialize(u32 pc);
   void sideExit(u32 pc);
@@ -111,6 +112,10 @@ private:
   llvm::Argument *ctx_ = nullptr;
   llvm::BasicBlock *entry_ = nullptr;
   llvm::AllocaInst *cycles_ = nullptr;
+  // Shared across generated calls until control returns to the dispatcher.
+  llvm::Value *guard_cycles_ = nullptr;
+  // Termination backstop for zero-cycle loops.
+  llvm::Value *guard_steps_ = nullptr;
   std::array<llvm::AllocaInst *, DOLIR_STATE_COUNT> state_{};
   std::array<bool, DOLIR_STATE_COUNT> used_{};
   std::array<bool, DOLIR_STATE_COUNT> dirty_{};

@@ -53,7 +53,8 @@ static u32 c_chunk_instructions(void) {
 #ifdef DOLRECOMP_ENABLE_LLVM
 #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 1024u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
-#define DOLLLVM_CACHE_VERSION "dolllvm-v4"
+// v6 carries the execution budget across generated function calls.
+#define DOLLLVM_CACHE_VERSION "dolllvm-v6"
 
 typedef struct {
     const PPCInst* insts;
@@ -103,16 +104,11 @@ static u32 llvm_worker_batch_size(void) {
     return (u32)value;
 }
 
+// Validate the object format selected by the target triple.
 static int valid_object_file(const char* path) {
-    FILE* file = fopen(path, "rb");
-    if (!file)
-        return 0;
-    unsigned char magic[4];
-    int valid = fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
-                magic[0] == 0x7Fu && magic[1] == 'E' &&
-                magic[2] == 'L' && magic[3] == 'F';
-    fclose(file);
-    return valid;
+    return dolllvm_object_matches_triple(path, getenv("DOLRECOMP_LLVM_TARGET"))
+               ? 1
+               : 0;
 }
 
 static int llvm_job_stamp_path(const LLVMChunkJob* job, char* path,
@@ -206,9 +202,11 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     hash = hash_bytes(hash, &job->count, sizeof(job->count));
     u32 state_size = (u32)sizeof(CPUState);
     hash = hash_bytes(hash, &state_size, sizeof(state_size));
-    const char* target = getenv("DOLRECOMP_LLVM_TARGET");
-    if (target)
-        hash = hash_bytes(hash, target, strlen(target));
+    // Host triples must distinguish caches when no target was requested.
+    char triple[256];
+    if (dolllvm_effective_triple(getenv("DOLRECOMP_LLVM_TARGET"), triple,
+                                 sizeof(triple)))
+        hash = hash_bytes(hash, triple, strlen(triple));
     for (u32 i = 0; i < job->count; i++) {
         hash = hash_bytes(hash, &job->insts[i].address,
                           sizeof(job->insts[i].address));

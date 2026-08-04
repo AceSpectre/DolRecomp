@@ -103,19 +103,44 @@ int main(int argc, char** argv) {
     };
     CHECK(add_chunk(&module, paired_words, 7, 0x80002B00u));
 
+    // Runtime boundaries must not reset the dispatcher budget.
+    const u32 budget_words[] = {
+        0x38630001u, 0x00000000u, 0x2C032710u, 0x4180FFF4u, 0x4E800020u,
+    };
+    CHECK(add_chunk(&module, budget_words, 5, 0x80002C00u));
+
+    // External tail branches share the same budget across chunks.
+    const u32 cross_chunk_a[] = {0x48000100u};
+    const u32 cross_chunk_b[] = {0x4BFFFF00u};
+    CHECK(add_chunk(&module, cross_chunk_a, 1, 0x80002D00u));
+    CHECK(add_chunk(&module, cross_chunk_b, 1, 0x80002E00u));
+
     CHECK(dolir_verify(&module, stderr));
     DolLLVMOptions options{};
     options.optimization_level = 2;
     options.verify = 1;
     options.emit_ir = 1;
     options.ir_path = argv[2];
+    const DolLLVMFunctionRange ranges[] = {
+        {0x80002D00u, 0x80002D04u},
+        {0x80002E00u, 0x80002E04u},
+    };
+    options.function_ranges = ranges;
+    options.function_range_count = 2;
     CHECK(dolllvm_emit_object(&module, argv[1], &options, stderr));
     FILE* object = std::fopen(argv[1], "rb");
     CHECK(object != nullptr);
     unsigned char magic[4]{};
     CHECK(std::fread(magic, 1, sizeof(magic), object) == sizeof(magic));
     std::fclose(object);
+    // The object format follows the default target triple, so this cannot assume
+    // ELF: a Windows host emits COFF, whose x86-64 objects begin with the machine
+    // type IMAGE_FILE_MACHINE_AMD64 (0x8664) stored little-endian.
+#if defined(_WIN32)
+    CHECK(magic[0] == 0x64 && magic[1] == 0x86);
+#else
     CHECK(magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F');
+#endif
     std::ifstream ir(argv[2]);
     const std::string irText((std::istreambuf_iterator<char>(ir)),
                              std::istreambuf_iterator<char>());

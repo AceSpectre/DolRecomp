@@ -37,13 +37,20 @@ BasicBlock *FunctionEmitter::externalDestination(const DolIRTerminator &term,
       context_, term.linked ? "direct_call" : "direct_tail", function_);
   IRBuilderBase::InsertPoint saved = builder_.saveIP();
   builder_.SetInsertPoint(callBlock);
+  emitBudgetGuard(target);
   materialize(target);
   char name[64];
-  snprintf(name, sizeof(name), "func_%08X", range->start);
+  snprintf(name, sizeof(name), "func_%08X_budget", range->start);
   auto callee = module_.getOrInsertFunction(
       name, FunctionType::get(Type::getVoidTy(context_),
-                              {PointerType::getUnqual(context_)}, false));
-  builder_.CreateCall(callee, {ctx_});
+                              {PointerType::getUnqual(context_),
+                               PointerType::getUnqual(context_),
+                               PointerType::getUnqual(context_)}, false));
+  if (auto *calleeFunction = dyn_cast<Function>(callee.getCallee())) {
+    calleeFunction->setVisibility(GlobalValue::HiddenVisibility);
+    calleeFunction->setDSOLocal(true);
+  }
+  builder_.CreateCall(callee, {ctx_, guard_cycles_, guard_steps_});
   if (!term.linked) {
     builder_.CreateRetVoid();
     builder_.restoreIP(saved);

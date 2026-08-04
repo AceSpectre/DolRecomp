@@ -16,6 +16,8 @@ void func_80002800(CPUState* cpu);
 void func_80002900(CPUState* cpu);
 void func_80002A00(CPUState* cpu);
 void func_80002B00(CPUState* cpu);
+void func_80002C00(CPUState* cpu);
+void func_80002D00(CPUState* cpu);
 
 static u32 fallback_count;
 static int fallback_bad;
@@ -250,6 +252,33 @@ int main(void) {
     CHECK(cpu.fpr[4] == cpu.fpr[5] && cpu.ps1[4] == cpu.ps1[6]);
 
     CHECK(fallback_count == 1);
+
+    // A fallback in the loop must not restart the dispatcher budget.
+    prepare_call(&cpu, 0x80002C00u);
+    cpu.gpr[3] = 0;
+    cpu.downcount = 0;
+    fallback_count = 0;
+    func_80002C00(&cpu);
+    fprintf(stderr, "budget guard: %u iterations, downcount %lld\n",
+            cpu.gpr[3], (long long)cpu.downcount);
+    CHECK(cpu.gpr[3] > 0);
+    CHECK(cpu.gpr[3] < 1000);
+    CHECK(cpu.pc >= 0x80002C00u && cpu.pc <= 0x80002C10u);
+    CHECK(cpu.pc != cpu.lr);
+    CHECK(cpu.downcount < 0 && cpu.downcount > -1024);
+    CHECK(fallback_count == (u32)cpu.gpr[3]);
+
+    // Re-entry starts a new budget and continues from the saved PC.
+    const u32 first_pass = cpu.gpr[3];
+    func_80002C00(&cpu);
+    CHECK(cpu.gpr[3] > first_pass);
+
+    prepare_call(&cpu, 0x80002D00u);
+    cpu.downcount = 0;
+    func_80002D00(&cpu);
+    CHECK(cpu.pc == 0x80002D00u || cpu.pc == 0x80002E00u);
+    CHECK(cpu.downcount <= -128 && cpu.downcount >= -512);
+
     cpu_free(&cpu);
     return 0;
 }

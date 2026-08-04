@@ -24,15 +24,28 @@ FunctionEmitter::FunctionEmitter(LLVMContext &context, Module &module,
       ranges_(ranges), range_count_(range_count) {}
 
 bool FunctionEmitter::emit(raw_ostream &diagnostics) {
+  auto *pointer = PointerType::getUnqual(context_);
   auto *type = FunctionType::get(Type::getVoidTy(context_),
-                                 {PointerType::getUnqual(context_)}, false);
-  function_ = Function::Create(type, GlobalValue::ExternalLinkage, source_.name,
-                               module_);
+                                 {pointer, pointer, pointer}, false);
+  const std::string bodyName = std::string(source_.name) + "_budget";
+  function_ = module_.getFunction(bodyName);
+  if (!function_)
+    function_ = Function::Create(type, GlobalValue::ExternalLinkage, bodyName,
+                                 module_);
+  if (function_->getFunctionType() != type || !function_->empty()) {
+    diagnostics << "dolllvm: conflicting native body " << bodyName << "\n";
+    return false;
+  }
   function_->setCallingConv(CallingConv::C);
   function_->setVisibility(GlobalValue::HiddenVisibility);
   function_->setDSOLocal(true);
+  function_->addFnAttr(Attribute::NoInline);
   ctx_ = function_->getArg(0);
   ctx_->setName("ctx");
+  guard_cycles_ = function_->getArg(1);
+  guard_cycles_->setName("guard_cycles");
+  guard_steps_ = function_->getArg(2);
+  guard_steps_->setName("guard_steps");
 
   entry_ = BasicBlock::Create(context_, "entry", function_);
   for (u32 i = 0; i < source_.block_count; i++)
@@ -44,7 +57,38 @@ bool FunctionEmitter::emit(raw_ostream &diagnostics) {
   for (u32 i = 0; i < source_.block_count; i++)
     if (!emitBlock(i, diagnostics))
       return false;
-  return !verifyFunction(*function_, &diagnostics);
+  if (verifyFunction(*function_, &diagnostics))
+    return false;
+  return emitWrapper(diagnostics);
+}
+
+bool FunctionEmitter::emitWrapper(raw_ostream &diagnostics) {
+  auto *pointer = PointerType::getUnqual(context_);
+  auto *type = FunctionType::get(Type::getVoidTy(context_), {pointer}, false);
+  Function *wrapper = module_.getFunction(source_.name);
+  if (!wrapper)
+    wrapper = Function::Create(type, GlobalValue::ExternalLinkage, source_.name,
+                               module_);
+  if (wrapper->getFunctionType() != type || !wrapper->empty()) {
+    diagnostics << "dolllvm: conflicting native entry " << source_.name << "\n";
+    return false;
+  }
+  wrapper->setCallingConv(CallingConv::C);
+  wrapper->setVisibility(GlobalValue::HiddenVisibility);
+  wrapper->setDSOLocal(true);
+  wrapper->getArg(0)->setName("ctx");
+
+  BasicBlock *entry = BasicBlock::Create(context_, "entry", wrapper);
+  IRBuilder<> builder(entry);
+  AllocaInst *guardCycles =
+      builder.CreateAlloca(Type::getInt64Ty(context_), nullptr, "guard_cycles");
+  AllocaInst *guardSteps =
+      builder.CreateAlloca(Type::getInt64Ty(context_), nullptr, "guard_steps");
+  builder.CreateStore(builder.getInt64(0), guardCycles);
+  builder.CreateStore(builder.getInt64(0), guardSteps);
+  builder.CreateCall(function_, {wrapper->getArg(0), guardCycles, guardSteps});
+  builder.CreateRetVoid();
+  return !verifyFunction(*wrapper, &diagnostics);
 }
 
 std::string FunctionEmitter::blockName(u32 index) const {
@@ -352,6 +396,13 @@ void FunctionEmitter::chargeCycles(u32 cycles) {
   Value *next = builder_.CreateAdd(
       old, ConstantInt::get(Type::getInt64Ty(context_), cycles));
   builder_.CreateStore(next, cycles_);
+  // The shared guard survives helper and generated-function boundaries.
+  Value *guard_old =
+      builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_);
+  builder_.CreateStore(
+      builder_.CreateAdd(guard_old,
+                         ConstantInt::get(Type::getInt64Ty(context_), cycles)),
+      guard_cycles_);
 }
 
 void FunctionEmitter::materialize(u32 pc) {
@@ -367,6 +418,7 @@ void FunctionEmitter::materialize(u32 pc) {
                ConstantInt::get(Type::getInt32Ty(context_), pc));
   Value *downcount =
       loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, downcount));
+  // Only unmaterialized cycles are owed to downcount.
   Value *cycles = builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
   builder_.CreateStore(builder_.CreateSub(downcount, cycles),
                        bytePtr(offsetof(CPUState, downcount)));
@@ -378,9 +430,19 @@ void FunctionEmitter::sideExit(u32 pc) {
 }
 
 void FunctionEmitter::emitBudgetGuard(u32 pc) {
-  Value *cycles = builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
-  Value *exhausted = builder_.CreateICmpUGE(
+  // Guard the whole native call chain, not one generated function.
+  Value *cycles =
+      builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_);
+  Value *over_cycles = builder_.CreateICmpUGE(
       cycles, ConstantInt::get(Type::getInt64Ty(context_), 256));
+  // Backstop for zero-cycle loops.
+  Value *steps = builder_.CreateLoad(Type::getInt64Ty(context_), guard_steps_);
+  Value *next_steps = builder_.CreateAdd(
+      steps, ConstantInt::get(Type::getInt64Ty(context_), 1));
+  builder_.CreateStore(next_steps, guard_steps_);
+  Value *over_steps = builder_.CreateICmpUGE(
+      next_steps, ConstantInt::get(Type::getInt64Ty(context_), 2048));
+  Value *exhausted = builder_.CreateOr(over_cycles, over_steps);
   BasicBlock *run = BasicBlock::Create(context_, "budget_run", function_);
   BasicBlock *exit = BasicBlock::Create(context_, "budget_exit", function_);
   builder_.CreateCondBr(exhausted, exit, run);

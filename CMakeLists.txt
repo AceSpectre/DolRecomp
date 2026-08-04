@@ -5,6 +5,17 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(DOLRECOMP_ENABLE_LLVM "Build the x86-64 LLVM object backend" OFF)
 
+# Discover LLVM before creating targets so its MSVC runtime choice is uniform.
+if(DOLRECOMP_ENABLE_LLVM)
+    enable_language(CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    find_package(LLVM CONFIG REQUIRED)
+    if(LLVM_PACKAGE_VERSION VERSION_LESS 19 OR LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL 21)
+        message(FATAL_ERROR "DolRecomp LLVM backend requires LLVM 19 or 20 (found ${LLVM_PACKAGE_VERSION})")
+    endif()
+endif()
+
 # Portable warnings for local development and CI.
 if(MSVC)
     add_compile_options(/W3)
@@ -77,13 +88,6 @@ target_include_directories(dr_ir PUBLIC ${DOLRECOMP_SRC})
 target_link_libraries(dr_ir PUBLIC dr_frontend)
 
 if(DOLRECOMP_ENABLE_LLVM)
-    enable_language(CXX)
-    set(CMAKE_CXX_STANDARD 17)
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    find_package(LLVM CONFIG REQUIRED)
-    if(LLVM_PACKAGE_VERSION VERSION_LESS 19 OR LLVM_PACKAGE_VERSION VERSION_GREATER_EQUAL 21)
-        message(FATAL_ERROR "DolRecomp LLVM backend requires LLVM 19 or 20 (found ${LLVM_PACKAGE_VERSION})")
-    endif()
     add_library(dr_llvm STATIC
         src/backend/llvm/llvm_backend.cpp
         src/backend/llvm/llvm_control_flow.cpp
@@ -101,14 +105,14 @@ if(DOLRECOMP_ENABLE_LLVM)
             NAMES LLVM-${LLVM_VERSION_MAJOR} LLVM
             HINTS ${LLVM_LIBRARY_DIRS}
             NO_DEFAULT_PATH)
-        if(NOT DOLRECOMP_LLVM_SHARED_IMPORT OR
-           NOT DOLRECOMP_LLVM_SHARED_IMPORT MATCHES "[.]dll[.]a$")
-            message(FATAL_ERROR
-                "DolRecomp requires LLVM's shared import library on MinGW; "
-                "install the matching MSYS2 llvm-libs package")
+        if(DOLRECOMP_LLVM_SHARED_IMPORT MATCHES "[.]dll[.]a$")
+            target_link_libraries(dr_llvm PRIVATE
+                "${DOLRECOMP_LLVM_SHARED_IMPORT}")
+        else()
+            llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS
+                Core Support Analysis Passes Target MC native nativecodegen)
+            target_link_libraries(dr_llvm PRIVATE ${DOLRECOMP_LLVM_LIBS})
         endif()
-        target_link_libraries(dr_llvm PRIVATE
-            "${DOLRECOMP_LLVM_SHARED_IMPORT}")
     elseif(TARGET LLVM)
         target_link_libraries(dr_llvm PRIVATE LLVM)
     else()
@@ -156,6 +160,10 @@ add_executable(dolrecomp src/app/main.c)
 target_link_libraries(dolrecomp PRIVATE dr_app)
 if(DOLRECOMP_ENABLE_LLVM)
     set_property(TARGET dolrecomp PROPERTY LINKER_LANGUAGE CXX)
+    # Large LLVM modules exceed MSVC's default 1 MiB stack.
+    if(MSVC)
+        target_link_options(dolrecomp PRIVATE /STACK:8388608)
+    endif()
 endif()
 
 add_executable(dolir_stats tools/dolir_stats.c)
