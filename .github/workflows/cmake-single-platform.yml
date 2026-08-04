@@ -67,14 +67,14 @@ jobs:
         uses: KyleMayes/install-llvm-action@v2
         with:
           version: "20.1.8"
-          cached: true
+          directory: ${{ runner.temp }}/llvm
 
       - name: Configure
         run: >
           cmake -B ${{ github.workspace }}/build -S ${{ github.workspace }}
           -DCMAKE_BUILD_TYPE=Release
           -DDOLRECOMP_ENABLE_LLVM=ON
-          -DLLVM_DIR=${{ env.LLVM_PATH }}/lib/cmake/llvm
+          "-DLLVM_DIR=${{ env.LLVM_PATH }}/lib/cmake/llvm"
 
       - name: Build
         run: cmake --build ${{ github.workspace }}/build --config Release
