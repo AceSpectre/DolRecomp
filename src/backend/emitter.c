@@ -68,17 +68,15 @@ static void emit_compare_u32(FILE* out, u8 crf, const char* lhs, const char* rhs
     fprintf(out, "    }\n");
 }
 
-// Restored alongside the ps_merge* cases: merges pick ps0/ps1 from either
-// operand's bank and round through the paired-single path.
 static void emit_ps_merge(FILE* out, const PPCInst* inst,
                           bool use_a_ps1, bool use_b_ps1) {
     const char* a_bank = use_a_ps1 ? "ps1" : "fpr";
     const char* b_bank = use_b_ps1 ? "ps1" : "fpr";
 
     fprintf(out, "    {\n");
-    fprintf(out, "        f64 ps0 = dolrecomp_ps_round(ctx->%s[%u]);\n",
+    fprintf(out, "        f64 ps0 = ctx->%s[%u];\n",
             a_bank, inst->rA);
-    fprintf(out, "        f64 ps1 = dolrecomp_ps_round(ctx->%s[%u]);\n",
+    fprintf(out, "        f64 ps1 = ctx->%s[%u];\n",
             b_bank, inst->rB);
     fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
     fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
@@ -86,11 +84,6 @@ static void emit_ps_merge(FILE* out, const PPCInst* inst,
 }
 
 static void emit_fcompare(FILE* out, const PPCInst* inst) {
-    // Compares go through ppc_fcmp rather than inline C. The inline form set the
-    // CR field correctly but dropped three things: the FPCC bits in FPSCR, the
-    // SNaN / invalid-operation signalling, and -- most visibly -- the ordered
-    // flag, which made fcmpo and fcmpu compile to identical code even though
-    // only fcmpo raises on a NaN operand.
     fprintf(out, "    ppc_fcmp(ctx, %u, ctx->fpr[%u], ctx->fpr[%u], %s);\n",
             inst->crfD, inst->rA, inst->rB,
             inst->op == PPC_OP_FCMPO ? "true" : "false");
@@ -446,13 +439,7 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "    return sh ? ((value << sh) | (value >> (32u - sh))) : value;\n"
         "}\n"
         "\n"
-        // Gekko single<->double conversion is not a C cast. It reconstructs the
-        // exponent and materialises denormals explicitly, matching Dolphin's
-        // ConvertToDouble / ConvertToSingle. A (f32)/(f64) round-trip gives a
-        // different result for denormals and for any value that is not already
-        // single-representable, and these run on every float load and store --
-        // roughly 143,000 sites in a single Wii title, which is enough to
-        // corrupt skinning matrices and shatter character geometry.
+        // Preserve the PPC bit-level single conversion, including denormals.
         "static inline f64 dolrecomp_f32_from_bits(u32 bits) {\n"
         "    u64 x = bits;\n"
         "    u64 exp = (x >> 23) & 0xFFu;\n"
@@ -1024,35 +1011,24 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         }
         break;
 
-    // Single-precision arithmetic goes through the runtime helpers rather than
-    // being inlined as C. The inline form -- ctx->fpr[d] = (f64)(f32)(a op b) --
-    // produces a plausible-looking value while dropping four things the Gekko
-    // actually does:
-    //
-    //   * force_25bit_c truncates a multiply's C operand to a 25-bit mantissa,
-    //     so an inlined f64 multiply differs numerically on every instruction
-    //   * fp_write_single also writes ps1, the paired-single second slot; the
-    //     inline form leaves it stale and paired-single ops go on to read it
-    //   * FPRF, FI and FR in FPSCR are never updated
-    //   * NaN and invalid-operation gating is skipped
-    //
-    // Skinning and matrix maths depend on all of these. Inlining them cost
-    // character models their limbs and shattered them into stray triangles the
-    // moment they animated.
     case PPC_OP_FADDS:
         fprintf(out, "    ppc_fadds(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FSUBS:
         fprintf(out, "    ppc_fsubs(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FMULS:
         fprintf(out, "    ppc_fmuls(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rC);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FDIVS:
         fprintf(out, "    ppc_fdivs(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FRES:
@@ -1077,22 +1053,24 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
     }
 
-    // Double-precision arithmetic goes through the helpers for the same reason
-    // as the single-precision forms above: FPSCR/FPRF updates and NaN gating.
     case PPC_OP_FADD:
         fprintf(out, "    ppc_fadd(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FSUB:
         fprintf(out, "    ppc_fsub(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FMUL:
         fprintf(out, "    ppc_fmul(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rC);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FDIV:
         fprintf(out, "    ppc_fdiv(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FRSQRTE:
@@ -1126,26 +1104,30 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 
     case PPC_OP_FMR:
         fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u];\n", inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FNEG:
         fprintf(out, "    ctx->fpr[%u] = dolrecomp_f64_from_bits(dolrecomp_f64_to_bits(ctx->fpr[%u]) ^ 0x8000000000000000ull);\n",
                 inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FABS:
         fprintf(out, "    ctx->fpr[%u] = dolrecomp_f64_from_bits(dolrecomp_f64_to_bits(ctx->fpr[%u]) & 0x7FFFFFFFFFFFFFFFull);\n",
                 inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FNABS:
         fprintf(out, "    ctx->fpr[%u] = dolrecomp_f64_from_bits(dolrecomp_f64_to_bits(ctx->fpr[%u]) | 0x8000000000000000ull);\n",
                 inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FRSP:
-        // frsp also writes ps1 and FPRF, which (f64)(f32) does not.
         fprintf(out, "    ppc_frsp(ctx, %u, %u);\n", inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FSEL:
@@ -1348,24 +1330,15 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_PS_CMPU0:
     case PPC_OP_PS_CMPO0:
     case PPC_OP_PS_CMPU1:
-    case PPC_OP_PS_CMPO1:
-        fprintf(out, "    {\n");
-        if (inst->op == PPC_OP_PS_CMPU0 || inst->op == PPC_OP_PS_CMPO0) {
-            fprintf(out, "        f32 val_a = (f32)ctx->fpr[%u];\n", inst->rA);
-            fprintf(out, "        f32 val_b = (f32)ctx->fpr[%u];\n", inst->rB);
-        } else {
-            fprintf(out, "        f32 val_a = (f32)ctx->ps1[%u];\n", inst->rA);
-            fprintf(out, "        f32 val_b = (f32)ctx->ps1[%u];\n", inst->rB);
-        }
-        fprintf(out, "        u32 cr_bits = 0;\n");
-        fprintf(out, "        if (val_a < val_b)       cr_bits = 0x8u;\n");
-        fprintf(out, "        else if (val_a > val_b)  cr_bits = 0x4u;\n");
-        fprintf(out, "        else if (val_a == val_b) cr_bits = 0x2u;\n");
-        fprintf(out, "        else                     cr_bits = 0x1u;\n");
-        fprintf(out, "        ctx->cr = (ctx->cr & ~(0xFu << %u)) | (cr_bits << %u);\n",
-                cr_field_shift(inst->crfD), cr_field_shift(inst->crfD));
-        fprintf(out, "    }\n");
+    case PPC_OP_PS_CMPO1: {
+        bool lane1 = inst->op == PPC_OP_PS_CMPU1 || inst->op == PPC_OP_PS_CMPO1;
+        bool ordered = inst->op == PPC_OP_PS_CMPO0 || inst->op == PPC_OP_PS_CMPO1;
+        const char* bank = lane1 ? "ps1" : "fpr";
+        fprintf(out, "    ppc_fcmp(ctx, %u, ctx->%s[%u], ctx->%s[%u], %s);\n",
+                inst->crfD, bank, inst->rA, bank, inst->rB,
+                ordered ? "true" : "false");
         break;
+    }
 
     case PPC_OP_PS_SEL:
         fprintf(out, "    ctx->fpr[%u] = ((f32)ctx->fpr[%u] >= 0.0f) ? ctx->fpr[%u] : ctx->fpr[%u];\n",
