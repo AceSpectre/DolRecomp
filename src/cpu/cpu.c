@@ -16,6 +16,23 @@ void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
     g_mem_write_journal_user = user;
 }
 
+/* Journal offsets are physical addresses: MEM1 maps to [0, ram_size),
+ * MEM2 to [0x10000000, 0x10000000 + mem2_size) — so a watcher adding
+ * 0x80000000 sees guest 0x8xxxxxxx / 0x9xxxxxxx addresses. Previously
+ * only MEM1 writes were journaled, which made MEM2 watches silently
+ * report nothing. */
+static void journal_write(CPUState* cpu, const u8* host, u32 size) {
+    if (!g_mem_write_journal)
+        return;
+    if (host >= cpu->ram && host < cpu->ram + cpu->ram_size)
+        g_mem_write_journal((u32)(host - cpu->ram), size,
+                            g_mem_write_journal_user);
+    else if (cpu->mem2 && host >= cpu->mem2 &&
+             host < cpu->mem2 + cpu->mem2_size)
+        g_mem_write_journal(0x10000000u + (u32)(host - cpu->mem2), size,
+                            g_mem_write_journal_user);
+}
+
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <xmmintrin.h>
@@ -120,6 +137,15 @@ static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
         return cpu->ram + offset;
     }
 
+    /* Gekko locked cache: 16KB data scratchpad at 0xE0000000. Without this
+     * mapping, LC stores fell through to the external MMIO handler and read
+     * back zero — every matrix nw4r::g3d staged here DMA'd out as zeros. */
+    if (addr >= 0xE0000000u && addr < 0xE0000000u + sizeof(cpu->lc)) {
+        u32 offset = addr - 0xE0000000u;
+        *avail = (u32)sizeof(cpu->lc) - offset;
+        return cpu->lc + offset;
+    }
+
     if (cpu->mem2 && cpu->mem2_size) {
         if (addr >= WII_MEM2_BASE && addr < WII_MEM2_BASE + cpu->mem2_size) {
             u32 offset = addr - WII_MEM2_BASE;
@@ -209,8 +235,7 @@ void mem_write64(CPUState* cpu, u32 addr, u64 value) {
         return;
     }
     clear_matching_reservation(cpu, addr);
-    if (g_mem_write_journal && host >= cpu->ram && host < cpu->ram + cpu->ram_size)
-        g_mem_write_journal((u32)(host - cpu->ram), 8, g_mem_write_journal_user);
+    journal_write(cpu, host, 8);
     write_be64(host, value);
 }
 
@@ -238,8 +263,7 @@ void mem_write32(CPUState* cpu, u32 addr, u32 value) {
         return;
     }
     clear_matching_reservation(cpu, addr);
-    if (g_mem_write_journal && host >= cpu->ram && host < cpu->ram + cpu->ram_size)
-        g_mem_write_journal((u32)(host - cpu->ram), 4, g_mem_write_journal_user);
+    journal_write(cpu, host, 4);
     write_be32(host, value);
 }
 
@@ -267,8 +291,7 @@ void mem_write16(CPUState* cpu, u32 addr, u16 value) {
         return;
     }
     clear_matching_reservation(cpu, addr);
-    if (g_mem_write_journal && host >= cpu->ram && host < cpu->ram + cpu->ram_size)
-        g_mem_write_journal((u32)(host - cpu->ram), 2, g_mem_write_journal_user);
+    journal_write(cpu, host, 2);
     write_be16(host, value);
 }
 
@@ -296,8 +319,7 @@ void mem_write8(CPUState* cpu, u32 addr, u8 value) {
         return;
     }
     clear_matching_reservation(cpu, addr);
-    if (g_mem_write_journal && host >= cpu->ram && host < cpu->ram + cpu->ram_size)
-        g_mem_write_journal((u32)(host - cpu->ram), 1, g_mem_write_journal_user);
+    journal_write(cpu, host, 1);
     *host = value;
 }
 
@@ -454,6 +476,23 @@ static u16 ppc_spr_storage_index(u16 spr) {
     }
 }
 
+/* Whether ppc_mfspr/ppc_mtspr can service this SPR without raising a
+ * program exception — lets lenient hosts keep ignoring SPRs the model
+ * doesn't know instead of faulting mid-boot. */
+bool ppc_spr_known(u16 spr) {
+    switch (spr) {
+    case 1: case 8: case 9: case 18: case 19: case 22: case 25:
+    case 26: case 27: case 268: case 269: case 282: case 284: case 285:
+    case 287:
+        return true;
+    default:
+        break;
+    }
+    if (spr >= 912 && spr <= 923)
+        return true;
+    return spr < 1024 && (ppc_spr_access[spr] & (SPR_READ | SPR_WRITE)) != 0;
+}
+
 u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia) {
     if ((cpu->msr & PPC_MSR_PR) && spr != 1 && spr != 8 && spr != 9 &&
         spr != 268 && spr != 269) {
@@ -550,6 +589,51 @@ void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
     case 920:
         cpu->hid2 = value;
         return;
+    case 923: { /* DMAL: locked cache <-> memory DMA (Dolphin
+                   Interpreter_SystemRegisters.cpp SPR_DMAL) */
+        cpu->spr[923] = value;
+        if (value & 2u) { /* DMA_T */
+            /* DMAU carries a physical address (0x00... MEM1 / 0x10... MEM2);
+             * the memory accessors speak effective addresses. OR-ing the
+             * cached-window bit maps both regions (0x00->0x80, 0x10->0x90).
+             * Without this every DMA write fell into the MMIO sink and the
+             * destination stayed zero. */
+            u32 mem_addr = (cpu->spr[922] & ~0x1Fu) | 0x80000000u;
+            u32 lc_addr = value & ~0x1Fu;
+            u32 lines = ((cpu->spr[922] & 0x1Fu) << 2) | ((value >> 2) & 3u);
+            if (lines == 0)
+                lines = 128;
+            int load = (value >> 4) & 1; /* 1 = memory -> locked cache */
+            /* DR_DMA_DEBUG=1 logs every transfer; DR_DMA_MATCH=0xLO-0xHI
+             * logs only those touching a memory range. */
+            {
+                static int dbg = -1, logged;
+                static u32 match_lo, match_hi;
+                if (dbg < 0) {
+                    dbg = getenv("DR_DMA_DEBUG") != NULL;
+                    const char* m = getenv("DR_DMA_MATCH");
+                    if (m && sscanf(m, "0x%x-0x%x", &match_lo, &match_hi) == 2)
+                        dbg = 2;
+                }
+                int hit = dbg == 1 ||
+                          (dbg == 2 && (mem_addr & 0x3FFFFFFFu) < match_hi &&
+                           (mem_addr & 0x3FFFFFFFu) + lines * 32u > match_lo);
+                if (hit && logged < 200 && ++logged)
+                    fprintf(stderr,
+                            "[dma] %s mem=0x%08X lc=0x%08X bytes=%u lc0=0x%08X\n",
+                            load ? "mem->lc" : "lc->mem", mem_addr, lc_addr,
+                            lines * 32u, mem_read32(cpu, lc_addr));
+            }
+            for (u32 i = 0; i < lines * 32u; i += 4) {
+                if (load)
+                    mem_write32(cpu, lc_addr + i, mem_read32(cpu, mem_addr + i));
+                else
+                    mem_write32(cpu, mem_addr + i, mem_read32(cpu, lc_addr + i));
+            }
+            cpu->spr[923] &= ~2u; /* DMA completes immediately */
+        }
+        return;
+    }
     default:
         break;
     }

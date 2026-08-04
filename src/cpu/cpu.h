@@ -96,6 +96,10 @@ struct CPUState {
     bool reserve_valid;
     u32 locked_cache_tag[512];
     bool locked_cache_valid[512];
+    /* Gekko locked-cache data (16KB window at 0xE0000000). nw4r::g3d's
+     * CalcView_LC_DMA path builds matrix arrays here and DMAs them out via
+     * DMAU/DMAL. */
+    u8 lc[0x4000];
     PPCExternalRead external_read;
     PPCExternalWrite external_write;
     PPCExternalRead32 external_read32;
@@ -190,6 +194,7 @@ void ppc_alignment_exception(CPUState* cpu, u32 ea, u32 cia);
 u32 ppc_mftb(CPUState* cpu, u16 tbr, u32 cia);
 u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia);
 void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia);
+bool ppc_spr_known(u16 spr);
 void ppc_rfi(CPUState* cpu, u32 cia);
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia);
 bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
