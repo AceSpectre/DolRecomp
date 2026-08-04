@@ -28,8 +28,7 @@ namespace {
 
 using namespace llvm;
 
-// Single definition of "which triple is in effect", shared by emission, the
-// object cache and the resume check so the three cannot disagree.
+// Shared by emission, cache hashing and resume validation.
 static std::string resolveTriple(const char *requested) {
   return requested && requested[0] ? std::string(requested)
                                    : llvm::sys::getDefaultTargetTriple();

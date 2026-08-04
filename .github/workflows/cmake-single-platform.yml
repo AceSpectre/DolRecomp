@@ -50,13 +50,7 @@ jobs:
         working-directory: ${{ github.workspace }}/build
         run: ctest --build-config ${{ matrix.build_type }} --output-on-failure
 
-  # The matrix above never passes -DDOLRECOMP_ENABLE_LLVM=ON, so none of the LLVM
-  # backend, its three tests, or the object-format handling is built anywhere in
-  # CI. That is how the backend came to be broken in several independent ways at
-  # once while every job stayed green: a passing run said nothing about the code
-  # this job covers. Both hosts are here because the object format follows the
-  # target triple -- Linux emits ELF, Windows COFF -- and the bug that disabled
-  # the object cache on Windows is invisible to an ELF-only build.
+  # Exercise the LLVM backend and both supported object formats.
   llvm:
     name: LLVM backend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

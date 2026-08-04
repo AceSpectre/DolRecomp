@@ -5,16 +5,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(DOLRECOMP_ENABLE_LLVM "Build the x86-64 LLVM object backend" OFF)
 
-# LLVM is discovered before any target exists because LLVMConfig.cmake ends with
-# an unqualified `set(CMAKE_MSVC_RUNTIME_LIBRARY ...)` naming the CRT LLVM was
-# built against — the prebuilt Windows release libraries say MultiThreaded (/MT).
-# That assignment lands in this directory scope and applies to every target
-# declared after it, so discovering LLVM in the middle of the file splits the
-# tree: the libraries above it get one CRT, everything below gets another, and
-# the shared static libraries then carry two CRTs into a single link. Matching
-# LLVM is what makes the tools link at all (otherwise the exe ends in unresolved
-# __imp__* CRT symbols: fseek, ftell, _ftelli64, _mkdir, system), so let LLVM
-# name the CRT and let it apply to all of DolRecomp uniformly.
+# Discover LLVM before creating targets so its MSVC runtime choice is uniform.
 if(DOLRECOMP_ENABLE_LLVM)
     enable_language(CXX)
     set(CMAKE_CXX_STANDARD 17)
@@ -169,10 +160,7 @@ add_executable(dolrecomp src/app/main.c)
 target_link_libraries(dolrecomp PRIVATE dr_app)
 if(DOLRECOMP_ENABLE_LLVM)
     set_property(TARGET dolrecomp PROPERTY LINKER_LANGUAGE CXX)
-    # LLVM's IR builders and pass pipeline recurse deeply enough to exhaust
-    # MSVC's default 1 MiB stack while emitting a large DOL, which aborts the
-    # run with STATUS_STACK_OVERFLOW (0xC00000FD) rather than a diagnostic.
-    # Other toolchains default to 8 MiB, so only MSVC needs raising.
+    # Large LLVM modules exceed MSVC's default 1 MiB stack.
     if(MSVC)
         target_link_options(dolrecomp PRIVATE /STACK:8388608)
     endif()

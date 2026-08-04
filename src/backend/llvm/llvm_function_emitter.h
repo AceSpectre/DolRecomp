@@ -49,6 +49,7 @@ private:
   void scanLoopHeaders();
 
   void emitEntry();
+  bool emitWrapper(llvm::raw_ostream &diagnostics);
   void chargeCycles(u32 cycles);
   void materialize(u32 pc);
   void sideExit(u32 pc);
@@ -111,18 +112,10 @@ private:
   llvm::Argument *ctx_ = nullptr;
   llvm::BasicBlock *entry_ = nullptr;
   llvm::AllocaInst *cycles_ = nullptr;
-  // Guest cycles charged since the dispatcher handed control to this function.
-  // Nothing resets it, unlike cycles_, which every call and helper resume point
-  // clears. That clearing is correct for charging -- materialize() has already
-  // flushed those cycles into downcount -- but it means cycles_ cannot answer
-  // "how long since we were last dispatched", so the yield decision reads this.
-  llvm::AllocaInst *guard_cycles_ = nullptr;
-  // Loop iterations since entry, as a termination backstop only. Every guest
-  // instruction in a block can cost zero cycles (dcbf, icbi, embedded data),
-  // which would leave guard_cycles_ flat, so a loop built only from those could
-  // otherwise spin forever. This is deliberately not the scheduling bound: the
-  // guard runs at loop headers, so it counts iterations, not instructions.
-  llvm::AllocaInst *guard_steps_ = nullptr;
+  // Shared across generated calls until control returns to the dispatcher.
+  llvm::Value *guard_cycles_ = nullptr;
+  // Termination backstop for zero-cycle loops.
+  llvm::Value *guard_steps_ = nullptr;
   std::array<llvm::AllocaInst *, DOLIR_STATE_COUNT> state_{};
   std::array<bool, DOLIR_STATE_COUNT> used_{};
   std::array<bool, DOLIR_STATE_COUNT> dirty_{};

@@ -103,22 +103,17 @@ int main(int argc, char** argv) {
     };
     CHECK(add_chunk(&module, paired_words, 7, 0x80002B00u));
 
-    // A loop whose body crosses a runtime boundary every iteration. The unknown
-    // word routes to instruction_fallback, and returning from it calls
-    // reloadUsedState(), which zeroes cycles_. A guard reading cycles_ therefore
-    // never reaches its threshold here and the loop runs to completion with
-    // downcount past zero -- the 0 FPS bug. test_llvm_execute drives this and
-    // asserts the dispatcher gets control back partway through.
-    //
-    //   loop: addi r3, r3, 1
-    //         .long 0          ; unknown -> fallback
-    //         cmpwi r3, 10000
-    //         blt  loop
-    //         blr
+    // Runtime boundaries must not reset the dispatcher budget.
     const u32 budget_words[] = {
         0x38630001u, 0x00000000u, 0x2C032710u, 0x4180FFF4u, 0x4E800020u,
     };
     CHECK(add_chunk(&module, budget_words, 5, 0x80002C00u));
+
+    // External tail branches share the same budget across chunks.
+    const u32 cross_chunk_a[] = {0x48000100u};
+    const u32 cross_chunk_b[] = {0x4BFFFF00u};
+    CHECK(add_chunk(&module, cross_chunk_a, 1, 0x80002D00u));
+    CHECK(add_chunk(&module, cross_chunk_b, 1, 0x80002E00u));
 
     CHECK(dolir_verify(&module, stderr));
     DolLLVMOptions options{};
@@ -126,6 +121,12 @@ int main(int argc, char** argv) {
     options.verify = 1;
     options.emit_ir = 1;
     options.ir_path = argv[2];
+    const DolLLVMFunctionRange ranges[] = {
+        {0x80002D00u, 0x80002D04u},
+        {0x80002E00u, 0x80002E04u},
+    };
+    options.function_ranges = ranges;
+    options.function_range_count = 2;
     CHECK(dolllvm_emit_object(&module, argv[1], &options, stderr));
     FILE* object = std::fopen(argv[1], "rb");
     CHECK(object != nullptr);

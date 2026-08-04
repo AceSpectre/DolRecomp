@@ -17,6 +17,7 @@ void func_80002900(CPUState* cpu);
 void func_80002A00(CPUState* cpu);
 void func_80002B00(CPUState* cpu);
 void func_80002C00(CPUState* cpu);
+void func_80002D00(CPUState* cpu);
 
 static u32 fallback_count;
 static int fallback_bad;
@@ -252,20 +253,7 @@ int main(void) {
 
     CHECK(fallback_count == 1);
 
-    // The dispatcher has to regain control from a loop whose body crosses a
-    // runtime boundary. Every iteration of func_80002C00 hits the fallback,
-    // which zeroes cycles_, so a guard reading cycles_ can never trip and the
-    // loop runs all 10,000 iterations in one native entry while downcount goes
-    // far past zero. That is the 0 FPS failure: the runtime never gets a chance
-    // to advance timing or service the GPU.
-    //
-    // The body costs 3 guest cycles, so a 256-cycle budget should yield after
-    // about 86 iterations. Observed: 86 iterations, downcount -258. With the
-    // guard reading cycles_ instead: 2047 iterations, downcount -6141 -- it only
-    // stopped because the iteration backstop caught it, 24x past the bound it
-    // was supposed to enforce. The limits below sit between those two so this
-    // fails on the real defect without pinning the exact threshold, which is
-    // still open to tuning.
+    // A fallback in the loop must not restart the dispatcher budget.
     prepare_call(&cpu, 0x80002C00u);
     cpu.gpr[3] = 0;
     cpu.downcount = 0;
@@ -280,11 +268,16 @@ int main(void) {
     CHECK(cpu.downcount < 0 && cpu.downcount > -1024);
     CHECK(fallback_count == (u32)cpu.gpr[3]);
 
-    // Re-entering resumes rather than restarting: the guard budget is per native
-    // entry, so a caller that keeps calling still makes progress.
+    // Re-entry starts a new budget and continues from the saved PC.
     const u32 first_pass = cpu.gpr[3];
     func_80002C00(&cpu);
     CHECK(cpu.gpr[3] > first_pass);
+
+    prepare_call(&cpu, 0x80002D00u);
+    cpu.downcount = 0;
+    func_80002D00(&cpu);
+    CHECK(cpu.pc == 0x80002D00u || cpu.pc == 0x80002E00u);
+    CHECK(cpu.downcount <= -128 && cpu.downcount >= -512);
 
     cpu_free(&cpu);
     return 0;

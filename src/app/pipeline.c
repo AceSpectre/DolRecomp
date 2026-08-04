@@ -53,9 +53,8 @@ static u32 c_chunk_instructions(void) {
 #ifdef DOLRECOMP_ENABLE_LLVM
 #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 1024u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
-// v5: the budget guard gained guard_steps_, so v4 objects yield on the wrong
-// bound and must not be reused.
-#define DOLLLVM_CACHE_VERSION "dolllvm-v5"
+// v6 carries the execution budget across generated function calls.
+#define DOLLLVM_CACHE_VERSION "dolllvm-v6"
 
 typedef struct {
     const PPCInst* insts;
@@ -105,11 +104,7 @@ static u32 llvm_worker_batch_size(void) {
     return (u32)value;
 }
 
-// The emitted object format follows the target triple, so this cannot assume
-// ELF: a Windows host emits COFF, and checking for ELF there rejected every
-// object the backend had just written -- silently disabling both the object
-// cache and DOLRECOMP_LLVM_RESUME, in a way that looks like a cold build rather
-// than an error.
+// Validate the object format selected by the target triple.
 static int valid_object_file(const char* path) {
     return dolllvm_object_matches_triple(path, getenv("DOLRECOMP_LLVM_TARGET"))
                ? 1
@@ -207,10 +202,7 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     hash = hash_bytes(hash, &job->count, sizeof(job->count));
     u32 state_size = (u32)sizeof(CPUState);
     hash = hash_bytes(hash, &state_size, sizeof(state_size));
-    // The *effective* triple, not the environment variable, because an unset
-    // variable still resolves to a host triple and objects for two different
-    // hosts are not interchangeable. Hashing only the variable let an ELF cache
-    // and a COFF cache share a key.
+    // Host triples must distinguish caches when no target was requested.
     char triple[256];
     if (dolllvm_effective_triple(getenv("DOLRECOMP_LLVM_TARGET"), triple,
                                  sizeof(triple)))
