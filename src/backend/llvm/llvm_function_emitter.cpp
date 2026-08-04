@@ -336,6 +336,10 @@ void FunctionEmitter::emitEntry() {
       builder_.CreateAlloca(Type::getInt64Ty(context_), nullptr, "cycles");
   builder_.CreateStore(ConstantInt::get(Type::getInt64Ty(context_), 0),
                        cycles_);
+  guard_cycles_ = builder_.CreateAlloca(Type::getInt64Ty(context_), nullptr,
+                                        "guard_cycles");
+  builder_.CreateStore(ConstantInt::get(Type::getInt64Ty(context_), 0),
+                       guard_cycles_);
   guard_steps_ =
       builder_.CreateAlloca(Type::getInt64Ty(context_), nullptr, "guard_steps");
   builder_.CreateStore(ConstantInt::get(Type::getInt64Ty(context_), 0),
@@ -356,6 +360,15 @@ void FunctionEmitter::chargeCycles(u32 cycles) {
   Value *next = builder_.CreateAdd(
       old, ConstantInt::get(Type::getInt64Ty(context_), cycles));
   builder_.CreateStore(next, cycles_);
+  // Same charge, into an accumulator no resume point clears. cycles_ is the
+  // amount still owed to downcount; guard_cycles_ is the total since dispatch,
+  // which is what the yield decision needs.
+  Value *guard_old =
+      builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_);
+  builder_.CreateStore(
+      builder_.CreateAdd(guard_old,
+                         ConstantInt::get(Type::getInt64Ty(context_), cycles)),
+      guard_cycles_);
 }
 
 void FunctionEmitter::materialize(u32 pc) {
@@ -371,6 +384,10 @@ void FunctionEmitter::materialize(u32 pc) {
                ConstantInt::get(Type::getInt32Ty(context_), pc));
   Value *downcount =
       loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, downcount));
+  // cycles_, not guard_cycles_: this is the debt still owed to downcount, and a
+  // resume point zeroes it precisely because that debt has just been paid.
+  // Subtracting the cumulative counter here would charge every earlier block
+  // again on each flush.
   Value *cycles = builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
   builder_.CreateStore(builder_.CreateSub(downcount, cycles),
                        bytePtr(offsetof(CPUState, downcount)));
@@ -382,12 +399,17 @@ void FunctionEmitter::sideExit(u32 pc) {
 }
 
 void FunctionEmitter::emitBudgetGuard(u32 pc) {
-  Value *cycles = builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
+  // Read the cumulative accumulator, not cycles_. Reading cycles_ here was the
+  // bug: a loop whose body crosses a call has cycles_ cleared on every resume,
+  // so it never reaches 256 and downcount runs past zero while the loop spins.
+  // guard_cycles_ survives those resumes, so this is a real bound on how long a
+  // single native entry can run before the dispatcher gets control back.
+  Value *cycles =
+      builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_);
   Value *over_cycles = builder_.CreateICmpUGE(
       cycles, ConstantInt::get(Type::getInt64Ty(context_), 256));
-  // Blocks are emitted one per guest instruction, so this bounds a single native
-  // entry to a few thousand guest instructions even when every iteration crosses
-  // a call and clears cycles_.
+  // Termination backstop for a loop whose blocks are all zero-cost; see the
+  // declaration. This counts loop iterations, not instructions.
   Value *steps = builder_.CreateLoad(Type::getInt64Ty(context_), guard_steps_);
   Value *next_steps = builder_.CreateAdd(
       steps, ConstantInt::get(Type::getInt64Ty(context_), 1));

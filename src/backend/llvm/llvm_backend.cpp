@@ -28,6 +28,13 @@ namespace {
 
 using namespace llvm;
 
+// Single definition of "which triple is in effect", shared by emission, the
+// object cache and the resume check so the three cannot disagree.
+static std::string resolveTriple(const char *requested) {
+  return requested && requested[0] ? std::string(requested)
+                                   : llvm::sys::getDefaultTargetTriple();
+}
+
 static CodeGenOptLevel codegenLevel(int level) {
   if (level <= 0)
     return CodeGenOptLevel::None;
@@ -72,9 +79,7 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
 
   int opt = options ? options->optimization_level : 2;
   std::string tripleName =
-      options && options->target_triple && options->target_triple[0]
-          ? options->target_triple
-          : llvm::sys::getDefaultTargetTriple();
+      resolveTriple(options ? options->target_triple : nullptr);
   const llvm::Triple triple(tripleName);
   if (triple.getArch() != llvm::Triple::x86_64 ||
       (!triple.isOSLinux() && !triple.isOSWindows())) {
@@ -188,4 +193,37 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
   codegen.run(module);
   objectFile.flush();
   return true;
+}
+
+extern "C" bool dolllvm_effective_triple(const char *requested, char *out,
+                                         size_t size) {
+  if (!out || size == 0)
+    return false;
+  const std::string triple = resolveTriple(requested);
+  if (triple.size() + 1 > size)
+    return false;
+  memcpy(out, triple.c_str(), triple.size() + 1);
+  return true;
+}
+
+extern "C" bool dolllvm_object_matches_triple(const char *path,
+                                              const char *requested) {
+  FILE *file = fopen(path, "rb");
+  if (!file)
+    return false;
+  unsigned char magic[4] = {0, 0, 0, 0};
+  const size_t read = fread(magic, 1, sizeof(magic), file);
+  fclose(file);
+  if (read != sizeof(magic))
+    return false;
+
+  const llvm::Triple triple(resolveTriple(requested));
+  if (triple.isOSBinFormatCOFF())
+    // IMAGE_FILE_MACHINE_AMD64, little-endian, at offset 0 of a COFF object.
+    return magic[0] == 0x64 && magic[1] == 0x86;
+  if (triple.isOSBinFormatMachO())
+    return magic[0] == 0xCF && magic[1] == 0xFA && magic[2] == 0xED &&
+           magic[3] == 0xFE;
+  return magic[0] == 0x7F && magic[1] == 'E' && magic[2] == 'L' &&
+         magic[3] == 'F';
 }

@@ -16,6 +16,7 @@ void func_80002800(CPUState* cpu);
 void func_80002900(CPUState* cpu);
 void func_80002A00(CPUState* cpu);
 void func_80002B00(CPUState* cpu);
+void func_80002C00(CPUState* cpu);
 
 static u32 fallback_count;
 static int fallback_bad;
@@ -250,6 +251,41 @@ int main(void) {
     CHECK(cpu.fpr[4] == cpu.fpr[5] && cpu.ps1[4] == cpu.ps1[6]);
 
     CHECK(fallback_count == 1);
+
+    // The dispatcher has to regain control from a loop whose body crosses a
+    // runtime boundary. Every iteration of func_80002C00 hits the fallback,
+    // which zeroes cycles_, so a guard reading cycles_ can never trip and the
+    // loop runs all 10,000 iterations in one native entry while downcount goes
+    // far past zero. That is the 0 FPS failure: the runtime never gets a chance
+    // to advance timing or service the GPU.
+    //
+    // The body costs 3 guest cycles, so a 256-cycle budget should yield after
+    // about 86 iterations. Observed: 86 iterations, downcount -258. With the
+    // guard reading cycles_ instead: 2047 iterations, downcount -6141 -- it only
+    // stopped because the iteration backstop caught it, 24x past the bound it
+    // was supposed to enforce. The limits below sit between those two so this
+    // fails on the real defect without pinning the exact threshold, which is
+    // still open to tuning.
+    prepare_call(&cpu, 0x80002C00u);
+    cpu.gpr[3] = 0;
+    cpu.downcount = 0;
+    fallback_count = 0;
+    func_80002C00(&cpu);
+    fprintf(stderr, "budget guard: %u iterations, downcount %lld\n",
+            cpu.gpr[3], (long long)cpu.downcount);
+    CHECK(cpu.gpr[3] > 0);
+    CHECK(cpu.gpr[3] < 1000);
+    CHECK(cpu.pc >= 0x80002C00u && cpu.pc <= 0x80002C10u);
+    CHECK(cpu.pc != cpu.lr);
+    CHECK(cpu.downcount < 0 && cpu.downcount > -1024);
+    CHECK(fallback_count == (u32)cpu.gpr[3]);
+
+    // Re-entering resumes rather than restarting: the guard budget is per native
+    // entry, so a caller that keeps calling still makes progress.
+    const u32 first_pass = cpu.gpr[3];
+    func_80002C00(&cpu);
+    CHECK(cpu.gpr[3] > first_pass);
+
     cpu_free(&cpu);
     return 0;
 }

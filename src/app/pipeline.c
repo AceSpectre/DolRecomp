@@ -105,16 +105,15 @@ static u32 llvm_worker_batch_size(void) {
     return (u32)value;
 }
 
+// The emitted object format follows the target triple, so this cannot assume
+// ELF: a Windows host emits COFF, and checking for ELF there rejected every
+// object the backend had just written -- silently disabling both the object
+// cache and DOLRECOMP_LLVM_RESUME, in a way that looks like a cold build rather
+// than an error.
 static int valid_object_file(const char* path) {
-    FILE* file = fopen(path, "rb");
-    if (!file)
-        return 0;
-    unsigned char magic[4];
-    int valid = fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
-                magic[0] == 0x7Fu && magic[1] == 'E' &&
-                magic[2] == 'L' && magic[3] == 'F';
-    fclose(file);
-    return valid;
+    return dolllvm_object_matches_triple(path, getenv("DOLRECOMP_LLVM_TARGET"))
+               ? 1
+               : 0;
 }
 
 static int llvm_job_stamp_path(const LLVMChunkJob* job, char* path,
@@ -208,9 +207,14 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     hash = hash_bytes(hash, &job->count, sizeof(job->count));
     u32 state_size = (u32)sizeof(CPUState);
     hash = hash_bytes(hash, &state_size, sizeof(state_size));
-    const char* target = getenv("DOLRECOMP_LLVM_TARGET");
-    if (target)
-        hash = hash_bytes(hash, target, strlen(target));
+    // The *effective* triple, not the environment variable, because an unset
+    // variable still resolves to a host triple and objects for two different
+    // hosts are not interchangeable. Hashing only the variable let an ELF cache
+    // and a COFF cache share a key.
+    char triple[256];
+    if (dolllvm_effective_triple(getenv("DOLRECOMP_LLVM_TARGET"), triple,
+                                 sizeof(triple)))
+        hash = hash_bytes(hash, triple, strlen(triple));
     for (u32 i = 0; i < job->count; i++) {
         hash = hash_bytes(hash, &job->insts[i].address,
                           sizeof(job->insts[i].address));
