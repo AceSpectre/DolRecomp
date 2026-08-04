@@ -1265,27 +1265,33 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
+    /* ps_merge reads both sources before writing rD: when rD aliases rA or
+     * rB, writing ctx->fpr[rD] first would corrupt the second read. */
     case PPC_OP_PS_MERGE00:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
+        fprintf(out, "    { f64 mrg_a = ctx->fpr[%u], mrg_b = ctx->fpr[%u];\n", inst->rA, inst->rB);
+        fprintf(out, "      ctx->fpr[%u] = dolrecomp_ps_round(mrg_a);\n", inst->rD);
+        fprintf(out, "      ctx->ps1[%u] = dolrecomp_ps_round(mrg_b); }\n", inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE01:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rB);
+        fprintf(out, "    { f64 mrg_a = ctx->fpr[%u], mrg_b = ctx->ps1[%u];\n", inst->rA, inst->rB);
+        fprintf(out, "      ctx->fpr[%u] = dolrecomp_ps_round(mrg_a);\n", inst->rD);
+        fprintf(out, "      ctx->ps1[%u] = dolrecomp_ps_round(mrg_b); }\n", inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE10:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
+        fprintf(out, "    { f64 mrg_a = ctx->ps1[%u], mrg_b = ctx->fpr[%u];\n", inst->rA, inst->rB);
+        fprintf(out, "      ctx->fpr[%u] = dolrecomp_ps_round(mrg_a);\n", inst->rD);
+        fprintf(out, "      ctx->ps1[%u] = dolrecomp_ps_round(mrg_b); }\n", inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE11:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rB);
+        fprintf(out, "    { f64 mrg_a = ctx->ps1[%u], mrg_b = ctx->ps1[%u];\n", inst->rA, inst->rB);
+        fprintf(out, "      ctx->fpr[%u] = dolrecomp_ps_round(mrg_a);\n", inst->rD);
+        fprintf(out, "      ctx->ps1[%u] = dolrecomp_ps_round(mrg_b); }\n", inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
