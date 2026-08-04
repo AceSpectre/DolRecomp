@@ -245,6 +245,10 @@ add_executable(test_fpscr tests/test_fpscr.c)
 target_link_libraries(test_fpscr PRIVATE dr_cpu)
 add_test(NAME fpscr COMMAND test_fpscr)
 
+add_executable(test_float_semantics tests/test_float_semantics.c)
+target_link_libraries(test_float_semantics PRIVATE dr_cpu)
+add_test(NAME float_semantics COMMAND test_float_semantics)
+
 add_executable(test_dolir tests/test_dolir.c)
 target_link_libraries(test_dolir PRIVATE dr_ir)
 add_test(NAME dolir COMMAND test_dolir)
