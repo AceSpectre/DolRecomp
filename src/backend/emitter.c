@@ -68,20 +68,25 @@ static void emit_compare_u32(FILE* out, u8 crf, const char* lhs, const char* rhs
     fprintf(out, "    }\n");
 }
 
-static void emit_fcompare(FILE* out, const PPCInst* inst) {
-    u32 shift = cr_field_shift(inst->crfD);
+static void emit_ps_merge(FILE* out, const PPCInst* inst,
+                          bool use_a_ps1, bool use_b_ps1) {
+    const char* a_bank = use_a_ps1 ? "ps1" : "fpr";
+    const char* b_bank = use_b_ps1 ? "ps1" : "fpr";
 
     fprintf(out, "    {\n");
-    fprintf(out, "        f64 val_a = ctx->fpr[%u];\n", inst->rA);
-    fprintf(out, "        f64 val_b = ctx->fpr[%u];\n", inst->rB);
-    fprintf(out, "        u32 cr_bits = 0;\n");
-    fprintf(out, "        if (val_a < val_b)       cr_bits = 0x8u;\n");
-    fprintf(out, "        else if (val_a > val_b)  cr_bits = 0x4u;\n");
-    fprintf(out, "        else if (val_a == val_b) cr_bits = 0x2u;\n");
-    fprintf(out, "        else                     cr_bits = 0x1u;\n");
-    fprintf(out, "        ctx->cr = (ctx->cr & ~(0xFu << %u)) | (cr_bits << %u);\n",
-            shift, shift);
+    fprintf(out, "        f64 ps0 = ctx->%s[%u];\n",
+            a_bank, inst->rA);
+    fprintf(out, "        f64 ps1 = ctx->%s[%u];\n",
+            b_bank, inst->rB);
+    fprintf(out, "        ctx->fpr[%u] = ps0;\n", inst->rD);
+    fprintf(out, "        ctx->ps1[%u] = ps1;\n", inst->rD);
     fprintf(out, "    }\n");
+}
+
+static void emit_fcompare(FILE* out, const PPCInst* inst) {
+    fprintf(out, "    ppc_fcmp(ctx, %u, ctx->fpr[%u], ctx->fpr[%u], %s);\n",
+            inst->crfD, inst->rA, inst->rB,
+            inst->op == PPC_OP_FCMPO ? "true" : "false");
 }
 
 static void emit_dform_ea(FILE* out, u8 ra, s16 simm, bool update) {
@@ -161,7 +166,7 @@ static void emit_fload(FILE* out, const PPCInst* inst, bool single,
     emit_dform_ea(out, inst->rA, inst->simm, update);
     fprintf(out, ";\n");
     if (single) {
-        fprintf(out, "        f64 value = (f64)dolrecomp_f32_from_bits(mem_read32(ctx, ea));\n");
+        fprintf(out, "        f64 value = dolrecomp_f32_from_bits(mem_read32(ctx, ea));\n");
         fprintf(out, "        ctx->fpr[%u] = value;\n", inst->rD);
         fprintf(out, "        ctx->ps1[%u] = value;\n", inst->rD);
     } else {
@@ -181,7 +186,7 @@ static void emit_floadx(FILE* out, const PPCInst* inst, bool single,
     emit_xform_ea(out, inst->rA, inst->rB, update);
     fprintf(out, ";\n");
     if (single) {
-        fprintf(out, "        f64 value = (f64)dolrecomp_f32_from_bits(mem_read32(ctx, ea));\n");
+        fprintf(out, "        f64 value = dolrecomp_f32_from_bits(mem_read32(ctx, ea));\n");
         fprintf(out, "        ctx->fpr[%u] = value;\n", inst->rD);
         fprintf(out, "        ctx->ps1[%u] = value;\n", inst->rD);
     } else {
@@ -201,7 +206,7 @@ static void emit_fstore(FILE* out, const PPCInst* inst, bool single,
     emit_dform_ea(out, inst->rA, inst->simm, update);
     fprintf(out, ";\n");
     if (single) {
-        fprintf(out, "        mem_write32(ctx, ea, dolrecomp_f32_to_bits((f32)ctx->fpr[%u]));\n",
+        fprintf(out, "        mem_write32(ctx, ea, dolrecomp_f32_to_bits(ctx->fpr[%u]));\n",
                 inst->rS);
     } else {
         fprintf(out, "        mem_write64(ctx, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]));\n",
@@ -220,7 +225,7 @@ static void emit_fstorex(FILE* out, const PPCInst* inst, bool single,
     emit_xform_ea(out, inst->rA, inst->rB, update);
     fprintf(out, ";\n");
     if (single) {
-        fprintf(out, "        mem_write32(ctx, ea, dolrecomp_f32_to_bits((f32)ctx->fpr[%u]));\n",
+        fprintf(out, "        mem_write32(ctx, ea, dolrecomp_f32_to_bits(ctx->fpr[%u]));\n",
                 inst->rS);
     } else {
         fprintf(out, "        mem_write64(ctx, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]));\n",
@@ -306,6 +311,7 @@ static void emit_branch_condition(FILE* out, u8 bo, u8 bi) {
 static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
     return target >= func_start && target < func_end && ((target - func_start) & 3u) == 0;
 }
+
 
 static void emit_direct_branch(FILE* out, const PPCInst* inst,
                                bool local_target, bool direct_backedge) {
@@ -433,16 +439,53 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "    return sh ? ((value << sh) | (value >> (32u - sh))) : value;\n"
         "}\n"
         "\n"
-        "static inline f32 dolrecomp_f32_from_bits(u32 bits) {\n"
-        "    f32 value;\n"
-        "    memcpy(&value, &bits, sizeof(value));\n"
+        // Preserve the PPC bit-level single conversion, including denormals.
+        "static inline f64 dolrecomp_f32_from_bits(u32 bits) {\n"
+        "    u64 x = bits;\n"
+        "    u64 exp = (x >> 23) & 0xFFu;\n"
+        "    u64 frac = x & 0x007FFFFFu;\n"
+        "    u64 result;\n"
+        "    if (exp > 0 && exp < 255) {\n"
+        "        u64 y = !(exp >> 7);\n"
+        "        u64 z = (y << 61) | (y << 60) | (y << 59);\n"
+        "        result = ((x & 0xC0000000u) << 32) | z |\n"
+        "                 ((x & 0x3FFFFFFFu) << 29);\n"
+        "    } else if (exp == 0 && frac != 0) {\n"
+        "        exp = 1023 - 126;\n"
+        "        do {\n"
+        "            frac <<= 1;\n"
+        "            exp -= 1;\n"
+        "        } while ((frac & 0x00800000u) == 0);\n"
+        "        result = ((x & 0x80000000u) << 32) | (exp << 52) |\n"
+        "                 ((frac & 0x007FFFFFu) << 29);\n"
+        "    } else {\n"
+        "        u64 y = exp >> 7;\n"
+        "        u64 z = (y << 61) | (y << 60) | (y << 59);\n"
+        "        result = ((x & 0xC0000000u) << 32) | z |\n"
+        "                 ((x & 0x3FFFFFFFu) << 29);\n"
+        "    }\n"
+        "    f64 value;\n"
+        "    memcpy(&value, &result, sizeof(value));\n"
         "    return value;\n"
         "}\n"
         "\n"
-        "static inline u32 dolrecomp_f32_to_bits(f32 value) {\n"
-        "    u32 bits;\n"
+        "static inline u32 dolrecomp_f32_to_bits(f64 value) {\n"
+        "    u64 bits;\n"
         "    memcpy(&bits, &value, sizeof(bits));\n"
-        "    return bits;\n"
+        "    u32 exp = (u32)((bits >> 52) & 0x7FFu);\n"
+        "    if (exp > 896 || (bits & 0x7FFFFFFFFFFFFFFFull) == 0) {\n"
+        "        return (u32)(((bits >> 32) & 0xC0000000u) |\n"
+        "                     ((bits >> 29) & 0x3FFFFFFFu));\n"
+        "    }\n"
+        "    if (exp >= 874) {\n"
+        "        u32 result =\n"
+        "            (u32)(0x80000000u | ((bits & 0x000FFFFFFFFFFFFFull) >> 21));\n"
+        "        result >>= 905 - exp;\n"
+        "        result |= (u32)((bits >> 32) & 0x80000000u);\n"
+        "        return result;\n"
+        "    }\n"
+        "    return (u32)(((bits >> 32) & 0xC0000000u) |\n"
+        "                 ((bits >> 29) & 0x3FFFFFFFu));\n"
         "}\n"
         "\n"
         "static inline f64 dolrecomp_f64_from_bits(u64 bits) {\n"
@@ -457,16 +500,12 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "    return bits;\n"
         "}\n"
         "\n"
-        "static inline f64 dolrecomp_ps_round(f64 value) {\n"
-        "    return (f64)(f32)value;\n"
-        "}\n"
-        "\n"
         "static inline f64 dolrecomp_ps_from_bits(u32 bits) {\n"
-        "    return (f64)dolrecomp_f32_from_bits(bits);\n"
+        "    return dolrecomp_f32_from_bits(bits);\n"
         "}\n"
         "\n"
         "static inline u32 dolrecomp_ps_to_bits(f64 value) {\n"
-        "    return dolrecomp_f32_to_bits((f32)value);\n"
+        "    return dolrecomp_f32_to_bits(value);\n"
         "}\n"
         "\n"
         ,
@@ -969,23 +1008,23 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_FADDS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] + ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ppc_fadds(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FSUBS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] - ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ppc_fsubs(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FMULS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC);
+        fprintf(out, "    ppc_fmuls(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rC);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FDIVS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] / ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ppc_fdivs(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FRES:
@@ -1011,23 +1050,23 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     }
 
     case PPC_OP_FADD:
-        fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u] + ctx->fpr[%u];\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ppc_fadd(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FSUB:
-        fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u] - ctx->fpr[%u];\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ppc_fsub(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FMUL:
-        fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u] * ctx->fpr[%u];\n",
-                inst->rD, inst->rA, inst->rC);
+        fprintf(out, "    ppc_fmul(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rC);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FDIV:
-        fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u] / ctx->fpr[%u];\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ppc_fdiv(ctx, %u, %u, %u);\n", inst->rD, inst->rA, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FRSQRTE:
@@ -1061,25 +1100,30 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 
     case PPC_OP_FMR:
         fprintf(out, "    ctx->fpr[%u] = ctx->fpr[%u];\n", inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FNEG:
         fprintf(out, "    ctx->fpr[%u] = dolrecomp_f64_from_bits(dolrecomp_f64_to_bits(ctx->fpr[%u]) ^ 0x8000000000000000ull);\n",
                 inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FABS:
         fprintf(out, "    ctx->fpr[%u] = dolrecomp_f64_from_bits(dolrecomp_f64_to_bits(ctx->fpr[%u]) & 0x7FFFFFFFFFFFFFFFull);\n",
                 inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FNABS:
         fprintf(out, "    ctx->fpr[%u] = dolrecomp_f64_from_bits(dolrecomp_f64_to_bits(ctx->fpr[%u]) | 0x8000000000000000ull);\n",
                 inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FRSP:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)ctx->fpr[%u];\n", inst->rD, inst->rB);
+        fprintf(out, "    ppc_frsp(ctx, %u, %u);\n", inst->rD, inst->rB);
+        if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_FSEL:
@@ -1147,54 +1191,36 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_PS_ADD:
-        fprintf(out, "    {\n");
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
-        fprintf(out, "        ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] + (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_add_op(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
-        fprintf(out, "    }\n");
         break;
 
     case PPC_OP_PS_SUB:
-        fprintf(out, "    {\n");
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] - (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
-        fprintf(out, "        ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] - (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_sub_op(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
-        fprintf(out, "    }\n");
         break;
 
     case PPC_OP_PS_MUL:
-        fprintf(out, "    {\n");
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC);
-        fprintf(out, "        ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_mul_op(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rC);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
-        fprintf(out, "    }\n");
         break;
 
     case PPC_OP_PS_DIV:
-        fprintf(out, "    {\n");
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] / (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
-        fprintf(out, "        ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] / (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_div_op(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
-        fprintf(out, "    }\n");
         break;
 
     case PPC_OP_PS_RES:
-        fprintf(out, "    { f64 a, b; ppc_ps_res(ctx, ctx->fpr[%u], ctx->ps1[%u], &a, &b); ctx->fpr[%u] = dolrecomp_ps_round(a); ctx->ps1[%u] = dolrecomp_ps_round(b); }\n",
-                inst->rB, inst->rB, inst->rD, inst->rD);
+        fprintf(out, "    ppc_ps_res_op(ctx, %u, %u);\n", inst->rD, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_RSQRTE:
-        fprintf(out, "    { f64 a, b; ppc_ps_rsqrte(ctx, ctx->fpr[%u], ctx->ps1[%u], &a, &b); ctx->fpr[%u] = dolrecomp_ps_round(a); ctx->ps1[%u] = dolrecomp_ps_round(b); }\n",
-                inst->rB, inst->rB, inst->rD, inst->rD);
+        fprintf(out, "    ppc_ps_rsqrte_op(ctx, %u, %u);\n", inst->rD, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
@@ -1202,26 +1228,13 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_PS_MSUB:
     case PPC_OP_PS_NMADD:
     case PPC_OP_PS_NMSUB:
-        fprintf(out, "    {\n");
-        fprintf(out, "        f32 ps0 = (f32)ctx->fpr[%u] * (f32)ctx->fpr[%u];\n",
-                inst->rA, inst->rC);
-        fprintf(out, "        f32 ps1 = (f32)ctx->ps1[%u] * (f32)ctx->ps1[%u];\n",
-                inst->rA, inst->rC);
-        if (inst->op == PPC_OP_PS_MADD || inst->op == PPC_OP_PS_NMADD) {
-            fprintf(out, "        ps0 += (f32)ctx->fpr[%u];\n", inst->rB);
-            fprintf(out, "        ps1 += (f32)ctx->ps1[%u];\n", inst->rB);
-        } else {
-            fprintf(out, "        ps0 -= (f32)ctx->fpr[%u];\n", inst->rB);
-            fprintf(out, "        ps1 -= (f32)ctx->ps1[%u];\n", inst->rB);
-        }
-        if (inst->op == PPC_OP_PS_NMADD || inst->op == PPC_OP_PS_NMSUB) {
-            fprintf(out, "        ps0 = -ps0;\n");
-            fprintf(out, "        ps1 = -ps1;\n");
-        }
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_ps_round(ps0);\n", inst->rD);
-        fprintf(out, "        ctx->ps1[%u] = dolrecomp_ps_round(ps1);\n", inst->rD);
+        fprintf(out, "    ppc_ps_madd_op(ctx, %u, %u, %u, %u, %s, %s);\n",
+                inst->rD, inst->rA, inst->rC, inst->rB,
+                (inst->op == PPC_OP_PS_MSUB || inst->op == PPC_OP_PS_NMSUB) ?
+                    "true" : "false",
+                (inst->op == PPC_OP_PS_NMADD || inst->op == PPC_OP_PS_NMSUB) ?
+                    "true" : "false");
         if (inst->rc) emit_set_cr1_from_fpscr(out);
-        fprintf(out, "    }\n");
         break;
 
     case PPC_OP_PS_NEG:
@@ -1255,98 +1268,73 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_PS_SUM0:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n",
-                inst->rD, inst->rC);
+        fprintf(out, "    ppc_ps_sum0(ctx, %u, %u, %u, %u);\n",
+                inst->rD, inst->rA, inst->rC, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_SUM1:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n",
-                inst->rD, inst->rC);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ppc_ps_sum1(ctx, %u, %u, %u, %u);\n",
+                inst->rD, inst->rA, inst->rC, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MULS0:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u]);\n",
+        fprintf(out, "    ppc_ps_muls0(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rC);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MULS1:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->ps1[%u]);\n",
-                inst->rD, inst->rA, inst->rC);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_muls1(ctx, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rC);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MADDS0:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->fpr[%u] + (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC, inst->rB);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->fpr[%u] + (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_madds0(ctx, %u, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rC, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MADDS1:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round((f32)ctx->fpr[%u] * (f32)ctx->ps1[%u] + (f32)ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC, inst->rB);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round((f32)ctx->ps1[%u] * (f32)ctx->ps1[%u] + (f32)ctx->ps1[%u]);\n",
+        fprintf(out, "    ppc_ps_madds1(ctx, %u, %u, %u, %u);\n",
                 inst->rD, inst->rA, inst->rC, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE00:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
+        emit_ps_merge(out, inst, false, false);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE01:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rB);
+        emit_ps_merge(out, inst, false, true);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE10:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->fpr[%u]);\n", inst->rD, inst->rB);
+        emit_ps_merge(out, inst, true, false);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MERGE11:
-        fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rA);
-        fprintf(out, "    ctx->ps1[%u] = dolrecomp_ps_round(ctx->ps1[%u]);\n", inst->rD, inst->rB);
+        emit_ps_merge(out, inst, true, true);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_CMPU0:
     case PPC_OP_PS_CMPO0:
     case PPC_OP_PS_CMPU1:
-    case PPC_OP_PS_CMPO1:
-        fprintf(out, "    {\n");
-        if (inst->op == PPC_OP_PS_CMPU0 || inst->op == PPC_OP_PS_CMPO0) {
-            fprintf(out, "        f32 val_a = (f32)ctx->fpr[%u];\n", inst->rA);
-            fprintf(out, "        f32 val_b = (f32)ctx->fpr[%u];\n", inst->rB);
-        } else {
-            fprintf(out, "        f32 val_a = (f32)ctx->ps1[%u];\n", inst->rA);
-            fprintf(out, "        f32 val_b = (f32)ctx->ps1[%u];\n", inst->rB);
-        }
-        fprintf(out, "        u32 cr_bits = 0;\n");
-        fprintf(out, "        if (val_a < val_b)       cr_bits = 0x8u;\n");
-        fprintf(out, "        else if (val_a > val_b)  cr_bits = 0x4u;\n");
-        fprintf(out, "        else if (val_a == val_b) cr_bits = 0x2u;\n");
-        fprintf(out, "        else                     cr_bits = 0x1u;\n");
-        fprintf(out, "        ctx->cr = (ctx->cr & ~(0xFu << %u)) | (cr_bits << %u);\n",
-                cr_field_shift(inst->crfD), cr_field_shift(inst->crfD));
-        fprintf(out, "    }\n");
+    case PPC_OP_PS_CMPO1: {
+        bool lane1 = inst->op == PPC_OP_PS_CMPU1 || inst->op == PPC_OP_PS_CMPO1;
+        bool ordered = inst->op == PPC_OP_PS_CMPO0 || inst->op == PPC_OP_PS_CMPO1;
+        const char* bank = lane1 ? "ps1" : "fpr";
+        fprintf(out, "    ppc_fcmp(ctx, %u, ctx->%s[%u], ctx->%s[%u], %s);\n",
+                inst->crfD, bank, inst->rA, bank, inst->rB,
+                ordered ? "true" : "false");
         break;
+    }
 
     case PPC_OP_PS_SEL:
         fprintf(out, "    ctx->fpr[%u] = ((f32)ctx->fpr[%u] >= 0.0f) ? ctx->fpr[%u] : ctx->fpr[%u];\n",
@@ -1834,6 +1822,8 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
                 func_addr);
         return false;
     }
+    // DOLRECOMP_C_LOCAL_RETURNS=0 sends every blr back through the dispatcher
+    // instead of routing it inside the function.
     bool has_local_returns = false;
     for (u32 i = 0; i < count; ++i)
         has_local_returns |= cfg.return_targets[i] != 0;

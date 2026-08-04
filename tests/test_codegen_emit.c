@@ -155,6 +155,28 @@ int main(int argc, char** argv) {
     if (!emit_function(out, memory_loop, 6, BASE + 0x1040))
         return 1;
 
+    PPCInst paired_compare[2];
+    paired_compare[0] = ppc_decode((4u << 26) | (2u << 23) | (1u << 16) |
+                                   (2u << 11) | (32u << 1), BASE + 0x1060);
+    paired_compare[1] = ppc_decode(0x4E800020u, BASE + 0x1064);
+    if (!emit_function(out, paired_compare, 2, BASE + 0x1060))
+        return 1;
+
+    PPCInst record_float[2];
+    record_float[0] = ppc_decode((59u << 26) | (3u << 21) | (1u << 16) |
+                                 (2u << 11) | (21u << 1) | 1u,
+                                 BASE + 0x1068);
+    record_float[1] = ppc_decode(0x4E800020u, BASE + 0x106C);
+    if (!emit_function(out, record_float, 2, BASE + 0x1068))
+        return 1;
+
+    PPCInst paired_merge[2];
+    paired_merge[0] = ppc_decode((4u << 26) | (5u << 21) | (1u << 16) |
+                                 (2u << 11) | (528u << 1), BASE + 0x1070);
+    paired_merge[1] = ppc_decode(0x4E800020u, BASE + 0x1074);
+    if (!emit_function(out, paired_merge, 2, BASE + 0x1070))
+        return 1;
+
     FunctionList funcs = {0};
     if (!function_list_add(&funcs, BASE, BASE + (u32)count * 4u) ||
         !function_list_add(&funcs, BASE + 0x1000, BASE + 0x100C) ||
@@ -162,7 +184,10 @@ int main(int argc, char** argv) {
         !function_list_add(&funcs, BASE + 0x1018, BASE + 0x101C) ||
         !function_list_add(&funcs, BASE + 0x1020, BASE + 0x1030) ||
         !function_list_add(&funcs, BASE + 0x1030, BASE + 0x1040) ||
-        !function_list_add(&funcs, BASE + 0x1040, BASE + 0x1058)) {
+        !function_list_add(&funcs, BASE + 0x1040, BASE + 0x1058) ||
+        !function_list_add(&funcs, BASE + 0x1060, BASE + 0x1068) ||
+        !function_list_add(&funcs, BASE + 0x1068, BASE + 0x1070) ||
+        !function_list_add(&funcs, BASE + 0x1070, BASE + 0x1078)) {
         function_list_free(&funcs);
         free(insts);
         if (out != stdout) fclose(out);

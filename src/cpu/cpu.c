@@ -1277,9 +1277,125 @@ void ppc_fcmp(CPUState* cpu, u8 crfd, f64 a, f64 b, bool ordered) {
     } else {
         compare = 2u;
     }
-    cpu->fpscr |= compare << 12;
+    // FPCC is the low four bits of FPRF (bits 12-15 here); bit 16 is the C
+    // class bit, which a compare leaves alone. Replace rather than OR, or a
+    // less-than followed by an equal reads back as 0xA instead of 0x2.
+    cpu->fpscr = (cpu->fpscr & ~(0xFu << 12)) | (compare << 12);
     u32 shift = 4u * (7u - crfd);
     cpu->cr = (cpu->cr & ~(0xFu << shift)) | (compare << shift);
+}
+
+enum {
+    FPSCR_ZX = 0x04000000u,
+    FPSCR_XX = 0x02000000u,
+    FPSCR_VXSNAN = 0x01000000u,
+    FPSCR_VXISI = 0x00800000u,
+    FPSCR_VXIDI = 0x00400000u,
+    FPSCR_VXZDZ = 0x00200000u,
+    FPSCR_VXIMZ = 0x00100000u,
+    FPSCR_FR = 0x00040000u,
+    FPSCR_FI = 0x00020000u,
+    FPSCR_VE = 0x00000080u,
+    FPSCR_ZE = 0x00000010u,
+    FPSCR_NI = 0x00000004u,
+};
+
+typedef struct {
+    f64 value;
+    u32 exception;
+} FPBinaryResult;
+
+typedef enum {
+    FP_ADD,
+    FP_SUB,
+    FP_MUL,
+    FP_DIV,
+} FPBinaryOp;
+
+static f64 quiet_nan(f64 value) {
+    return f64_value(f64_bits(value) | 0x0008000000000000ull);
+}
+
+static f32 force_single(CPUState* cpu, f64 value) {
+    if (cpu->fpscr & FPSCR_NI) {
+        u64 bits = f64_bits(value);
+        if ((bits & 0x7FFFFFFFFFFFFFFFull) < 0x3810000000000000ull)
+            return f32_value((u32)(bits >> 32) & 0x80000000u);
+    }
+
+    f32 result = (f32)value;
+    if ((cpu->fpscr & FPSCR_NI) && fpclassify(result) == FP_SUBNORMAL)
+        return copysignf(0.0f, result);
+    return result;
+}
+
+static f64 force_double(CPUState* cpu, f64 value) {
+    if ((cpu->fpscr & FPSCR_NI) && fpclassify(value) == FP_SUBNORMAL)
+        return copysign(0.0, value);
+    return value;
+}
+
+static void clear_fi_fr(CPUState* cpu) {
+    cpu->fpscr &= ~(FPSCR_FI | FPSCR_FR);
+}
+
+static void set_fi_fr(CPUState* cpu, f64 exact, f64 rounded) {
+    clear_fi_fr(cpu);
+    if (isnan(exact) || exact == rounded)
+        return;
+    set_fp_exception(cpu, FPSCR_XX);
+    cpu->fpscr |= FPSCR_FI;
+    if (fabs(rounded) > fabs(exact))
+        cpu->fpscr |= FPSCR_FR;
+}
+
+static FPBinaryResult binary_fp(CPUState* cpu, FPBinaryOp op, f64 a, f64 b) {
+    FPBinaryResult result = {0};
+    switch (op) {
+    case FP_ADD: result.value = a + b; break;
+    case FP_SUB: result.value = a - b; break;
+    case FP_MUL: result.value = a * b; break;
+    case FP_DIV: result.value = a / b; break;
+    }
+
+    if (op == FP_DIV && isinf(result.value) && b == 0.0) {
+        result.exception = FPSCR_ZX;
+    } else if (isnan(result.value)) {
+        if (is_snan(a) || is_snan(b))
+            result.exception = FPSCR_VXSNAN;
+        clear_fi_fr(cpu);
+
+        if (isnan(a))
+            result.value = quiet_nan(a);
+        else if (isnan(b))
+            result.value = quiet_nan(b);
+        else if (op == FP_MUL) {
+            result.value = f64_value(0x7FF8000000000000ull);
+            result.exception = FPSCR_VXIMZ;
+        } else if (op == FP_DIV) {
+            result.value = f64_value(0x7FF8000000000000ull);
+            result.exception = b == 0.0 ? FPSCR_VXZDZ : FPSCR_VXIDI;
+        } else {
+            result.value = f64_value(0x7FF8000000000000ull);
+            result.exception = FPSCR_VXISI;
+        }
+    } else if ((op == FP_ADD || op == FP_SUB) && (isinf(a) || isinf(b))) {
+        clear_fi_fr(cpu);
+    }
+
+    if (result.exception)
+        set_fp_exception(cpu, result.exception);
+    return result;
+}
+
+static bool binary_result_enabled(const CPUState* cpu, FPBinaryResult result) {
+    const u32 invalid = FPSCR_VXSNAN | FPSCR_VXISI | FPSCR_VXIDI |
+                        FPSCR_VXZDZ | FPSCR_VXIMZ;
+    if ((result.exception & invalid) && (cpu->fpscr & FPSCR_VE))
+        return false;
+    if (result.exception == FPSCR_ZX && (cpu->fpscr & FPSCR_ZE))
+        return false;
+    return true;
 }
 
 static void write_single_result(CPUState* cpu, u8 d, f32 value) {
@@ -1288,46 +1404,72 @@ static void write_single_result(CPUState* cpu, u8 d, f32 value) {
     set_fprf(cpu, classify_f32(value));
 }
 
+static void binary_single(CPUState* cpu, u8 d, f64 a, f64 b, FPBinaryOp op) {
+    FPBinaryResult result = binary_fp(cpu, op, a, b);
+    if (!binary_result_enabled(cpu, result))
+        return;
+    f32 rounded = force_single(cpu, result.value);
+    if (isfinite(result.value))
+        set_fi_fr(cpu, result.value, (f64)rounded);
+    write_single_result(cpu, d, rounded);
+}
+
+static void binary_double(CPUState* cpu, u8 d, f64 a, f64 b, FPBinaryOp op) {
+    FPBinaryResult result = binary_fp(cpu, op, a, b);
+    if (!binary_result_enabled(cpu, result))
+        return;
+    cpu->fpr[d] = force_double(cpu, result.value);
+    if (op == FP_MUL)
+        clear_fi_fr(cpu);
+    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+}
+
 void ppc_fadds(CPUState* cpu, u8 d, u8 a, u8 b) {
-    write_single_result(cpu, d, (f32)(cpu->fpr[a] + cpu->fpr[b]));
+    binary_single(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_ADD);
 }
 
 void ppc_fsubs(CPUState* cpu, u8 d, u8 a, u8 b) {
-    write_single_result(cpu, d, (f32)(cpu->fpr[a] - cpu->fpr[b]));
+    binary_single(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_SUB);
 }
 
 void ppc_fmuls(CPUState* cpu, u8 d, u8 a, u8 c) {
-    write_single_result(cpu, d, (f32)(cpu->fpr[a] * force_25_bit(cpu->fpr[c])));
-    cpu->fpscr &= ~0x00060000u;
+    binary_single(cpu, d, cpu->fpr[a], force_25_bit(cpu->fpr[c]), FP_MUL);
 }
 
 void ppc_fdivs(CPUState* cpu, u8 d, u8 a, u8 b) {
-    write_single_result(cpu, d, (f32)(cpu->fpr[a] / cpu->fpr[b]));
+    binary_single(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_DIV);
 }
 
 void ppc_fadd(CPUState* cpu, u8 d, u8 a, u8 b) {
-    cpu->fpr[d] = cpu->fpr[a] + cpu->fpr[b];
-    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+    binary_double(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_ADD);
 }
 
 void ppc_fsub(CPUState* cpu, u8 d, u8 a, u8 b) {
-    cpu->fpr[d] = cpu->fpr[a] - cpu->fpr[b];
-    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+    binary_double(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_SUB);
 }
 
 void ppc_fmul(CPUState* cpu, u8 d, u8 a, u8 c) {
-    cpu->fpr[d] = cpu->fpr[a] * cpu->fpr[c];
-    cpu->fpscr &= ~0x00060000u;
-    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+    binary_double(cpu, d, cpu->fpr[a], cpu->fpr[c], FP_MUL);
 }
 
 void ppc_fdiv(CPUState* cpu, u8 d, u8 a, u8 b) {
-    cpu->fpr[d] = cpu->fpr[a] / cpu->fpr[b];
-    set_fprf(cpu, classify_f64(cpu->fpr[d]));
+    binary_double(cpu, d, cpu->fpr[a], cpu->fpr[b], FP_DIV);
 }
 
 void ppc_frsp(CPUState* cpu, u8 d, u8 b) {
-    write_single_result(cpu, d, (f32)cpu->fpr[b]);
+    f64 value = cpu->fpr[b];
+    f32 rounded = force_single(cpu, value);
+    if (isnan(value)) {
+        bool snan = is_snan(value);
+        if (snan)
+            set_fp_exception(cpu, FPSCR_VXSNAN);
+        clear_fi_fr(cpu);
+        if (snan && (cpu->fpscr & FPSCR_VE))
+            return;
+    } else {
+        set_fi_fr(cpu, value, (f64)rounded);
+    }
+    write_single_result(cpu, d, rounded);
 }
 
 static void write_paired_result(CPUState* cpu, u8 d, f64 ps0, f64 ps1) {
