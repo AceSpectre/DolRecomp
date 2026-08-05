@@ -135,14 +135,87 @@ bool cpu_alloc_mem2(CPUState* cpu, u32 size); //mem 2 only exists after first al
 void cpu_free(CPUState* cpu);
 void cpu_reset(CPUState* cpu);
 
-u64  mem_read64(CPUState* cpu, u32 addr);
-void mem_write64(CPUState* cpu, u32 addr, u64 value);
-u32  mem_read32(CPUState* cpu, u32 addr);
-void mem_write32(CPUState* cpu, u32 addr, u32 value);
-u16  mem_read16(CPUState* cpu, u32 addr);
-void mem_write16(CPUState* cpu, u32 addr, u16 value);
-u8   mem_read8(CPUState* cpu, u32 addr);
-void mem_write8(CPUState* cpu, u32 addr, u8 value);
+u64  mem_read64_slow(CPUState* cpu, u32 addr);
+void mem_write64_slow(CPUState* cpu, u32 addr, u64 value);
+u32  mem_read32_slow(CPUState* cpu, u32 addr);
+void mem_write32_slow(CPUState* cpu, u32 addr, u32 value);
+u16  mem_read16_slow(CPUState* cpu, u32 addr);
+void mem_write16_slow(CPUState* cpu, u32 addr, u16 value);
+u8   mem_read8_slow(CPUState* cpu, u32 addr);
+void mem_write8_slow(CPUState* cpu, u32 addr, u8 value);
+
+/* Recompiled code issues one of these per guest load/store, so they are the
+ * hottest path in the runtime. The overwhelming majority target cached MEM1
+ * (0x80000000 + ram_size), which needs nothing but a range check: the rest —
+ * uncached aliases, MEM2, the locked cache, MMIO, reservations, the write
+ * journal — stays in the out-of-line slow path, which remains the single
+ * definition of those semantics.
+ *
+ * Writes take the fast path only when no watchpoint journal is installed and
+ * no reservation is outstanding, so lwarx/stwcx and BOOMSTREET_WATCH behave
+ * exactly as before. */
+#define DOLRECOMP_MEM_FAST_HIT(cpu, addr, size) \
+    ((u32)((addr) - GC_RAM_BASE) <= (cpu)->ram_size - (size))
+
+static inline u32 mem_read32(CPUState* cpu, u32 addr) {
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 4u))
+        return read_be32(cpu->ram + (addr - GC_RAM_BASE));
+    return mem_read32_slow(cpu, addr);
+}
+
+static inline void mem_write32(CPUState* cpu, u32 addr, u32 value) {
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 4u) && !g_mem_write_journal &&
+        !cpu->reserve_valid) {
+        write_be32(cpu->ram + (addr - GC_RAM_BASE), value);
+        return;
+    }
+    mem_write32_slow(cpu, addr, value);
+}
+
+static inline u16 mem_read16(CPUState* cpu, u32 addr) {
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 2u))
+        return read_be16(cpu->ram + (addr - GC_RAM_BASE));
+    return mem_read16_slow(cpu, addr);
+}
+
+static inline void mem_write16(CPUState* cpu, u32 addr, u16 value) {
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 2u) && !g_mem_write_journal &&
+        !cpu->reserve_valid) {
+        write_be16(cpu->ram + (addr - GC_RAM_BASE), value);
+        return;
+    }
+    mem_write16_slow(cpu, addr, value);
+}
+
+static inline u8 mem_read8(CPUState* cpu, u32 addr) {
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 1u))
+        return cpu->ram[addr - GC_RAM_BASE];
+    return mem_read8_slow(cpu, addr);
+}
+
+static inline void mem_write8(CPUState* cpu, u32 addr, u8 value) {
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 1u) && !g_mem_write_journal &&
+        !cpu->reserve_valid) {
+        cpu->ram[addr - GC_RAM_BASE] = value;
+        return;
+    }
+    mem_write8_slow(cpu, addr, value);
+}
+
+static inline u64 mem_read64(CPUState* cpu, u32 addr) {
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 8u))
+        return read_be64(cpu->ram + (addr - GC_RAM_BASE));
+    return mem_read64_slow(cpu, addr);
+}
+
+static inline void mem_write64(CPUState* cpu, u32 addr, u64 value) {
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 8u) && !g_mem_write_journal &&
+        !cpu->reserve_valid) {
+        write_be64(cpu->ram + (addr - GC_RAM_BASE), value);
+        return;
+    }
+    mem_write64_slow(cpu, addr, value);
+}
 
 f64 ppc_approx_reciprocal(f64 value);
 f64 ppc_approx_rsqrt(f64 value);

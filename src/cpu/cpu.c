@@ -211,7 +211,7 @@ static u32 exception_msr(u32 old_msr, u32 exception) {
     return next;
 }
 
-u64 mem_read64(CPUState* cpu, u32 addr) {
+u64 mem_read64_slow(CPUState* cpu, u32 addr) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 8) {
@@ -223,7 +223,7 @@ u64 mem_read64(CPUState* cpu, u32 addr) {
     return read_be64(host);
 }
 
-void mem_write64(CPUState* cpu, u32 addr, u64 value) {
+void mem_write64_slow(CPUState* cpu, u32 addr, u64 value) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 8) {
@@ -239,7 +239,7 @@ void mem_write64(CPUState* cpu, u32 addr, u64 value) {
     write_be64(host, value);
 }
 
-u32 mem_read32(CPUState* cpu, u32 addr) {
+u32 mem_read32_slow(CPUState* cpu, u32 addr) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 4) {
@@ -251,7 +251,7 @@ u32 mem_read32(CPUState* cpu, u32 addr) {
     return read_be32(host);
 }
 
-void mem_write32(CPUState* cpu, u32 addr, u32 value) {
+void mem_write32_slow(CPUState* cpu, u32 addr, u32 value) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 4) {
@@ -267,7 +267,7 @@ void mem_write32(CPUState* cpu, u32 addr, u32 value) {
     write_be32(host, value);
 }
 
-u16 mem_read16(CPUState* cpu, u32 addr) {
+u16 mem_read16_slow(CPUState* cpu, u32 addr) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 2) {
@@ -279,7 +279,7 @@ u16 mem_read16(CPUState* cpu, u32 addr) {
     return read_be16(host);
 }
 
-void mem_write16(CPUState* cpu, u32 addr, u16 value) {
+void mem_write16_slow(CPUState* cpu, u32 addr, u16 value) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host || avail < 2) {
@@ -295,7 +295,7 @@ void mem_write16(CPUState* cpu, u32 addr, u16 value) {
     write_be16(host, value);
 }
 
-u8 mem_read8(CPUState* cpu, u32 addr) {
+u8 mem_read8_slow(CPUState* cpu, u32 addr) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host) {
@@ -307,7 +307,7 @@ u8 mem_read8(CPUState* cpu, u32 addr) {
     return *host;
 }
 
-void mem_write8(CPUState* cpu, u32 addr, u8 value) {
+void mem_write8_slow(CPUState* cpu, u32 addr, u8 value) {
     u32 avail;
     u8* host = resolve_addr(cpu, addr, &avail);
     if (!host) {
