@@ -176,17 +176,12 @@ void ppc_take_exception(CPUState* cpu, u32 exception, u32 vector, u32 srr0, u32 
 void ppc_program_exception(CPUState* cpu, u32 cause, u32 cia);
 bool ppc_fp_available(CPUState* cpu, u32 cia);
 
-/* Inlined fast path. The emitter puts this before every FPU instruction, so the
-   call overhead dominated the test it was performing. ppc_fp_available() stays a
-   real symbol because the LLVM backend emits calls to it by name. */
-bool ppc_fp_raise_unavailable(CPUState* cpu, u32 cia);
-
 /* MSR[FP] spelled out rather than via PPC_MSR_FP: that macro is defined in
    cpu.c, not here, and defining it in the header would collide with it. */
 static inline bool ppc_fp_available_inline(CPUState* cpu, u32 cia) {
     if (cpu->msr & 0x00002000u) /* MSR[FP], PPC bit 18 */
         return true;
-    return ppc_fp_raise_unavailable(cpu, cia);
+    return ppc_fp_available(cpu, cia);
 }
 void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia);
 bool ppc_host_call(CPUState* cpu, u32 address);
