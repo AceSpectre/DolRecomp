@@ -321,7 +321,16 @@ void ppc_take_exception(CPUState* cpu, u32 exception, u32 vector, u32 srr0, u32 
 void ppc_external_interrupt_exception(CPUState* cpu);
 void ppc_decrementer_exception(CPUState* cpu);
 void ppc_program_exception(CPUState* cpu, u32 cause, u32 cia);
-bool ppc_fp_available(CPUState* cpu, u32 cia);
+void ppc_fp_unavailable_slow(CPUState* cpu, u32 cia);
+/* Checked before every FP instruction; MSR[FP] is virtually always set, so
+ * the check must be an inline test, not a cross-library call. The exception
+ * path stays out of line. */
+static inline bool ppc_fp_available(CPUState* cpu, u32 cia) {
+    if (cpu->msr & (1u << (31 - 18))) /* MSR[FP] */
+        return true;
+    ppc_fp_unavailable_slow(cpu, cia);
+    return false;
+}
 void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia);
 bool ppc_host_call(CPUState* cpu, u32 address);
 void ppc_system_call_exception(CPUState* cpu, u32 cia);
