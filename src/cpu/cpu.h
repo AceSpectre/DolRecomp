@@ -128,6 +128,16 @@ struct CPUState {
 typedef void (*PPCMemWriteJournal)(u32 offset, u32 size, void* user);
 extern PPCMemWriteJournal g_mem_write_journal;
 extern void* g_mem_write_journal_user;
+
+/* resolve_addr() slow-path bucket counters -- see cpu.c. */
+extern u64 dolrecomp_resolve_mem1;
+extern u64 dolrecomp_resolve_mem2;
+extern u64 dolrecomp_resolve_lc;
+extern u64 dolrecomp_resolve_other;
+
+/* dolrecomp_call direct-mapped translation cache -- see backend/dispatch.c. */
+extern u64 dolrecomp_call_hits;
+extern u64 dolrecomp_call_misses;
 void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user);
 
 bool cpu_init(CPUState* cpu);
@@ -157,9 +167,19 @@ void mem_write8_slow(CPUState* cpu, u32 addr, u8 value);
 #define DOLRECOMP_MEM_FAST_HIT(cpu, addr, size) \
     ((u32)((addr) - GC_RAM_BASE) <= (cpu)->ram_size - (size))
 
+/* Second-hottest range after MEM1: Wii MEM2 (0x90000000 + mem2_size), which
+ * only exists once cpu_alloc_mem2() has run, so this also gates on the host
+ * pointer being non-NULL -- mirrors resolve_addr()'s cached-MEM2 branch in
+ * cpu.c exactly (same base, same bounds, cached alias only). */
+#define DOLRECOMP_MEM2_FAST_HIT(cpu, addr, size) \
+    ((cpu)->mem2 && \
+     (u32)((addr) - WII_MEM2_BASE) <= (cpu)->mem2_size - (size))
+
 static inline u32 mem_read32(CPUState* cpu, u32 addr) {
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 4u))
         return read_be32(cpu->ram + (addr - GC_RAM_BASE));
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 4u))
+        return read_be32(cpu->mem2 + (addr - WII_MEM2_BASE));
     return mem_read32_slow(cpu, addr);
 }
 
@@ -169,12 +189,19 @@ static inline void mem_write32(CPUState* cpu, u32 addr, u32 value) {
         write_be32(cpu->ram + (addr - GC_RAM_BASE), value);
         return;
     }
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 4u) && !g_mem_write_journal &&
+        !cpu->reserve_valid) {
+        write_be32(cpu->mem2 + (addr - WII_MEM2_BASE), value);
+        return;
+    }
     mem_write32_slow(cpu, addr, value);
 }
 
 static inline u16 mem_read16(CPUState* cpu, u32 addr) {
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 2u))
         return read_be16(cpu->ram + (addr - GC_RAM_BASE));
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 2u))
+        return read_be16(cpu->mem2 + (addr - WII_MEM2_BASE));
     return mem_read16_slow(cpu, addr);
 }
 
@@ -184,12 +211,19 @@ static inline void mem_write16(CPUState* cpu, u32 addr, u16 value) {
         write_be16(cpu->ram + (addr - GC_RAM_BASE), value);
         return;
     }
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 2u) && !g_mem_write_journal &&
+        !cpu->reserve_valid) {
+        write_be16(cpu->mem2 + (addr - WII_MEM2_BASE), value);
+        return;
+    }
     mem_write16_slow(cpu, addr, value);
 }
 
 static inline u8 mem_read8(CPUState* cpu, u32 addr) {
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 1u))
         return cpu->ram[addr - GC_RAM_BASE];
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 1u))
+        return cpu->mem2[addr - WII_MEM2_BASE];
     return mem_read8_slow(cpu, addr);
 }
 
@@ -199,12 +233,19 @@ static inline void mem_write8(CPUState* cpu, u32 addr, u8 value) {
         cpu->ram[addr - GC_RAM_BASE] = value;
         return;
     }
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 1u) && !g_mem_write_journal &&
+        !cpu->reserve_valid) {
+        cpu->mem2[addr - WII_MEM2_BASE] = value;
+        return;
+    }
     mem_write8_slow(cpu, addr, value);
 }
 
 static inline u64 mem_read64(CPUState* cpu, u32 addr) {
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 8u))
         return read_be64(cpu->ram + (addr - GC_RAM_BASE));
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 8u))
+        return read_be64(cpu->mem2 + (addr - WII_MEM2_BASE));
     return mem_read64_slow(cpu, addr);
 }
 
@@ -212,6 +253,11 @@ static inline void mem_write64(CPUState* cpu, u32 addr, u64 value) {
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 8u) && !g_mem_write_journal &&
         !cpu->reserve_valid) {
         write_be64(cpu->ram + (addr - GC_RAM_BASE), value);
+        return;
+    }
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 8u) && !g_mem_write_journal &&
+        !cpu->reserve_valid) {
+        write_be64(cpu->mem2 + (addr - WII_MEM2_BASE), value);
         return;
     }
     mem_write64_slow(cpu, addr, value);

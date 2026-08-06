@@ -124,16 +124,31 @@ void cpu_reset(CPUState* cpu) {
     cpu->spr[287] = PPC_GEKKO_PVR;
 }
 
+/* resolve_addr only runs on inline-fast-path misses, so these count the
+ * slow-path lookups that fall through to here (e.g. the uncached alias),
+ * not every MEM1/MEM2 access. */
+u64 dolrecomp_resolve_mem1 = 0;
+u64 dolrecomp_resolve_mem2 = 0;
+u64 dolrecomp_resolve_lc = 0;
+u64 dolrecomp_resolve_other = 0;
+
+/* dolrecomp_call direct-mapped translation cache hit/miss counters --
+ * see backend/dispatch.c, filled in the generated dolrecomp_call(). */
+u64 dolrecomp_call_hits = 0;
+u64 dolrecomp_call_misses = 0;
+
 static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
     if (addr >= GC_RAM_BASE && addr < GC_RAM_BASE + cpu->ram_size) {
         u32 offset = addr - GC_RAM_BASE;
         *avail = cpu->ram_size - offset;
+        dolrecomp_resolve_mem1++;
         return cpu->ram + offset;
     }
 
     if (addr >= GC_RAM_UNCACHED && addr < GC_RAM_UNCACHED + cpu->ram_size) {
         u32 offset = addr - GC_RAM_UNCACHED;
         *avail = cpu->ram_size - offset;
+        dolrecomp_resolve_mem1++;
         return cpu->ram + offset;
     }
 
@@ -143,6 +158,7 @@ static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
     if (addr >= 0xE0000000u && addr < 0xE0000000u + sizeof(cpu->lc)) {
         u32 offset = addr - 0xE0000000u;
         *avail = (u32)sizeof(cpu->lc) - offset;
+        dolrecomp_resolve_lc++;
         return cpu->lc + offset;
     }
 
@@ -150,17 +166,20 @@ static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
         if (addr >= WII_MEM2_BASE && addr < WII_MEM2_BASE + cpu->mem2_size) {
             u32 offset = addr - WII_MEM2_BASE;
             *avail = cpu->mem2_size - offset;
+            dolrecomp_resolve_mem2++;
             return cpu->mem2 + offset;
         }
 
         if (addr >= WII_MEM2_UNCACHED && addr < WII_MEM2_UNCACHED + cpu->mem2_size) {
             u32 offset = addr - WII_MEM2_UNCACHED;
             *avail = cpu->mem2_size - offset;
+            dolrecomp_resolve_mem2++;
             return cpu->mem2 + offset;
         }
     }
 
     *avail = 0;
+    dolrecomp_resolve_other++;
     return NULL;
 }
 
