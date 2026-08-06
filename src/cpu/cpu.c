@@ -717,6 +717,17 @@ static s32 gqr_scale(u32 value) {
     return sign_extend(value & 0x3Fu, 6);
 }
 
+/* 2^k for k in [-32, 32], built from exponent bits. Multiplying by a power
+ * of two adjusts only the exponent, so `x * pow2(k)` is bit-identical to
+ * `ldexp(x, k)` for every input in this range (both correctly round the
+ * denormal underflow case), without the libm call per quantized lane. */
+static f64 pow2(s32 k) {
+    u64 bits = (u64)(1023 + k) << 52;
+    f64 r;
+    memcpy(&r, &bits, sizeof(r));
+    return r;
+}
+
 static u32 psq_type_size(u8 type) {
     switch (type) {
     case 0: return 4;
@@ -747,13 +758,13 @@ static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
     case 0:
         return (f64)f32_value(mem_read32(cpu, ea));
     case 4:
-        return (f64)(f32)ldexp((f64)mem_read8(cpu, ea), -scale);
+        return (f64)(f32)((f64)mem_read8(cpu, ea) * pow2(-scale));
     case 5:
-        return (f64)(f32)ldexp((f64)mem_read16(cpu, ea), -scale);
+        return (f64)(f32)((f64)mem_read16(cpu, ea) * pow2(-scale));
     case 6:
-        return (f64)(f32)ldexp((f64)(s8)mem_read8(cpu, ea), -scale);
+        return (f64)(f32)((f64)(s8)mem_read8(cpu, ea) * pow2(-scale));
     case 7:
-        return (f64)(f32)ldexp((f64)(s16)mem_read16(cpu, ea), -scale);
+        return (f64)(f32)((f64)(s16)mem_read16(cpu, ea) * pow2(-scale));
     default:
         return 0.0;
     }
@@ -765,7 +776,7 @@ static s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale) 
     if (isinf(value))
         return value < 0.0 ? min_value : max_value;
 
-    f64 scaled = trunc(ldexp(value, scale));
+    f64 scaled = trunc(value * pow2(scale));
     if (scaled <= (f64)min_value)
         return min_value;
     if (scaled >= (f64)max_value)
@@ -803,7 +814,7 @@ static bool psq_check_enabled(CPUState* cpu, bool indexed, u32 cia) {
     return true;
 }
 
-bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index, bool indexed, u32 cia) {
+bool ppc_psq_load_slow(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index, bool indexed, u32 cia) {
     if (!psq_check_enabled(cpu, indexed, cia))
         return false;
 
@@ -826,7 +837,7 @@ bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr_index, bool inde
     return true;
 }
 
-bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool indexed, u32 cia) {
+bool ppc_psq_store_slow(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool indexed, u32 cia) {
     if (!psq_check_enabled(cpu, indexed, cia))
         return false;
 

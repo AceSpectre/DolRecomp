@@ -342,8 +342,55 @@ void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia);
 bool ppc_spr_known(u16 spr);
 void ppc_rfi(CPUState* cpu, u32 cia);
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia);
-bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
-bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
+bool ppc_psq_load_slow(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
+bool ppc_psq_store_slow(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
+
+/* Gekko squashes single-precision denormals to +0 on psq stores. */
+static inline u32 dolrecomp_psq_f32_store_bits(f64 v) {
+    f32 s = (f32)v;
+    u32 bits; memcpy(&bits, &s, sizeof bits);
+    if ((bits & 0x7F800000u) == 0 && (bits & 0x007FFFFFu) != 0) bits = 0;
+    return bits;
+}
+
+/* psq_l/psq_st fast path: paired singles enabled, GQR type 0 (raw floats --
+ * the scale field is ignored for type 0), 4-byte aligned, so no exception is
+ * reachable and both slots are plain 32-bit accesses. Quantized types,
+ * misalignment and disabled PSE/LSQE fall through to the out-of-line slow
+ * path, which remains the single definition of the semantics. The gqr index
+ * is a call-site constant in generated code, so the GQR fetch folds. */
+static inline bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w,
+                                u8 gqr, bool indexed, u32 cia) {
+    if ((cpu->hid2 & PPC_HID2_PSE) &&
+        (indexed || (cpu->hid2 & PPC_HID2_LSQE)) &&
+        ((cpu->gqr[gqr & 7u] >> 16) & 7u) == 0 && (ea & 3u) == 0) {
+        u32 bits0 = mem_read32(cpu, ea);
+        f32 f0; memcpy(&f0, &bits0, sizeof f0);
+        cpu->fpr[frD] = (f64)f0;
+        if (w) {
+            cpu->ps1[frD] = 1.0;
+        } else {
+            u32 bits1 = mem_read32(cpu, ea + 4u);
+            f32 f1; memcpy(&f1, &bits1, sizeof f1);
+            cpu->ps1[frD] = (f64)f1;
+        }
+        return true;
+    }
+    return ppc_psq_load_slow(cpu, frD, ea, w, gqr, indexed, cia);
+}
+
+static inline bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w,
+                                 u8 gqr, bool indexed, u32 cia) {
+    if ((cpu->hid2 & PPC_HID2_PSE) &&
+        (indexed || (cpu->hid2 & PPC_HID2_LSQE)) &&
+        (cpu->gqr[gqr & 7u] & 7u) == 0 && (ea & 3u) == 0) {
+        mem_write32(cpu, ea, dolrecomp_psq_f32_store_bits(cpu->fpr[frS]));
+        if (!w)
+            mem_write32(cpu, ea + 4u, dolrecomp_psq_f32_store_bits(cpu->ps1[frS]));
+        return true;
+    }
+    return ppc_psq_store_slow(cpu, frS, ea, w, gqr, indexed, cia);
+}
 u32 ppc_eciwx(CPUState* cpu, u32 ea, u32 cia);
 void ppc_ecowx(CPUState* cpu, u32 ea, u32 value, u32 cia);
 void ppc_tlbie(CPUState* cpu, u32 ea, u32 cia);
