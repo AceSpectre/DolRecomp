@@ -1783,6 +1783,13 @@ static void emit_counted_loop(FILE* out, const PPCInst* insts,
     u32 continuation = insts[last].address + 4u;
 
     fprintf(out, "static void loop_%08X(CPUState* ctx) {\n", loop_address);
+    /* Idle-park hook (see cpu.h). The first entry into the guest OS's idle
+     * spin often arrives by an intra-function branch, where no dispatcher and
+     * therefore no host_call observer runs -- without this check the helper
+     * spins its entire downcount budget (~667k iterations per slice) before
+     * the host can notice. Cost when this is not the idle loop: one compare. */
+    fprintf(out, "    if (ctx->idle_hook_pc == 0x%08Xu && ctx->idle_hook(ctx)) return;\n",
+            loop_address);
     fprintf(out, "label_%08X:\n", loop_address);
     fprintf(out, "    ctx->downcount -= %u;\n", cfg->block_cycles[first]);
     for (u32 i = first; i <= last; ++i) {

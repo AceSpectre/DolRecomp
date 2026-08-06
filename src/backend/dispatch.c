@@ -175,6 +175,10 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     fprintf(out, "\nstatic inline DOLRECOMP_UNUSED int dolrecomp_run_blocks(CPUState* ctx, u32 max_blocks) {\n");
     fprintf(out, "    u32 blocks = 0;\n");
     fprintf(out, "    while (max_blocks == 0u || blocks < max_blocks) {\n");
+    fprintf(out, "        /* Parked in the recognised idle loop (see cpu.h): every further\n");
+    fprintf(out, "         * block this call could run would be one no-op idle iteration plus\n");
+    fprintf(out, "         * a dispatcher round trip. Hand control back to the host loop. */\n");
+    fprintf(out, "        if (ctx->downcount <= DOLRECOMP_IDLE_PARK_THRESHOLD) return 1;\n");
     fprintf(out, "        if (!dolrecomp_call(ctx, ctx->pc)) return 0;\n");
     fprintf(out, "        if (ctx->exception) return 0;\n");
     fprintf(out, "        blocks++;\n");

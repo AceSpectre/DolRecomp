@@ -52,6 +52,21 @@ typedef void (*PPCExternalWrite32)(CPUState* cpu, u32 ea, u32 value, u8 rid);
 typedef void* (*PPCExternalPointer)(CPUState* cpu, u32 ea, u32 size);
 typedef void (*PPCInstructionFallback)(CPUState* cpu, u32 raw, u32 cia);
 typedef bool (*PPCHostCall)(CPUState* cpu, u32 address);
+typedef bool (*PPCIdleHook)(CPUState* cpu);
+
+/* Idle-park protocol. A host that recognises the guest OS's idle spin can set
+ * idle_hook_pc to the loop's entry address and idle_hook to a function that
+ * checks the actual park condition. Every counted-loop helper compares its
+ * loop address against idle_hook_pc on entry (one u32 compare when it is not
+ * the idle loop) and, when the hook confirms the loop would spin, the hook
+ * emulates exactly one iteration's architectural effect and drives downcount
+ * to DOLRECOMP_IDLE_PARK_DOWNCOUNT so the helper returns without spinning.
+ * dolrecomp_run_blocks treats a downcount at or below the threshold as
+ * "parked" and returns to the host loop instead of burning the remaining
+ * block budget on one-iteration dispatches. Ordinary execution only drifts a
+ * few hundred cycles negative, so the threshold is unreachable by accident. */
+#define DOLRECOMP_IDLE_PARK_DOWNCOUNT  (-((s64)1 << 30))
+#define DOLRECOMP_IDLE_PARK_THRESHOLD  (-((s64)1 << 29))
 typedef void (*PPCCacheControl)(CPUState* cpu, u8 operation, u32 ea, u32 cia);
 
 enum {
@@ -106,6 +121,8 @@ struct CPUState {
     PPCExternalWrite32 external_write32;
     PPCInstructionFallback instruction_fallback;
     PPCHostCall host_call;
+    PPCIdleHook idle_hook;   /* see the idle-park protocol above */
+    u32 idle_hook_pc;
     void* external_user_data;
 
     u8* ram;
