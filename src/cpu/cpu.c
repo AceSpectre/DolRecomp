@@ -11,9 +11,11 @@
 PPCMemWriteJournal g_mem_write_journal = NULL;
 void* g_mem_write_journal_user = NULL;
 
-void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
+void ppc_set_mem_write_journal(CPUState* cpu, PPCMemWriteJournal fn, void* user) {
     g_mem_write_journal = fn;
     g_mem_write_journal_user = user;
+    if (cpu)
+        cpu->journal_active = fn != NULL;
 }
 
 /* Journal offsets are physical addresses: MEM1 maps to [0, ram_size),

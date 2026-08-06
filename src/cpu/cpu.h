@@ -109,6 +109,30 @@ struct CPUState {
     u8 external_write_count;
     u32 reserve_addr;
     bool reserve_valid;
+    /* Per-CPU mirror of "a write journal is installed" so the store fast
+     * path tests one nearby field instead of reloading a process global. */
+    bool journal_active;
+
+    /* Hot fields, kept in front of the 16KB lc array on purpose: the memory
+     * fast path reads ram/ram_size (and mem2/mem2_size) on every guest
+     * access, and helpers touch downcount constantly. Before this reorder
+     * they lived ~17KB into the struct, a guaranteed extra cache line away
+     * from the register file. */
+    u8* ram;
+    u32 ram_size;
+    union {
+        u8* exram;
+        u8* mem2;
+    };
+    union {
+        u32 exram_size;
+        u32 mem2_size;
+    };
+    s64 downcount;
+    PPCIdleHook idle_hook;   /* see the idle-park protocol above */
+    u32 idle_hook_pc;
+    PPCHostCall host_call;
+
     u32 locked_cache_tag[512];
     bool locked_cache_valid[512];
     /* Gekko locked-cache data (16KB window at 0xE0000000). nw4r::g3d's
@@ -120,23 +144,8 @@ struct CPUState {
     PPCExternalRead32 external_read32;
     PPCExternalWrite32 external_write32;
     PPCInstructionFallback instruction_fallback;
-    PPCHostCall host_call;
-    PPCIdleHook idle_hook;   /* see the idle-park protocol above */
-    u32 idle_hook_pc;
     void* external_user_data;
-
-    u8* ram;
-    u32 ram_size;
     PPCExternalPointer external_pointer;
-    s64 downcount;
-    union {
-        u8* exram;
-        u8* mem2;
-    };
-    union {
-        u32 exram_size;
-        u32 mem2_size;
-    };
 
     u32 spr[1024];
     PPCCacheControl cache_control;
@@ -155,7 +164,10 @@ extern u64 dolrecomp_resolve_other;
 /* dolrecomp_call direct-mapped translation cache -- see backend/dispatch.c. */
 extern u64 dolrecomp_call_hits;
 extern u64 dolrecomp_call_misses;
-void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user);
+/* Installs the process-global write journal and keeps cpu->journal_active
+ * (the per-CPU fast-path mirror) coherent. Pass the CPUState whose stores
+ * must observe the journal; with multiple CPUStates, call once per state. */
+void ppc_set_mem_write_journal(CPUState* cpu, PPCMemWriteJournal fn, void* user);
 
 bool cpu_init(CPUState* cpu);
 bool cpu_alloc_mem2(CPUState* cpu, u32 size); //mem 2 only exists after first aloc
@@ -201,12 +213,12 @@ static inline u32 mem_read32(CPUState* cpu, u32 addr) {
 }
 
 static inline void mem_write32(CPUState* cpu, u32 addr, u32 value) {
-    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 4u) && !g_mem_write_journal &&
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 4u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be32(cpu->ram + (addr - GC_RAM_BASE), value);
         return;
     }
-    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 4u) && !g_mem_write_journal &&
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 4u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be32(cpu->mem2 + (addr - WII_MEM2_BASE), value);
         return;
@@ -223,12 +235,12 @@ static inline u16 mem_read16(CPUState* cpu, u32 addr) {
 }
 
 static inline void mem_write16(CPUState* cpu, u32 addr, u16 value) {
-    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 2u) && !g_mem_write_journal &&
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 2u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be16(cpu->ram + (addr - GC_RAM_BASE), value);
         return;
     }
-    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 2u) && !g_mem_write_journal &&
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 2u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be16(cpu->mem2 + (addr - WII_MEM2_BASE), value);
         return;
@@ -245,12 +257,12 @@ static inline u8 mem_read8(CPUState* cpu, u32 addr) {
 }
 
 static inline void mem_write8(CPUState* cpu, u32 addr, u8 value) {
-    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 1u) && !g_mem_write_journal &&
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 1u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         cpu->ram[addr - GC_RAM_BASE] = value;
         return;
     }
-    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 1u) && !g_mem_write_journal &&
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 1u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         cpu->mem2[addr - WII_MEM2_BASE] = value;
         return;
@@ -267,12 +279,12 @@ static inline u64 mem_read64(CPUState* cpu, u32 addr) {
 }
 
 static inline void mem_write64(CPUState* cpu, u32 addr, u64 value) {
-    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 8u) && !g_mem_write_journal &&
+    if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 8u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be64(cpu->ram + (addr - GC_RAM_BASE), value);
         return;
     }
-    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 8u) && !g_mem_write_journal &&
+    if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 8u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be64(cpu->mem2 + (addr - WII_MEM2_BASE), value);
         return;
