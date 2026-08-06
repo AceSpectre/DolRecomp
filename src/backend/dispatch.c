@@ -125,6 +125,15 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     fprintf(out, "\n#define DOLRECOMP_CALL_CACHE_SIZE 4096u\n");
     fprintf(out, "typedef struct { u32 addr; DolRecompFunction fn; } DolRecompCallCacheEntry;\n");
     fprintf(out, "static DolRecompCallCacheEntry g_dolrecomp_call_cache[DOLRECOMP_CALL_CACHE_SIZE];\n");
+    fprintf(out, "\n/* Define DOLRECOMP_DISPATCH_STATS to count cache hits/misses. The counters\n");
+    fprintf(out, " * are two global read-modify-writes on the hottest path in the runtime\n");
+    fprintf(out, " * (one per dispatcher round trip), so they are compiled out by default and\n");
+    fprintf(out, " * read as zero in the stats report. */\n");
+    fprintf(out, "#ifdef DOLRECOMP_DISPATCH_STATS\n");
+    fprintf(out, "#define DOLRECOMP_COUNT(c) ((c)++)\n");
+    fprintf(out, "#else\n");
+    fprintf(out, "#define DOLRECOMP_COUNT(c) ((void)0)\n");
+    fprintf(out, "#endif\n");
     fprintf(out, "\nstatic inline DolRecompFunction dolrecomp_find_original_cached(u32 address) {\n");
     fprintf(out, "    /* Guest instructions are 4-byte aligned; drop the two zero bits before\n");
     fprintf(out, "     * masking so adjacent instructions land in adjacent slots. addr == 0 is\n");
@@ -133,10 +142,10 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     fprintf(out, "    u32 slot = (address >> 2) & (DOLRECOMP_CALL_CACHE_SIZE - 1u);\n");
     fprintf(out, "    DolRecompCallCacheEntry* entry = &g_dolrecomp_call_cache[slot];\n");
     fprintf(out, "    if (entry->addr == address && entry->fn != NULL) {\n");
-    fprintf(out, "        dolrecomp_call_hits++;\n");
+    fprintf(out, "        DOLRECOMP_COUNT(dolrecomp_call_hits);\n");
     fprintf(out, "        return entry->fn;\n");
     fprintf(out, "    }\n");
-    fprintf(out, "    dolrecomp_call_misses++;\n");
+    fprintf(out, "    DOLRECOMP_COUNT(dolrecomp_call_misses);\n");
     fprintf(out, "    DolRecompFunction fn = dolrecomp_find_original(address);\n");
     fprintf(out, "    if (fn != NULL) {\n");
     fprintf(out, "        entry->addr = address;\n");

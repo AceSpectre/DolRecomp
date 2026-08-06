@@ -139,18 +139,27 @@ u64 dolrecomp_resolve_other = 0;
 u64 dolrecomp_call_hits = 0;
 u64 dolrecomp_call_misses = 0;
 
+/* Slow-path bucket counters cost a global RMW per resolve (resolve_lc alone
+ * ran 6.6M times per 3D repro), so they are compiled out unless a stats
+ * build defines DOLRECOMP_DISPATCH_STATS. */
+#ifdef DOLRECOMP_DISPATCH_STATS
+#define DOLRECOMP_COUNT(c) ((c)++)
+#else
+#define DOLRECOMP_COUNT(c) ((void)0)
+#endif
+
 static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
     if (addr >= GC_RAM_BASE && addr < GC_RAM_BASE + cpu->ram_size) {
         u32 offset = addr - GC_RAM_BASE;
         *avail = cpu->ram_size - offset;
-        dolrecomp_resolve_mem1++;
+        DOLRECOMP_COUNT(dolrecomp_resolve_mem1);
         return cpu->ram + offset;
     }
 
     if (addr >= GC_RAM_UNCACHED && addr < GC_RAM_UNCACHED + cpu->ram_size) {
         u32 offset = addr - GC_RAM_UNCACHED;
         *avail = cpu->ram_size - offset;
-        dolrecomp_resolve_mem1++;
+        DOLRECOMP_COUNT(dolrecomp_resolve_mem1);
         return cpu->ram + offset;
     }
 
@@ -160,7 +169,7 @@ static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
     if (addr >= 0xE0000000u && addr < 0xE0000000u + sizeof(cpu->lc)) {
         u32 offset = addr - 0xE0000000u;
         *avail = (u32)sizeof(cpu->lc) - offset;
-        dolrecomp_resolve_lc++;
+        DOLRECOMP_COUNT(dolrecomp_resolve_lc);
         return cpu->lc + offset;
     }
 
@@ -168,20 +177,20 @@ static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
         if (addr >= WII_MEM2_BASE && addr < WII_MEM2_BASE + cpu->mem2_size) {
             u32 offset = addr - WII_MEM2_BASE;
             *avail = cpu->mem2_size - offset;
-            dolrecomp_resolve_mem2++;
+            DOLRECOMP_COUNT(dolrecomp_resolve_mem2);
             return cpu->mem2 + offset;
         }
 
         if (addr >= WII_MEM2_UNCACHED && addr < WII_MEM2_UNCACHED + cpu->mem2_size) {
             u32 offset = addr - WII_MEM2_UNCACHED;
             *avail = cpu->mem2_size - offset;
-            dolrecomp_resolve_mem2++;
+            DOLRECOMP_COUNT(dolrecomp_resolve_mem2);
             return cpu->mem2 + offset;
         }
     }
 
     *avail = 0;
-    dolrecomp_resolve_other++;
+    DOLRECOMP_COUNT(dolrecomp_resolve_other);
     return NULL;
 }
 
