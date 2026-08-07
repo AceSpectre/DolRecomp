@@ -14,6 +14,7 @@
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/MC/TargetRegistry.h>
+#include <llvm/IR/PassInstrumentation.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/FileSystem.h>
@@ -23,6 +24,10 @@
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
+#include <llvm/Config/llvm-config.h>
+
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 
@@ -33,6 +38,28 @@ static std::string resolveTriple(const char *requested) {
   return requested && requested[0] ? std::string(requested)
                                    : llvm::sys::getDefaultTargetTriple();
 }
+
+// Everything below feeds both codegen and the object cache key. Changing any of
+// it must invalidate cached objects, so keep them named rather than inline: the
+// fingerprint is built from these same constants, and an edit that misses the
+// key produces a build that silently reuses objects from the old settings and
+// reports them as a result.
+static constexpr const char *kTargetCPU = "generic";
+static constexpr const char *kTargetFeatures = "";
+
+// instcombine's fixpoint check is a self-diagnostic for the pass, not a
+// correctness property of the IR. Recompiled Gekko functions contain long
+// straight-line integer and condition-flag sequences that can still be changing
+// after one iteration, which makes the pass call report_fatal_error and take the
+// whole recompilation down. Suppressing the check leaves the optimization
+// itself intact.
+static constexpr const char *kPassPipeline =
+    "function(mem2reg,early-cse<memssa>,instcombine<no-verify-fixpoint>,"
+    "simplifycfg,sccp,"
+    "correlated-propagation,jump-threading,gvn,dse,adce,loop-simplify,"
+    "loop-rotate,loop-mssa(licm),loop-vectorize,slp-vectorizer,vector-"
+    "combine,"
+    "tailcallelim),cgscc(inline),ipsccp,globaldce";
 
 static CodeGenOptLevel codegenLevel(int level) {
   if (level <= 0)
@@ -52,8 +79,8 @@ static TargetMachine *targetMachine(const Target *target,
   if (!cachedMachine || cachedTriple != tripleName || cachedOpt != opt) {
     TargetOptions options;
     cachedMachine.reset(target->createTargetMachine(
-        tripleName, "generic", "", options, Reloc::PIC_, std::nullopt,
-        codegenLevel(opt)));
+        tripleName, kTargetCPU, kTargetFeatures, options, Reloc::PIC_,
+        std::nullopt, codegenLevel(opt)));
     cachedTriple = tripleName;
     cachedOpt = opt;
   }
@@ -129,27 +156,44 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
     llvm::FunctionAnalysisManager fam;
     llvm::CGSCCAnalysisManager cgam;
     llvm::ModuleAnalysisManager mam;
-    llvm::PassBuilder passBuilder(machine);
+
+    // DOLRECOMP_LLVM_TRACE_PASSES names the last pass and IR unit to start.
+    // Without it an optimizer that fails to converge is indistinguishable from
+    // one that is merely slow: the historical instcombine hang on this title
+    // spun for 49 minutes at 1.00 core with nothing identifying the function.
+    // Each line is flushed, so the last line printed is where it stopped.
+    llvm::PassInstrumentationCallbacks callbacks;
+    const bool tracePasses = getenv("DOLRECOMP_LLVM_TRACE_PASSES") != nullptr;
+    if (tracePasses) {
+      callbacks.registerBeforeNonSkippedPassCallback(
+          [](llvm::StringRef pass, llvm::Any ir) {
+            // Any holds a pointer to the IR unit, so any_cast<const T *> on
+            // the Any* yields const T *const *.
+            std::string unit = "<unknown>";
+            const llvm::Function *const *fn =
+                llvm::any_cast<const llvm::Function *>(&ir);
+            const llvm::Module *const *mod =
+                llvm::any_cast<const llvm::Module *>(&ir);
+            if (fn && *fn)
+              unit = (*fn)->getName().str();
+            else if (mod && *mod)
+              unit = (*mod)->getName().str();
+            fprintf(stderr, "dolllvm: pass %s on %s\n", pass.str().c_str(),
+                    unit.c_str());
+            fflush(stderr);
+          });
+    }
+    llvm::PassBuilder passBuilder(machine, llvm::PipelineTuningOptions(),
+                                  std::nullopt,
+                                  tracePasses ? &callbacks : nullptr);
     passBuilder.registerModuleAnalyses(mam);
     passBuilder.registerCGSCCAnalyses(cgam);
     passBuilder.registerFunctionAnalyses(fam);
     passBuilder.registerLoopAnalyses(lam);
     passBuilder.crossRegisterProxies(lam, fam, cgam, mam);
     llvm::ModulePassManager passes;
-    std::string pipeline =
-        // instcombine's fixpoint check is a self-diagnostic for the pass, not a
-        // correctness property of the IR. Recompiled Gekko functions contain
-        // long straight-line integer and condition-flag sequences that can still
-        // be changing after one iteration, which makes the pass call
-        // report_fatal_error and take the whole recompilation down. Suppressing
-        // the check leaves the optimization itself intact.
-        "function(mem2reg,early-cse<memssa>,instcombine<no-verify-fixpoint>,"
-        "simplifycfg,sccp,"
-        "correlated-propagation,jump-threading,gvn,dse,adce,loop-simplify,"
-        "loop-rotate,loop-mssa(licm),loop-vectorize,slp-vectorizer,vector-"
-        "combine,"
-        "tailcallelim),cgscc(inline),ipsccp,globaldce";
-    if (llvm::Error error = passBuilder.parsePassPipeline(passes, pipeline)) {
+    if (llvm::Error error =
+            passBuilder.parsePassPipeline(passes, kPassPipeline)) {
       fprintf(diagnostics,
               "dolllvm: cannot construct optimization pipeline: %s\n",
               llvm::toString(std::move(error)).c_str());
@@ -225,4 +269,18 @@ extern "C" bool dolllvm_object_matches_triple(const char *path,
            magic[3] == 0xFE;
   return magic[0] == 0x7F && magic[1] == 'E' && magic[2] == 'L' &&
          magic[3] == 'F';
+}
+
+extern "C" bool dolllvm_codegen_fingerprint(char *out, size_t size) {
+  if (!out || size == 0)
+    return false;
+  // Every codegen-affecting input the object cache key would otherwise miss.
+  // The triple is hashed separately by the caller, which already had it.
+  const std::string fingerprint = std::string(LLVM_VERSION_STRING) + "|" +
+                                  kTargetCPU + "|" + kTargetFeatures + "|" +
+                                  "pic|small|" + kPassPipeline;
+  if (fingerprint.size() + 1 > size)
+    return false;
+  memcpy(out, fingerprint.c_str(), fingerprint.size() + 1);
+  return true;
 }

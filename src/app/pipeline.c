@@ -55,6 +55,9 @@ static u32 c_chunk_instructions(void) {
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
 // v6 carries the execution budget across generated function calls.
 #define DOLLLVM_CACHE_VERSION "dolllvm-v6"
+// The LLVM optimisation level used for generated objects. Named so it can be
+// folded into the cache key; changing it must not reuse cached objects.
+#define DOLLLVM_OPT_LEVEL 2
 
 typedef struct {
     const PPCInst* insts;
@@ -207,6 +210,14 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     if (dolllvm_effective_triple(getenv("DOLRECOMP_LLVM_TARGET"), triple,
                                  sizeof(triple)))
         hash = hash_bytes(hash, triple, strlen(triple));
+    // LLVM version, target CPU and features, and the pass pipeline. Without
+    // these a codegen experiment reuses objects built with the old settings
+    // and reports them as its result.
+    char codegen[1024];
+    if (dolllvm_codegen_fingerprint(codegen, sizeof(codegen)))
+        hash = hash_bytes(hash, codegen, strlen(codegen));
+    u32 opt_level = (u32)DOLLLVM_OPT_LEVEL;
+    hash = hash_bytes(hash, &opt_level, sizeof(opt_level));
     for (u32 i = 0; i < job->count; i++) {
         hash = hash_bytes(hash, &job->insts[i].address,
                           sizeof(job->insts[i].address));
@@ -282,6 +293,13 @@ static int emit_llvm_chunk_job(const void* data, void* user) {
     (void)user;
     if (reuse_llvm_object(job))
         return 1;
+#ifdef _WIN32
+    // See run_llvm_chunk_jobs: on Windows this is the only live progress.
+    printf("[%u/%u] Emitting LLVM object %s\n", job->index, job->total,
+           job->name);
+    fflush(stdout);
+    time_t started = time(NULL);
+#endif
     char temp_path[1440];
 #ifdef _WIN32
     int process_id = _getpid();
@@ -303,7 +321,7 @@ static int emit_llvm_chunk_job(const void* data, void* user) {
     }
     DolLLVMOptions options = {0};
     options.target_triple = getenv("DOLRECOMP_LLVM_TARGET");
-    options.optimization_level = 2;
+    options.optimization_level = DOLLLVM_OPT_LEVEL;
     options.verify = 1;
     options.function_ranges = job->ranges;
     options.function_range_count = job->range_count;
@@ -334,6 +352,12 @@ static int emit_llvm_chunk_job(const void* data, void* user) {
     }
     if (!ok)
         remove(temp_path);
+#ifdef _WIN32
+    printf("[%u/%u] %s LLVM object %s (%llds)\n", job->index, job->total,
+           ok ? "Finished" : "FAILED", job->name,
+           (long long)(time(NULL) - started));
+    fflush(stdout);
+#endif
     return ok;
 }
 
@@ -354,11 +378,12 @@ static int run_llvm_chunk_jobs(const LLVMChunkJob* jobs, u32 count,
                                u32 requested_jobs) {
     u32 workers = effective_chunk_jobs(count, requested_jobs);
 #ifdef _WIN32
-    for (u32 i = 0; i < count; i++) {
-        printf("[%u/%u] Emitting LLVM object %s\n",
-               jobs[i].index, jobs[i].total, jobs[i].name);
-        fflush(stdout);
-    }
+    // Progress is reported from inside the job, not dumped up front. The
+    // Windows path used to print every line before starting any work, so a
+    // chunk that hung produced a complete-looking log and no indication of
+    // which chunk was stuck -- one such hang ran 49 minutes with nothing to
+    // point at. A start line, and a done line carrying elapsed seconds, means
+    // the stuck chunk is the one with no matching completion.
     return run_parallel_jobs(jobs, sizeof(*jobs), count, workers,
                              emit_llvm_chunk_job, NULL);
 #else

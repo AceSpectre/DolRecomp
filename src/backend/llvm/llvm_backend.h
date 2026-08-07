@@ -31,6 +31,12 @@ bool dolllvm_effective_triple(const char* requested, char* out, size_t size);
 // Validate an object's magic against the effective target triple.
 bool dolllvm_object_matches_triple(const char* path, const char* requested);
 
+// Every codegen-affecting input that is not already in the object cache key:
+// LLVM version, target CPU and feature string, relocation and code model, and
+// the pass pipeline. Hash this alongside the instruction words, or a codegen
+// change silently reuses objects built with the old settings.
+bool dolllvm_codegen_fingerprint(char* out, size_t size);
+
 #ifdef __cplusplus
 }
 #endif
