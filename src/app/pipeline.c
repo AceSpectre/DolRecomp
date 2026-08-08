@@ -51,7 +51,12 @@ static u32 c_chunk_instructions(void) {
 }
 
 #ifdef DOLRECOMP_ENABLE_LLVM
-#define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 1024u
+// 128, measured. A chunk is one LLVM function, so this is the block count the
+// register allocator keeps the whole guest register file live across. Against
+// the previous 1024 default this is +57.9% throughput and -66% .text on Mario
+// Kart; 64 gains a further 1.4% but its range overlaps 128's, so it is not a
+// proven gain. See docs/LLVM-EXPERIMENTS.md E002-E004.
+#define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
 // v6 carries the execution budget across generated function calls.
 #define DOLLLVM_CACHE_VERSION "dolllvm-v6"
@@ -73,6 +78,25 @@ typedef struct {
     char cache_path[1400];
 } LLVMChunkJob;
 
+// The floor is 32, not the 128 the C path uses.
+//
+// A chunk becomes exactly one LLVM function, so this value is the number of
+// basic blocks the register allocator has to keep the whole promoted guest
+// register file live across -- and that scope is what drives the generated
+// code size. Measured on Mario Kart (LLVM-EXPERIMENTS E002/E003), against the
+// 1024 default:
+//
+//     1024   .text 1,012,522,870   speed 0.3288
+//      256   .text   450,227,766   speed 0.4404   +33.9%
+//      128   .text   345,215,974   speed 0.5192   +57.9%
+//
+// monotonic, with disjoint confidence ranges at every step, so 128 was the
+// binding constraint rather than the optimum. Smaller chunks do eventually
+// cost -- a call that leaves the chunk returns through the dispatcher instead
+// of branching -- so this is a curve with a minimum, not a free win. Sweep it
+// per title rather than assuming this one's answer.
+#define DOLLLVM_MIN_CHUNK_INSTRUCTIONS 32u
+
 static u32 llvm_chunk_instructions(void) {
     const char* configured = getenv("DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS");
     if (!configured || !configured[0])
@@ -80,10 +104,12 @@ static u32 llvm_chunk_instructions(void) {
     char* end = NULL;
     errno = 0;
     unsigned long value = strtoul(configured, &end, 10);
-    if (errno || !end || *end || value < 128u || value > 4096u) {
+    if (errno || !end || *end || value < DOLLLVM_MIN_CHUNK_INSTRUCTIONS ||
+        value > 4096u) {
         fprintf(stderr,
-                "warning: DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS must be 128..4096; "
+                "warning: DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS must be %u..4096; "
                 "using %u\n",
+                DOLLLVM_MIN_CHUNK_INSTRUCTIONS,
                 DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS);
         return DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS;
     }
