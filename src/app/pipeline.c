@@ -59,7 +59,12 @@ static u32 c_chunk_instructions(void) {
 #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
 // v6 carries the execution budget across generated function calls.
-#define DOLLLVM_CACHE_VERSION "dolllvm-v6"
+// Any change that alters generated code must bump this, because
+// llvm_job_hash() omits the pass pipeline, opt level and LLVM version.
+// v7: ps1 preservation fix in dolir_builder (lfd and fmr/fneg/fabs/fnabs/fsel
+// no longer splat into the high paired-single slot). Default codegen changed,
+// so every cached object from v6 is stale.
+#define DOLLLVM_CACHE_VERSION "dolllvm-v7"
 // The LLVM optimisation level used for generated objects. Named so it can be
 // folded into the cache key; changing it must not reuse cached objects.
 #define DOLLLVM_OPT_LEVEL 2
