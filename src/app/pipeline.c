@@ -291,8 +291,17 @@ static void cache_llvm_object(const LLVMChunkJob* job) {
 static int emit_llvm_chunk_job(const void* data, void* user) {
     const LLVMChunkJob* job = (const LLVMChunkJob*)data;
     (void)user;
-    if (reuse_llvm_object(job))
+    if (reuse_llvm_object(job)) {
+#ifdef _WIN32
+        // Say so. A silent reuse is indistinguishable from a regeneration in
+        // the log, and "the cache was hit" is exactly the thing that must not
+        // be assumed when checking whether a codegen change was really tested.
+        printf("[%u/%u] Reusing cached LLVM object %s\n", job->index,
+               job->total, job->name);
+        fflush(stdout);
+#endif
         return 1;
+    }
 #ifdef _WIN32
     // See run_llvm_chunk_jobs: on Windows this is the only live progress.
     printf("[%u/%u] Emitting LLVM object %s\n", job->index, job->total,

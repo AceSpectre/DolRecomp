@@ -53,6 +53,13 @@ static constexpr const char *kTargetFeatures = "";
 // after one iteration, which makes the pass call report_fatal_error and take the
 // whole recompilation down. Suppressing the check leaves the optimization
 // itself intact.
+//
+// Do not remove the vectorizers. Measured (LLVM-EXPERIMENTS E001): dropping
+// loop-vectorize, slp-vectorizer and vector-combine costs **-27%** throughput
+// and makes the module 4.6% *larger*. The intuition that they cannot pay off
+// against CPU "generic" with an empty feature string is wrong -- SSE2 is part
+// of the x86-64 baseline, and Gekko paired-singles are inherently 2-wide f32
+// pairs, so SLP has real work to do at that baseline.
 static constexpr const char *kPassPipeline =
     "function(mem2reg,early-cse<memssa>,instcombine<no-verify-fixpoint>,"
     "simplifycfg,sccp,"
