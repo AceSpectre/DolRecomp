@@ -40,12 +40,38 @@ static std::string resolveTriple(const char *requested) {
 }
 
 // Everything below feeds both codegen and the object cache key. Changing any of
-// it must invalidate cached objects, so keep them named rather than inline: the
-// fingerprint is built from these same constants, and an edit that misses the
+// it must invalidate cached objects, so keep it reachable from one place: the
+// fingerprint is built from these same accessors, and an edit that misses the
 // key produces a build that silently reuses objects from the old settings and
 // reports them as a result.
-static constexpr const char *kTargetCPU = "generic";
-static constexpr const char *kTargetFeatures = "";
+//
+// DOLRECOMP_LLVM_CPU and DOLRECOMP_LLVM_FEATURES override the target machine's
+// CPU and feature string; "native" resolves to the host. The default stays
+// "generic" with no features, which is the portable x86-64 baseline -- a
+// released module must run on any x86-64 host, so raising the target has to
+// stay opt-in.
+//
+// That baseline already includes SSE2, which is not incidental here: E001
+// measured the vectorizers as worth 1.37x precisely because Gekko
+// paired-singles are 2-wide f32 pairs that map onto SSE2. So a wider target is
+// a live hypothesis rather than a long shot.
+static constexpr const char *kDefaultTargetCPU = "generic";
+static constexpr const char *kDefaultTargetFeatures = "";
+
+static std::string targetCPU() {
+  const char *cpu = getenv("DOLRECOMP_LLVM_CPU");
+  if (!cpu || !cpu[0])
+    return kDefaultTargetCPU;
+  // createTargetMachine does not expand "native" itself.
+  if (!strcmp(cpu, "native"))
+    return llvm::sys::getHostCPUName().str();
+  return cpu;
+}
+
+static std::string targetFeatures() {
+  const char *features = getenv("DOLRECOMP_LLVM_FEATURES");
+  return features ? features : kDefaultTargetFeatures;
+}
 
 // instcombine's fixpoint check is a self-diagnostic for the pass, not a
 // correctness property of the IR. Recompiled Gekko functions contain long
@@ -86,7 +112,7 @@ static TargetMachine *targetMachine(const Target *target,
   if (!cachedMachine || cachedTriple != tripleName || cachedOpt != opt) {
     TargetOptions options;
     cachedMachine.reset(target->createTargetMachine(
-        tripleName, kTargetCPU, kTargetFeatures, options, Reloc::PIC_,
+        tripleName, targetCPU(), targetFeatures(), options, Reloc::PIC_,
         std::nullopt, codegenLevel(opt)));
     cachedTriple = tripleName;
     cachedOpt = opt;
@@ -284,7 +310,7 @@ extern "C" bool dolllvm_codegen_fingerprint(char *out, size_t size) {
   // Every codegen-affecting input the object cache key would otherwise miss.
   // The triple is hashed separately by the caller, which already had it.
   const std::string fingerprint = std::string(LLVM_VERSION_STRING) + "|" +
-                                  kTargetCPU + "|" + kTargetFeatures + "|" +
+                                  targetCPU() + "|" + targetFeatures() + "|" +
                                   "pic|small|" + kPassPipeline;
   if (fingerprint.size() + 1 > size)
     return false;
