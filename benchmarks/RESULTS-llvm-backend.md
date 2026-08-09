@@ -250,14 +250,12 @@ DolIR feeds the LLVM pipeline only, so **no C codegen changes.** Bumps
   95%; individual pairs do not all clear it.
 - **This branch is built and tested, but not re-benchmarked.** The commits were
   rebased onto upstream `main` and de-entangled by hand from experimental work
-  that is not included here. The result builds clean with
-  `-DDOLRECOMP_ENABLE_LLVM=ON` against LLVM 20.1.8 and passes the repository
-  suite — **18/19 with the LLVM backend enabled**, including `dispatch`,
-  `llvm_backend`, `llvm_execute` and `llvm_pipeline`. The single failure,
-  `codegen_compile`, reproduces identically on unmodified upstream `main` in the
-  same environment (a nested CMake invocation with no resource compiler
-  configured) and is unrelated to these changes. **The performance numbers above
-  were not re-measured against this exact commit series** — they come from the
-  campaign builds these commits were extracted from.
+  that is not included here. The result builds clean in both configurations
+  against LLVM 20.1.8 and passes the repository suite in full — **16/16** with
+  the C backend and **19/19** with `-DDOLRECOMP_ENABLE_LLVM=ON`, including
+  `dispatch`, `llvm_backend`, `llvm_execute` and `llvm_pipeline` — and is green
+  on all six CI checks. **The performance numbers above were not re-measured
+  against this exact commit series** — they come from the campaign builds these
+  commits were extracted from.
 - **96 is unexplained.** A 35% loss at uniform-96 with no mechanism. Whatever it
   is, the power-of-two theory is not it.
