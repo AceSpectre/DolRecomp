@@ -93,8 +93,8 @@ measured 0.5513 and 0.5524 in two different series against a third series'
 **Correctness:** the dispatcher change holds the backend at the C floor — 0
 architectural divergences.
 
-**Covered by** `tests/test_dispatch.c`, which checks the indexed path against
-the linear one for equivalence.
+**Covered by** the existing `tests/test_dispatch.c`, extended here (+54 lines) to
+check the indexed path against the linear one for equivalence. It passes.
 
 ---
 
@@ -248,13 +248,16 @@ DolIR feeds the LLVM pipeline only, so **no C codegen changes.** Bumps
   vs index) should generalise; the *magnitudes* should not be assumed to.
 - **The gate passes on the median, not on every pair.** 0.9587 and 0.9573 clear
   95%; individual pairs do not all clear it.
-- **This branch is syntax-checked, not built or tested.** The commits were
+- **This branch is built and tested, but not re-benchmarked.** The commits were
   rebased onto upstream `main` and de-entangled by hand from experimental work
-  that is not included, then verified with `clang -fsyntax-only` against LLVM
-  20.1.8 (`llvm_backend.cpp`, `dispatch.c`, `dolir_builder.c`, `pipeline.c`,
-  `test_dispatch.c`, all clean). **`tests/test_dispatch.c` was not executed on
-  this branch**, and no full link or benchmark was re-run against this exact
-  commit series. The numbers above come from the campaign builds the commits
-  were extracted from.
+  that is not included here. The result builds clean with
+  `-DDOLRECOMP_ENABLE_LLVM=ON` against LLVM 20.1.8 and passes the repository
+  suite — **18/19 with the LLVM backend enabled**, including `dispatch`,
+  `llvm_backend`, `llvm_execute` and `llvm_pipeline`. The single failure,
+  `codegen_compile`, reproduces identically on unmodified upstream `main` in the
+  same environment (a nested CMake invocation with no resource compiler
+  configured) and is unrelated to these changes. **The performance numbers above
+  were not re-measured against this exact commit series** — they come from the
+  campaign builds these commits were extracted from.
 - **96 is unexplained.** A 35% loss at uniform-96 with no mechanism. Whatever it
   is, the power-of-two theory is not it.
