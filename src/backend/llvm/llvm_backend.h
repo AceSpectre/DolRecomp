@@ -63,6 +63,36 @@ typedef enum {
 
 int dolllvm_pgo_mode(void);
 
+// The profile-vs-DOL staleness gate.
+//
+// A profile that no longer describes the emitted CFG does not fail. It
+// degrades: PGOInstrumentationUse rejects the mismatched records one function
+// at a time and leaves those functions unprofiled, so the build succeeds, the
+// module looks trained, and the measurement is quietly against something
+// between a profiled and an unprofiled arm. Clang's own warning for the C half
+// (-Wprofile-instr-out-of-date) was suppressed on this project, and the LLVM
+// half never had one at all.
+//
+// The gate is a POSITIVE check rather than a warning scrape: after
+// PGOInstrumentationUse has run -- observed through a pass-instrumentation
+// callback, so nothing about the pipeline moves -- every defined function that
+// matched its profile record carries entry-count metadata, and every function
+// that did not carries none. On a profile collected from this same module that
+// second set is empty, because IR instrumentation records EVERY function at
+// gen time, whether or not the scene ever executed it. So a non-zero count
+// means the profile and the DOL have diverged, not that the scene was narrow.
+//
+//   DOLRECOMP_LLVM_PGO_STALE=error   fail the emit (the default)
+//   DOLRECOMP_LLVM_PGO_STALE=warn    report and keep building
+//   DOLRECOMP_LLVM_PGO_STALE=off     no check
+typedef enum {
+    DOLLLVM_PGO_STALE_OFF = 0,
+    DOLLLVM_PGO_STALE_WARN = 1,
+    DOLLLVM_PGO_STALE_ERROR = 2
+} DolLLVMPGOStalePolicy;
+
+int dolllvm_pgo_stale_policy(void);
+
 // Every codegen-affecting input that is not already in the object cache key:
 // LLVM version, target CPU and feature string, relocation and code model, and
 // the pass pipeline. Hash this alongside the instruction words, or a codegen

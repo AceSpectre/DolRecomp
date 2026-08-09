@@ -30,6 +30,7 @@
 #include <llvm/TargetParser/Triple.h>
 #include <llvm/Config/llvm-config.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -137,6 +138,8 @@ static const std::string &pgoProfileFingerprint() {
   return fingerprint;
 }
 
+static void reportPgoStaleSummary();
+
 // Off by default, so the default module stays byte-identical to an unprofiled
 // build and the existing object cache keeps its meaning. "use" without a
 // readable DOLRECOMP_LLVM_PROFILE is refused rather than silently degraded to
@@ -163,9 +166,40 @@ extern "C" int dolllvm_pgo_mode(void) {
     fprintf(stderr, "dolllvm: PGO use, profile %s (%s)\n",
             pgoProfilePath().c_str(), pgoProfileFingerprint().c_str());
     fflush(stderr);
+    // One summary per process, at exit, so a `warn`-policy build ends with a
+    // total rather than with thousands of individually ignorable lines.
+    atexit(reportPgoStaleSummary);
     return (int)DOLLLVM_PGO_USE;
   }();
   return mode;
+}
+
+// Process-wide tallies for the staleness gate. The job runner is threads in one
+// process (run_parallel_jobs), so these are atomic and the summary is printed
+// once, from an atexit hook registered when use mode is first resolved. Without
+// the summary a stale profile under the `warn` policy is thousands of
+// individually ignorable lines and no total.
+static std::atomic<unsigned long long> pgoMatchedFunctions{0};
+static std::atomic<unsigned long long> pgoUnmatchedFunctions{0};
+static std::atomic<unsigned long long> pgoStaleChunks{0};
+
+static void reportPgoStaleSummary() {
+  const unsigned long long matched = pgoMatchedFunctions.load();
+  const unsigned long long unmatched = pgoUnmatchedFunctions.load();
+  const unsigned long long total = matched + unmatched;
+  if (total == 0)
+    return;
+  fprintf(stderr,
+          "dolllvm: PGO profile match: %llu/%llu functions matched, %llu "
+          "unmatched across %llu stale chunks\n",
+          matched, total, unmatched, pgoStaleChunks.load());
+  if (unmatched != 0)
+    fprintf(stderr,
+            "dolllvm: PROFILE IS STALE against this DOL -- %.4f%% of emitted "
+            "functions carry no profile record. Re-collect the profile against "
+            "this binary.\n",
+            100.0 * (double)unmatched / (double)total);
+  fflush(stderr);
 }
 
 static CodeGenOptLevel codegenLevel(int level) {
@@ -270,7 +304,39 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
     // spun for 49 minutes at 1.00 core with nothing identifying the function.
     // Each line is flushed, so the last line printed is where it stopped.
     llvm::PassInstrumentationCallbacks callbacks;
+    const int pgo = dolllvm_pgo_mode();
     const bool tracePasses = getenv("DOLRECOMP_LLVM_TRACE_PASSES") != nullptr;
+    // P002. Counted here, acted on after the pipeline has run. The callback is
+    // observational -- pass instrumentation cannot change what the passes do --
+    // so the gate costs the emitted objects nothing and the fingerprint does
+    // not move.
+    unsigned long long matchedHere = 0;
+    unsigned long long unmatchedHere = 0;
+    const bool gatePgo =
+        pgo == DOLLLVM_PGO_USE &&
+        dolllvm_pgo_stale_policy() != DOLLLVM_PGO_STALE_OFF;
+    if (gatePgo) {
+      callbacks.registerAfterPassCallback(
+          [&matchedHere, &unmatchedHere](llvm::StringRef pass, llvm::Any ir,
+                                         const llvm::PreservedAnalyses &) {
+            if (pass != "PGOInstrumentationUse")
+              return;
+            const llvm::Module *const *mod =
+                llvm::any_cast<const llvm::Module *>(&ir);
+            if (!mod || !*mod)
+              return;
+            // Immediately after the Use pass, so the count reflects what the
+            // profile matched and not what later passes went on to create.
+            for (const llvm::Function &function : **mod) {
+              if (function.isDeclaration())
+                continue;
+              if (function.getEntryCount())
+                matchedHere++;
+              else
+                unmatchedHere++;
+            }
+          });
+    }
     if (tracePasses) {
       callbacks.registerBeforeNonSkippedPassCallback(
           [](llvm::StringRef pass, llvm::Any ir) {
@@ -292,7 +358,8 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
     }
     llvm::PassBuilder passBuilder(machine, llvm::PipelineTuningOptions(),
                                   std::nullopt,
-                                  tracePasses ? &callbacks : nullptr);
+                                  (tracePasses || gatePgo) ? &callbacks
+                                                           : nullptr);
     passBuilder.registerModuleAnalyses(mam);
     passBuilder.registerCGSCCAnalyses(cgam);
     passBuilder.registerFunctionAnalyses(fam);
@@ -304,7 +371,6 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
     // key on disagree and every function silently goes unprofiled; running both
     // here makes that identity structural rather than a property of the passes
     // in between, which are free to change without invalidating a profile.
-    const int pgo = dolllvm_pgo_mode();
     if (pgo == DOLLLVM_PGO_GEN) {
       passes.addPass(llvm::PGOInstrumentationGen(
           llvm::PGOInstrumentationType::FDO));
@@ -326,6 +392,31 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
       passes.addPass(llvm::InstrProfilingLoweringPass(llvm::InstrProfOptions(),
                                                       /*IsCS=*/false));
     passes.run(module, mam);
+
+    // P002. The verdict. Under `error` a stale profile stops the build here,
+    // which is the point: the failure this gate exists for is a build that
+    // SUCCEEDS while training on records that no longer describe it, and every
+    // downstream number then belongs to a module nobody meant to measure.
+    if (gatePgo) {
+      pgoMatchedFunctions += matchedHere;
+      pgoUnmatchedFunctions += unmatchedHere;
+      if (unmatchedHere != 0) {
+        pgoStaleChunks++;
+        fprintf(diagnostics,
+                "dolllvm: PGO profile stale for %s: %llu of %llu functions "
+                "have no profile record\n",
+                object_path ? object_path : "<chunk>", unmatchedHere,
+                matchedHere + unmatchedHere);
+        fflush(diagnostics);
+        if (dolllvm_pgo_stale_policy() == DOLLLVM_PGO_STALE_ERROR) {
+          fprintf(diagnostics,
+                  "dolllvm: refusing to emit against a stale profile. Re-collect "
+                  "it, or set DOLRECOMP_LLVM_PGO_STALE=warn to build anyway.\n");
+          fflush(diagnostics);
+          return false;
+        }
+      }
+    }
   }
   if (llvm::verifyModule(module, &diagnosticStream)) {
     diagnosticStream.flush();
@@ -395,6 +486,25 @@ extern "C" bool dolllvm_object_matches_triple(const char *path,
            magic[3] == 0xFE;
   return magic[0] == 0x7F && magic[1] == 'E' && magic[2] == 'L' &&
          magic[3] == 'F';
+}
+
+// Default `error`: a stale profile is a wrong measurement, not a slow one, and
+// a profile that looks applied and is not costs a whole build cycle.
+extern "C" int dolllvm_pgo_stale_policy(void) {
+  static const int policy = [] {
+    const char *requested = getenv("DOLRECOMP_LLVM_PGO_STALE");
+    if (!requested || !requested[0] || !strcmp(requested, "error"))
+      return (int)DOLLLVM_PGO_STALE_ERROR;
+    if (!strcmp(requested, "warn"))
+      return (int)DOLLLVM_PGO_STALE_WARN;
+    if (!strcmp(requested, "off") || !strcmp(requested, "0"))
+      return (int)DOLLLVM_PGO_STALE_OFF;
+    fprintf(stderr,
+            "dolllvm: DOLRECOMP_LLVM_PGO_STALE must be error, warn or off\n");
+    abort();
+    return (int)DOLLLVM_PGO_STALE_ERROR;
+  }();
+  return policy;
 }
 
 extern "C" bool dolllvm_codegen_fingerprint(char *out, size_t size) {
