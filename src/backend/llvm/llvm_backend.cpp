@@ -19,9 +19,13 @@
 #include <llvm/Support/Error.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
+#include <llvm/Transforms/Instrumentation/InstrProfiling.h>
+#include <llvm/Transforms/Instrumentation/PGOInstrumentation.h>
+#include <llvm/Transforms/Utils/Instrumentation.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 #include <llvm/Config/llvm-config.h>
@@ -93,6 +97,76 @@ static constexpr const char *kPassPipeline =
     "loop-rotate,loop-mssa(licm),loop-vectorize,slp-vectorizer,vector-"
     "combine,"
     "tailcallelim),cgscc(inline),ipsccp,globaldce";
+
+// The profile path, and a content hash of it, resolved once. The hash is what
+// goes in the cache key: two different profiles written to the same path must
+// not share objects, and a profile regenerated in place by a collection script
+// makes the path alone a non-identity -- exactly the silent stale-reuse the
+// fingerprint exists to prevent.
+static const std::string &pgoProfilePath() {
+  static const std::string path = [] {
+    const char *file = getenv("DOLRECOMP_LLVM_PROFILE");
+    return std::string(file ? file : "");
+  }();
+  return path;
+}
+
+static const std::string &pgoProfileFingerprint() {
+  static const std::string fingerprint = [] {
+    if (pgoProfilePath().empty())
+      return std::string("none");
+    FILE *file = fopen(pgoProfilePath().c_str(), "rb");
+    if (!file)
+      return std::string("missing");
+    unsigned long long hash = 1469598103934665603ull;
+    unsigned long long size = 0;
+    unsigned char buffer[65536];
+    size_t read;
+    while ((read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+      size += read;
+      for (size_t i = 0; i < read; i++) {
+        hash ^= buffer[i];
+        hash *= 1099511628211ull;
+      }
+    }
+    fclose(file);
+    char text[64];
+    snprintf(text, sizeof(text), "%016llx/%llu", hash, size);
+    return std::string(text);
+  }();
+  return fingerprint;
+}
+
+// Off by default, so the default module stays byte-identical to an unprofiled
+// build and the existing object cache keeps its meaning. "use" without a
+// readable DOLRECOMP_LLVM_PROFILE is refused rather than silently degraded to
+// an unprofiled build -- an untrained PGO build that looks trained is the one
+// failure mode that corrupts a measurement instead of stopping it.
+extern "C" int dolllvm_pgo_mode(void) {
+  static const int mode = [] {
+    const char *requested = getenv("DOLRECOMP_LLVM_PGO");
+    if (!requested || !requested[0] || !strcmp(requested, "0") ||
+        !strcmp(requested, "off"))
+      return (int)DOLLLVM_PGO_OFF;
+    if (!strcmp(requested, "gen"))
+      return (int)DOLLLVM_PGO_GEN;
+    if (strcmp(requested, "use")) {
+      fprintf(stderr, "dolllvm: DOLRECOMP_LLVM_PGO must be gen, use or off\n");
+      abort();
+    }
+    if (pgoProfilePath().empty() || pgoProfileFingerprint() == "missing") {
+      fprintf(stderr,
+              "dolllvm: DOLRECOMP_LLVM_PGO=use needs a readable "
+              "DOLRECOMP_LLVM_PROFILE (.profdata)\n");
+      abort();
+    }
+    fprintf(stderr, "dolllvm: PGO use, profile %s (%s)\n",
+            pgoProfilePath().c_str(), pgoProfileFingerprint().c_str());
+    fflush(stderr);
+    return (int)DOLLLVM_PGO_USE;
+  }();
+  return mode;
+}
 
 static CodeGenOptLevel codegenLevel(int level) {
   if (level <= 0)
@@ -225,6 +299,18 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
     passBuilder.registerLoopAnalyses(lam);
     passBuilder.crossRegisterProxies(lam, fam, cgam, mam);
     llvm::ModulePassManager passes;
+    // P001. Front of the pipeline, before anything has touched the emitter's
+    // output. Gen and Use must observe byte-identical IR or the CFG hashes they
+    // key on disagree and every function silently goes unprofiled; running both
+    // here makes that identity structural rather than a property of the passes
+    // in between, which are free to change without invalidating a profile.
+    const int pgo = dolllvm_pgo_mode();
+    if (pgo == DOLLLVM_PGO_GEN) {
+      passes.addPass(llvm::PGOInstrumentationGen(
+          llvm::PGOInstrumentationType::FDO));
+    } else if (pgo == DOLLLVM_PGO_USE) {
+      passes.addPass(llvm::PGOInstrumentationUse(pgoProfilePath()));
+    }
     if (llvm::Error error =
             passBuilder.parsePassPipeline(passes, kPassPipeline)) {
       fprintf(diagnostics,
@@ -232,6 +318,13 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
               llvm::toString(std::move(error)).c_str());
       return false;
     }
+    // The counter intrinsics have to survive the optimizer as intrinsics: once
+    // lowered they are a load, an add and a store on a global, and GVN or DSE
+    // will happily fold two iterations of a loop into one increment. Lower them
+    // last, which is where clang lowers them and for the same reason.
+    if (pgo == DOLLLVM_PGO_GEN)
+      passes.addPass(llvm::InstrProfilingLoweringPass(llvm::InstrProfOptions(),
+                                                      /*IsCS=*/false));
     passes.run(module, mam);
   }
   if (llvm::verifyModule(module, &diagnosticStream)) {
@@ -309,9 +402,17 @@ extern "C" bool dolllvm_codegen_fingerprint(char *out, size_t size) {
     return false;
   // Every codegen-affecting input the object cache key would otherwise miss.
   // The triple is hashed separately by the caller, which already had it.
-  const std::string fingerprint = std::string(LLVM_VERSION_STRING) + "|" +
-                                  targetCPU() + "|" + targetFeatures() + "|" +
-                                  "pic|small|" + kPassPipeline;
+  // Keyed to the PGO mode, and in use mode to the profile's CONTENT -- a
+  // profile rewritten in place by a collection script makes its path a
+  // non-identity. Absent entirely when PGO is off, which is what keeps the
+  // default objects byte-identical and the existing cache valid.
+  const std::string fingerprint =
+      std::string(LLVM_VERSION_STRING) + "|" + targetCPU() + "|" +
+      targetFeatures() + "|" + "pic|small|" + kPassPipeline +
+      (dolllvm_pgo_mode() == DOLLLVM_PGO_GEN ? "|pgo=gen" : "") +
+      (dolllvm_pgo_mode() == DOLLLVM_PGO_USE
+           ? "|pgo=use:" + pgoProfileFingerprint()
+           : "");
   if (fingerprint.size() + 1 > size)
     return false;
   memcpy(out, fingerprint.c_str(), fingerprint.size() + 1);
