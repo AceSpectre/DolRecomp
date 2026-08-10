@@ -25,7 +25,6 @@
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/Instrumentation/InstrProfiling.h>
 #include <llvm/Transforms/Instrumentation/PGOInstrumentation.h>
-#include <llvm/Transforms/Instrumentation.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 #include <llvm/Config/llvm-config.h>
