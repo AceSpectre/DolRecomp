@@ -314,8 +314,7 @@ static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
 
 // Chunk entry addresses, sorted. Written once before the worker pool starts and
 // read-only thereafter, so no locking. NULL means "no table": every cross-chunk
-// branch falls back to the return-to-chassis form, which is what shipped before
-// direct calls existed and remains the escape hatch if they misbehave.
+// branch takes the safe return-to-chassis path.
 static const u32* g_chunk_starts = NULL;
 static u32 g_chunk_count = 0;
 

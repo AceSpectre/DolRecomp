@@ -1015,26 +1015,15 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             file_count++;
         }
 
-        // Hand the emitter every chunk entry known so far so a cross-chunk bl
-        // can be emitted as a direct call. funcs accumulates across sections and
-        // this section's chunks were just added, so a target in this or any
-        // earlier section resolves; one in a later section does not yet exist as
-        // a symbol and falls back to the return-to-chassis form. That costs
-        // almost nothing in practice -- .text1 holds 181 of this title's 182
-        // chunks, so nearly every call is intra-section.
-        // emitter.c calls "no chunk table" the escape hatch if direct calls
-        // misbehave, but only this function could set it, so there was no way to
-        // emit a module *without* the calls. -DDOLRECOMP_C_MAX_CALL_DEPTH=0
-        // stops the path being taken, which is the right switch for a module
-        // already built, but it leaves every call site and guard branch in the
-        // generated C -- so it cannot answer what the feature costs when it is
-        // absent. Same idiom as DOLRECOMP_C_CHUNK_INSTRUCTIONS above.
-        const char* no_direct = getenv("DOLRECOMP_NO_DIRECT_CALLS");
+        // Direct cross-chunk calls bypass the chassis dispatcher. That is unsafe
+        // for runtimes which validate mutable guest code at dispatch boundaries,
+        // so only emit them after an explicit opt-in for controlled benchmarks.
+        // funcs accumulates across sections; targets in a later section still
+        // fall back to the dispatcher because their symbols are not known yet.
+        const char* direct = getenv("DOLRECOMP_UNSAFE_DIRECT_CALLS");
         u32* chunk_starts = NULL;
-        if (no_direct && *no_direct && *no_direct != '0') {
-            printf("  cross-chunk direct calls disabled "
-                   "(DOLRECOMP_NO_DIRECT_CALLS)\n");
-        } else {
+        if (direct && strcmp(direct, "1") == 0) {
+            printf("  unsafe cross-chunk direct calls enabled\n");
             chunk_starts = (u32*)malloc((size_t)funcs.count * sizeof(u32));
             if (chunk_starts) {
                 for (u32 i = 0; i < funcs.count; ++i)
