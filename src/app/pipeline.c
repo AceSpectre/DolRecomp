@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 #ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
@@ -51,10 +52,23 @@ static u32 c_chunk_instructions(void) {
 }
 
 #ifdef DOLRECOMP_ENABLE_LLVM
-#define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 1024u
+// 128, measured. A chunk is one LLVM function, so this is the block count the
+// register allocator keeps the whole guest register file live across. Against
+// the previous 1024 default this is +57.9% throughput and -66% .text on Mario
+// Kart; 64 gains a further 1.4% but its range overlaps 128's, so it is not a
+// proven gain. See docs/LLVM-EXPERIMENTS.md E002-E004.
+#define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
 // v6 carries the execution budget across generated function calls.
-#define DOLLLVM_CACHE_VERSION "dolllvm-v6"
+// Any change that alters generated code must bump this, because
+// llvm_job_hash() omits the pass pipeline, opt level and LLVM version.
+// v7: ps1 preservation fix in dolir_builder (lfd and fmr/fneg/fabs/fnabs/fsel
+// no longer splat into the high paired-single slot). Default codegen changed,
+// so every cached object from v6 is stale.
+#define DOLLLVM_CACHE_VERSION "dolllvm-v7"
+// The LLVM optimisation level used for generated objects. Named so it can be
+// folded into the cache key; changing it must not reuse cached objects.
+#define DOLLLVM_OPT_LEVEL 2
 
 typedef struct {
     const PPCInst* insts;
@@ -70,6 +84,25 @@ typedef struct {
     char cache_path[1400];
 } LLVMChunkJob;
 
+// The floor is 32, not the 128 the C path uses.
+//
+// A chunk becomes exactly one LLVM function, so this value is the number of
+// basic blocks the register allocator has to keep the whole promoted guest
+// register file live across -- and that scope is what drives the generated
+// code size. Measured on Mario Kart (LLVM-EXPERIMENTS E002/E003), against the
+// 1024 default:
+//
+//     1024   .text 1,012,522,870   speed 0.3288
+//      256   .text   450,227,766   speed 0.4404   +33.9%
+//      128   .text   345,215,974   speed 0.5192   +57.9%
+//
+// monotonic, with disjoint confidence ranges at every step, so 128 was the
+// binding constraint rather than the optimum. Smaller chunks do eventually
+// cost -- a call that leaves the chunk returns through the dispatcher instead
+// of branching -- so this is a curve with a minimum, not a free win. Sweep it
+// per title rather than assuming this one's answer.
+#define DOLLLVM_MIN_CHUNK_INSTRUCTIONS 32u
+
 static u32 llvm_chunk_instructions(void) {
     const char* configured = getenv("DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS");
     if (!configured || !configured[0])
@@ -77,10 +110,12 @@ static u32 llvm_chunk_instructions(void) {
     char* end = NULL;
     errno = 0;
     unsigned long value = strtoul(configured, &end, 10);
-    if (errno || !end || *end || value < 128u || value > 4096u) {
+    if (errno || !end || *end || value < DOLLLVM_MIN_CHUNK_INSTRUCTIONS ||
+        value > 4096u) {
         fprintf(stderr,
-                "warning: DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS must be 128..4096; "
+                "warning: DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS must be %u..4096; "
                 "using %u\n",
+                DOLLLVM_MIN_CHUNK_INSTRUCTIONS,
                 DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS);
         return DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS;
     }
@@ -207,6 +242,14 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     if (dolllvm_effective_triple(getenv("DOLRECOMP_LLVM_TARGET"), triple,
                                  sizeof(triple)))
         hash = hash_bytes(hash, triple, strlen(triple));
+    // LLVM version, target CPU and features, and the pass pipeline. Without
+    // these a codegen experiment reuses objects built with the old settings
+    // and reports them as its result.
+    char codegen[1024];
+    if (dolllvm_codegen_fingerprint(codegen, sizeof(codegen)))
+        hash = hash_bytes(hash, codegen, strlen(codegen));
+    u32 opt_level = (u32)DOLLLVM_OPT_LEVEL;
+    hash = hash_bytes(hash, &opt_level, sizeof(opt_level));
     for (u32 i = 0; i < job->count; i++) {
         hash = hash_bytes(hash, &job->insts[i].address,
                           sizeof(job->insts[i].address));
@@ -280,8 +323,24 @@ static void cache_llvm_object(const LLVMChunkJob* job) {
 static int emit_llvm_chunk_job(const void* data, void* user) {
     const LLVMChunkJob* job = (const LLVMChunkJob*)data;
     (void)user;
-    if (reuse_llvm_object(job))
+    if (reuse_llvm_object(job)) {
+#ifdef _WIN32
+        // Say so. A silent reuse is indistinguishable from a regeneration in
+        // the log, and "the cache was hit" is exactly the thing that must not
+        // be assumed when checking whether a codegen change was really tested.
+        printf("[%u/%u] Reusing cached LLVM object %s\n", job->index,
+               job->total, job->name);
+        fflush(stdout);
+#endif
         return 1;
+    }
+#ifdef _WIN32
+    // See run_llvm_chunk_jobs: on Windows this is the only live progress.
+    printf("[%u/%u] Emitting LLVM object %s\n", job->index, job->total,
+           job->name);
+    fflush(stdout);
+    time_t started = time(NULL);
+#endif
     char temp_path[1440];
 #ifdef _WIN32
     int process_id = _getpid();
@@ -303,7 +362,7 @@ static int emit_llvm_chunk_job(const void* data, void* user) {
     }
     DolLLVMOptions options = {0};
     options.target_triple = getenv("DOLRECOMP_LLVM_TARGET");
-    options.optimization_level = 2;
+    options.optimization_level = DOLLLVM_OPT_LEVEL;
     options.verify = 1;
     options.function_ranges = job->ranges;
     options.function_range_count = job->range_count;
@@ -334,6 +393,12 @@ static int emit_llvm_chunk_job(const void* data, void* user) {
     }
     if (!ok)
         remove(temp_path);
+#ifdef _WIN32
+    printf("[%u/%u] %s LLVM object %s (%llds)\n", job->index, job->total,
+           ok ? "Finished" : "FAILED", job->name,
+           (long long)(time(NULL) - started));
+    fflush(stdout);
+#endif
     return ok;
 }
 
@@ -354,11 +419,12 @@ static int run_llvm_chunk_jobs(const LLVMChunkJob* jobs, u32 count,
                                u32 requested_jobs) {
     u32 workers = effective_chunk_jobs(count, requested_jobs);
 #ifdef _WIN32
-    for (u32 i = 0; i < count; i++) {
-        printf("[%u/%u] Emitting LLVM object %s\n",
-               jobs[i].index, jobs[i].total, jobs[i].name);
-        fflush(stdout);
-    }
+    // Progress is reported from inside the job, not dumped up front. The
+    // Windows path used to print every line before starting any work, so a
+    // chunk that hung produced a complete-looking log and no indication of
+    // which chunk was stuck -- one such hang ran 49 minutes with nothing to
+    // point at. A start line, and a done line carrying elapsed seconds, means
+    // the stuck chunk is the one with no matching completion.
     return run_parallel_jobs(jobs, sizeof(*jobs), count, workers,
                              emit_llvm_chunk_job, NULL);
 #else
