@@ -25,7 +25,7 @@
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/Instrumentation/InstrProfiling.h>
 #include <llvm/Transforms/Instrumentation/PGOInstrumentation.h>
-#include <llvm/Transforms/Utils/Instrumentation.h>
+#include <llvm/Transforms/Instrumentation.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/TargetParser/Triple.h>
 #include <llvm/Config/llvm-config.h>
@@ -372,8 +372,12 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
     // here makes that identity structural rather than a property of the passes
     // in between, which are free to change without invalidating a profile.
     if (pgo == DOLLLVM_PGO_GEN) {
+#if LLVM_VERSION_MAJOR >= 20
       passes.addPass(llvm::PGOInstrumentationGen(
           llvm::PGOInstrumentationType::FDO));
+#else
+      passes.addPass(llvm::PGOInstrumentationGen(/*IsCS=*/false));
+#endif
     } else if (pgo == DOLLLVM_PGO_USE) {
       passes.addPass(llvm::PGOInstrumentationUse(pgoProfilePath()));
     }
