@@ -124,24 +124,38 @@ if(DOLRECOMP_ENABLE_LLVM)
     target_compile_definitions(dr_llvm PUBLIC DOLRECOMP_ENABLE_LLVM=1)
     target_compile_definitions(dr_llvm PRIVATE ${LLVM_DEFINITIONS})
     target_link_libraries(dr_llvm PUBLIC dr_ir)
-    if(MINGW)
+    
+    set(DOLRECOMP_LLVM_COMPONENTS
+        Core
+        Support
+        Analysis
+        BitWriter
+        Passes
+        Target
+        MC
+        native
+        nativecodegen
+        aarch64
+        arm
+        riscv
+    )
+    
+    if(TARGET LLVM)
+        target_link_libraries(dr_llvm PRIVATE LLVM)
+    elseif(MINGW)
         find_library(DOLRECOMP_LLVM_SHARED_IMPORT
             NAMES LLVM-${LLVM_VERSION_MAJOR} LLVM
             HINTS ${LLVM_LIBRARY_DIRS}
             NO_DEFAULT_PATH)
+
         if(DOLRECOMP_LLVM_SHARED_IMPORT MATCHES "[.]dll[.]a$")
-            target_link_libraries(dr_llvm PRIVATE
-                "${DOLRECOMP_LLVM_SHARED_IMPORT}")
+            target_link_libraries(dr_llvm PRIVATE "${DOLRECOMP_LLVM_SHARED_IMPORT}")
         else()
-            llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS
-                Core Support Analysis BitWriter Passes Target MC native nativecodegen)
+            llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS ${DOLRECOMP_LLVM_COMPONENTS})
             target_link_libraries(dr_llvm PRIVATE ${DOLRECOMP_LLVM_LIBS})
         endif()
-    elseif(TARGET LLVM)
-        target_link_libraries(dr_llvm PRIVATE LLVM)
     else()
-        llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS
-            Core Support Analysis BitWriter Passes Target MC native nativecodegen)
+        llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS ${DOLRECOMP_LLVM_COMPONENTS})
         target_link_libraries(dr_llvm PRIVATE ${DOLRECOMP_LLVM_LIBS})
     endif()
 endif()
