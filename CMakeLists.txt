@@ -196,6 +196,30 @@ add_library(dr_app STATIC
     src/app/pipeline.c
 )
 target_include_directories(dr_app PUBLIC ${DOLRECOMP_SRC})
+# The generated-object cache must invalidate when the code that generates those
+# objects changes. A hand-edited version string cannot do that -- it only
+# invalidates when somebody remembers to bump it. Hash the sources that decide
+# what gets emitted and fold the digest into every cache key. GLOB with
+# CONFIGURE_DEPENDS so a newly added emitter file is covered automatically
+# rather than needing to be added to a list that can rot.
+file(GLOB DOLRECOMP_CODEGEN_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/llvm/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/llvm/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ir/*.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ir/*.h")
+list(SORT DOLRECOMP_CODEGEN_SOURCES)
+set(DOLRECOMP_CODEGEN_DIGEST "")
+foreach(_codegen_source IN LISTS DOLRECOMP_CODEGEN_SOURCES)
+    file(SHA256 "${_codegen_source}" _codegen_file_hash)
+    string(APPEND DOLRECOMP_CODEGEN_DIGEST "${_codegen_file_hash}")
+endforeach()
+string(SHA256 DOLRECOMP_CODEGEN_SOURCE_HASH "${DOLRECOMP_CODEGEN_DIGEST}")
+list(LENGTH DOLRECOMP_CODEGEN_SOURCES _codegen_count)
+message(STATUS "Codegen source digest: ${DOLRECOMP_CODEGEN_SOURCE_HASH} (${_codegen_count} files)")
+target_compile_definitions(dr_app PRIVATE
+    DOLRECOMP_CODEGEN_SOURCE_HASH="${DOLRECOMP_CODEGEN_SOURCE_HASH}")
 target_link_libraries(dr_app PUBLIC dr_backend dr_analysis dr_frontend dr_platform dr_ir)
 if(DOLRECOMP_ENABLE_LLVM)
     target_link_libraries(dr_app PUBLIC dr_llvm)
