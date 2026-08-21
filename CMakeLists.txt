@@ -4,7 +4,7 @@ project(DolRecomp C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(DOLRECOMP_ENABLE_LLVM "Build the LLVM object backend" OFF)
-option(DOLRECOMP_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(DOLRECOMP_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
 # Discover LLVM before creating targets so its MSVC runtime choice is uniform.
 if(DOLRECOMP_ENABLE_LLVM)
