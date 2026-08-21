@@ -18,6 +18,7 @@ static void markColdFixup(Function *function) {
   function->addFnAttr(Attribute::NoInline);
   function->addFnAttr(Attribute::NoUnwind);
   function->addFnAttr(Attribute::WillReturn);
+  function->setSection(".text.unlikely." + function->getName().str());
 }
 
 Function *getPairNaNFixup(Module &module, Type *pairType) {
