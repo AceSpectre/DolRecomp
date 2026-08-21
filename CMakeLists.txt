@@ -133,11 +133,7 @@ if(DOLRECOMP_ENABLE_LLVM)
         Passes
         Target
         MC
-        native
-        nativecodegen
-        aarch64
-        arm
-        riscv
+        all-targets
     )
     
     if(TARGET LLVM)
