@@ -48,6 +48,12 @@ typedef void (*PPCExternalWrite32)(CPUState* cpu, u32 ea, u32 value, u8 rid);
 typedef void* (*PPCExternalPointer)(CPUState* cpu, u32 ea, u32 size);
 typedef void (*PPCInstructionFallback)(CPUState* cpu, u32 raw, u32 cia);
 typedef bool (*PPCHostCall)(CPUState* cpu, u32 address);
+
+#define PPC_HOST_CALL_NATIVE_REGION_QUERY 0xFFFFFFFCu
+#define PPC_NATIVE_REGION_QUERY_PENDING 0xFEu
+#define PPC_NATIVE_REGION_QUERY_HANDLED 0xFFu
+typedef u32 (*PPCSPRRead)(CPUState* cpu, u16 spr, u32 cia);
+typedef void (*PPCSPRWrite)(CPUState* cpu, u16 spr, u32 value, u32 cia);
 typedef void (*PPCCacheControl)(CPUState* cpu, u8 operation, u32 ea, u32 cia);
 
 enum {
@@ -103,6 +109,7 @@ struct CPUState {
     u32 ram_size;
     PPCExternalPointer external_pointer;
     s64 downcount;
+    s64 cycle_budget;
     union {
         u8* exram;
         u8* mem2;
@@ -112,7 +119,8 @@ struct CPUState {
         u32 mem2_size;
     };
 
-    u32 spr[1024];
+    PPCSPRRead spr_read;
+    PPCSPRWrite spr_write;
     PPCCacheControl cache_control;
 };
 
@@ -185,6 +193,7 @@ static inline bool ppc_fp_available_inline(CPUState* cpu, u32 cia) {
 }
 void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia);
 bool ppc_host_call(CPUState* cpu, u32 address);
+bool ppc_native_region_available(CPUState* cpu, u32 start, u32 end);
 void ppc_system_call_exception(CPUState* cpu, u32 cia);
 void ppc_dsi_exception(CPUState* cpu, u32 ea, u32 cia, u32 dsisr);
 void ppc_alignment_exception(CPUState* cpu, u32 ea, u32 cia);

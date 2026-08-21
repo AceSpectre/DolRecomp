@@ -15,15 +15,22 @@ typedef struct {
     const char* title_id_arg;
     const char* output_arg;
     const char* map_path;
+    const char* llvm_targets;
+    const char* profile_generate_path;
+    const char* profile_use_path;
     DolRecompCPU cpu;
     DolRecompBackend backend;
     u32 jobs;
     u32 rel_base;
+    u32 partition_instructions;
+    u64 partition_seed;
     int gamecube_mode;
     int cpu_explicit;
     int rel_base_set;
     int setup_mode;
     int show_help;
+    int fast_semantics;
+    int lockstep_instrumentation;
 } CliOptions;
 
 void print_usage(const char* argv0);

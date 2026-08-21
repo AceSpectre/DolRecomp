@@ -18,6 +18,9 @@ typedef struct {
 void emit_chunk_prototype(FILE* out, u32 func_addr);
 void function_list_free(FunctionList* list);
 int function_list_add(FunctionList* list, u32 start, u32 end);
+void emit_function_lookup(FILE* out, const FunctionList* funcs,
+                          const char* symbol_suffix);
 void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point);
 
 #endif
+// the dream is to not need dispatch... catch me later when that dream is accomplished

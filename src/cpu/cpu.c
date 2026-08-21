@@ -36,8 +36,6 @@ bool cpu_init(CPUState* cpu) {
         return false;
     }
 
-    cpu->spr[287] = PPC_GEKKO_PVR;
-
     return true;
 }
 
@@ -84,6 +82,9 @@ void cpu_reset(CPUState* cpu) {
     PPCInstructionFallback instruction_fallback = cpu->instruction_fallback;
     PPCHostCall host_call = cpu->host_call;
     void* external_user_data = cpu->external_user_data;
+    PPCSPRRead spr_read = cpu->spr_read;
+    PPCSPRWrite spr_write = cpu->spr_write;
+    PPCCacheControl cache_control = cpu->cache_control;
 
     memset(cpu, 0, sizeof(*cpu));
     cpu->ram = ram;
@@ -98,13 +99,15 @@ void cpu_reset(CPUState* cpu) {
     cpu->instruction_fallback = instruction_fallback;
     cpu->host_call = host_call;
     cpu->external_user_data = external_user_data;
+    cpu->spr_read = spr_read;
+    cpu->spr_write = spr_write;
+    cpu->cache_control = cache_control;
 
     if (cpu->ram)
         memset(cpu->ram, 0, cpu->ram_size);
     if (cpu->mem2)
         memset(cpu->mem2, 0, cpu->mem2_size);
 
-    cpu->spr[287] = PPC_GEKKO_PVR;
 }
 
 static u8* resolve_addr(CPUState* cpu, u32 addr, u32* avail) {
@@ -354,6 +357,24 @@ bool ppc_host_call(CPUState* cpu, u32 address) {
     return cpu->host_call ? cpu->host_call(cpu, address) : false;
 }
 
+bool ppc_native_region_available(CPUState* cpu, u32 start, u32 end) {
+    if (!cpu || !cpu->host_call)
+        return true;
+
+    u32 saved_addr = cpu->external_addr;
+    u32 saved_value = cpu->external_value;
+    u8 saved_rid = cpu->external_rid;
+    cpu->external_addr = start;
+    cpu->external_value = end;
+    cpu->external_rid = PPC_NATIVE_REGION_QUERY_PENDING;
+    bool blocked = cpu->host_call(cpu, PPC_HOST_CALL_NATIVE_REGION_QUERY);
+    bool handled = cpu->external_rid == PPC_NATIVE_REGION_QUERY_HANDLED;
+    cpu->external_addr = saved_addr;
+    cpu->external_value = saved_value;
+    cpu->external_rid = saved_rid;
+    return handled && !blocked;
+}
+
 void ppc_system_call_exception(CPUState* cpu, u32 cia) {
     ppc_take_exception(cpu, PPC_EXC_SYSTEM_CALL, PPC_VECTOR_SYSTEM_CALL, cia + 4u, 0);
 }
@@ -439,19 +460,6 @@ static const u8 ppc_spr_access[1024] = {
     [1022] = SPR_RW,
 };
 
-static u16 ppc_spr_storage_index(u16 spr) {
-    switch (spr) {
-    case 936: return 952;
-    case 937: return 953;
-    case 938: return 954;
-    case 939: return 955;
-    case 940: return 956;
-    case 941: return 957;
-    case 942: return 958;
-    default: return spr;
-    }
-}
-
 u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia) {
     if ((cpu->msr & PPC_MSR_PR) && spr != 1 && spr != 8 && spr != 9 &&
         spr != 268 && spr != 269) {
@@ -476,6 +484,8 @@ u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia) {
         return cpu->srr1;
     case 282:
         return cpu->ear;
+    case 287:
+        return cpu->spr_read ? cpu->spr_read(cpu, spr, cia) : PPC_GEKKO_PVR;
     case 912:
     case 913:
     case 914:
@@ -491,8 +501,8 @@ u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia) {
         break;
     }
 
-    if (spr < 1024 && (ppc_spr_access[spr] & SPR_READ))
-        return cpu->spr[ppc_spr_storage_index(spr)];
+    if (spr < 1024 && (ppc_spr_access[spr] & SPR_READ) && cpu->spr_read)
+        return cpu->spr_read(cpu, spr, cia);
 
     ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
     return 0;
@@ -552,8 +562,8 @@ void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
         break;
     }
 
-    if (spr < 1024 && (ppc_spr_access[spr] & SPR_WRITE)) {
-        cpu->spr[ppc_spr_storage_index(spr)] = value;
+    if (spr < 1024 && (ppc_spr_access[spr] & SPR_WRITE) && cpu->spr_write) {
+        cpu->spr_write(cpu, spr, value, cia);
         return;
     }
 
@@ -600,6 +610,38 @@ static f32 f32_value(u32 bits) {
     return value;
 }
 
+static f64 extend_f32_bits(u32 bits) {
+    u64 exponent = (bits >> 23) & 0xFFu;
+    u64 fraction = bits & 0x007FFFFFu;
+    u64 result;
+
+    if (exponent > 0 && exponent < 255) {
+        u64 high_exponent = !(exponent >> 7);
+        u64 extension = (high_exponent << 61) | (high_exponent << 60) |
+                        (high_exponent << 59);
+        result = ((u64)(bits & 0xC0000000u) << 32) | extension |
+                 ((u64)(bits & 0x3FFFFFFFu) << 29);
+    } else if (exponent == 0 && fraction != 0) {
+        exponent = 1023 - 126;
+        do {
+            fraction <<= 1;
+            exponent--;
+        } while ((fraction & 0x00800000u) == 0);
+        result = ((u64)(bits & 0x80000000u) << 32) | (exponent << 52) |
+                 ((fraction & 0x007FFFFFu) << 29);
+    } else {
+        u64 high_exponent = exponent >> 7;
+        u64 extension = (high_exponent << 61) | (high_exponent << 60) |
+                        (high_exponent << 59);
+        result = ((u64)(bits & 0xC0000000u) << 32) | extension |
+                 ((u64)(bits & 0x3FFFFFFFu) << 29);
+    }
+
+    f64 value;
+    memcpy(&value, &result, sizeof(value));
+    return value;
+}
+
 static u32 f32_bits(f32 value) {
     u32 bits;
     memcpy(&bits, &value, sizeof(bits));
@@ -643,7 +685,7 @@ static bool psq_access_is_valid(CPUState* cpu, u8 type, u32 ea, u32 cia) {
 static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
     switch (type) {
     case 0:
-        return (f64)f32_value(mem_read32(cpu, ea));
+        return extend_f32_bits(mem_read32(cpu, ea));
     case 4:
         return (f64)(f32)ldexp((f64)mem_read8(cpu, ea), -scale);
     case 5:
@@ -1142,6 +1184,27 @@ static f64 force_25_bit(f64 value) {
     return f64_value(bits);
 }
 
+static f64 correct_single_fma_tie(f64 a, f64 c, f64 addend, f64 result) {
+    u64 bits = f64_bits(result);
+    if ((bits & 0x000000001FFFFFFFull) != 0x0000000010000000ull)
+        return result;
+
+    f64 a_prime = addend - result;
+    f64 b_prime = result + a_prime;
+    f64 error = fma(a, c, a_prime) + (addend - b_prime);
+    if (error == 0.0)
+        return result;
+    return f64_value((error > 0.0) == (result > 0.0) ? bits + 1 : bits - 1);
+}
+
+static f64 single_fma_value(CPUState* cpu, f64 a, f64 c, f64 addend) {
+    f64 rounded_c = force_25_bit(c);
+    f64 result = fma(a, rounded_c, addend);
+    if ((cpu->fpscr & 3u) == 0)
+        result = correct_single_fma_tie(a, rounded_c, addend, result);
+    return result;
+}
+
 bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
              bool subtract, bool negative, f64* output) {
     f64 addend = subtract ? -b : b;
@@ -1150,19 +1213,7 @@ bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
     if (!single) {
         result = fma(a, c, addend);
     } else {
-        f64 rounded_c = force_25_bit(c);
-        result = fma(a, rounded_c, addend);
-        u64 bits = f64_bits(result);
-        if ((bits & 0x000000001FFFFFFFull) == 0x0000000010000000ull) {
-            f64 a_prime = addend - result;
-            f64 b_prime = result + a_prime;
-            f64 error = fma(a, rounded_c, a_prime) + (addend - b_prime);
-            if (error != 0.0) {
-                if ((error > 0.0) == (result > 0.0)) bits++;
-                else bits--;
-                result = f64_value(bits);
-            }
-        }
+        result = single_fma_value(cpu, a, c, addend);
         result = (f64)(f32)result;
     }
 
@@ -1486,67 +1537,128 @@ static void write_paired_result(CPUState* cpu, u8 d, f64 ps0, f64 ps1) {
     set_fprf(cpu, classify_f32((f32)ps0));
 }
 
+static f64 paired_binary_nan(f64 a, f64 b, f64 result) {
+    if (isnan(a))
+        return quiet_nan(a);
+    if (isnan(b))
+        return quiet_nan(b);
+    if (isnan(result))
+        return f64_value(0x7FF8000000000000ull);
+    return result;
+}
+
+static f64 paired_fma_nan(f64 a, f64 b, f64 c, f64 result) {
+    if (isnan(a))
+        return quiet_nan(a);
+    if (isnan(b))
+        return quiet_nan(b);
+    if (isnan(c))
+        return quiet_nan(c);
+    if (isnan(result))
+        return f64_value(0x7FF8000000000000ull);
+    return result;
+}
+
 void ppc_ps_add_op(CPUState* cpu, u8 d, u8 a, u8 b) {
-    write_paired_result(cpu, d, cpu->fpr[a] + cpu->fpr[b],
-                        cpu->ps1[a] + cpu->ps1[b]);
+    write_paired_result(cpu, d,
+                        paired_binary_nan(cpu->fpr[a], cpu->fpr[b],
+                                          cpu->fpr[a] + cpu->fpr[b]),
+                        paired_binary_nan(cpu->ps1[a], cpu->ps1[b],
+                                          cpu->ps1[a] + cpu->ps1[b]));
 }
 
 void ppc_ps_sub_op(CPUState* cpu, u8 d, u8 a, u8 b) {
-    write_paired_result(cpu, d, cpu->fpr[a] - cpu->fpr[b],
-                        cpu->ps1[a] - cpu->ps1[b]);
+    write_paired_result(cpu, d,
+                        paired_binary_nan(cpu->fpr[a], cpu->fpr[b],
+                                          cpu->fpr[a] - cpu->fpr[b]),
+                        paired_binary_nan(cpu->ps1[a], cpu->ps1[b],
+                                          cpu->ps1[a] - cpu->ps1[b]));
 }
 
 void ppc_ps_mul_op(CPUState* cpu, u8 d, u8 a, u8 c) {
-    write_paired_result(cpu, d, cpu->fpr[a] * force_25_bit(cpu->fpr[c]),
-                        cpu->ps1[a] * force_25_bit(cpu->ps1[c]));
+    f64 c0 = force_25_bit(cpu->fpr[c]);
+    f64 c1 = force_25_bit(cpu->ps1[c]);
+    write_paired_result(cpu, d,
+                        paired_binary_nan(cpu->fpr[a], cpu->fpr[c],
+                                          cpu->fpr[a] * c0),
+                        paired_binary_nan(cpu->ps1[a], cpu->ps1[c],
+                                          cpu->ps1[a] * c1));
 }
 
 void ppc_ps_div_op(CPUState* cpu, u8 d, u8 a, u8 b) {
-    write_paired_result(cpu, d, cpu->fpr[a] / cpu->fpr[b],
-                        cpu->ps1[a] / cpu->ps1[b]);
+    write_paired_result(cpu, d,
+                        paired_binary_nan(cpu->fpr[a], cpu->fpr[b],
+                                          cpu->fpr[a] / cpu->fpr[b]),
+                        paired_binary_nan(cpu->ps1[a], cpu->ps1[b],
+                                          cpu->ps1[a] / cpu->ps1[b]));
 }
 
 void ppc_ps_madd_op(CPUState* cpu, u8 d, u8 a, u8 c, u8 b,
                     bool subtract, bool negative) {
-    f64 ps0 = fma(cpu->fpr[a], force_25_bit(cpu->fpr[c]),
-                  subtract ? -cpu->fpr[b] : cpu->fpr[b]);
-    f64 ps1 = fma(cpu->ps1[a], force_25_bit(cpu->ps1[c]),
-                  subtract ? -cpu->ps1[b] : cpu->ps1[b]);
-    if (negative && !isnan(ps0))
-        ps0 = -ps0;
-    if (negative && !isnan(ps1))
-        ps1 = -ps1;
+    f64 ps0 = single_fma_value(
+        cpu, cpu->fpr[a], cpu->fpr[c],
+        subtract ? -cpu->fpr[b] : cpu->fpr[b]);
+    f64 ps1 = single_fma_value(
+        cpu, cpu->ps1[a], cpu->ps1[c],
+        subtract ? -cpu->ps1[b] : cpu->ps1[b]);
+    ps0 = paired_fma_nan(cpu->fpr[a], cpu->fpr[b], cpu->fpr[c], ps0);
+    ps1 = paired_fma_nan(cpu->ps1[a], cpu->ps1[b], cpu->ps1[c], ps1);
+    if (negative) {
+        ps0 = (f64)(f32)ps0;
+        ps1 = (f64)(f32)ps1;
+        if (!isnan(ps0))
+            ps0 = -ps0;
+        if (!isnan(ps1))
+            ps1 = -ps1;
+    }
     write_paired_result(cpu, d, ps0, ps1);
 }
 
 void ppc_ps_madds0(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
-    f64 scalar = force_25_bit(cpu->fpr[c]);
-    write_paired_result(cpu, d, fma(cpu->fpr[a], scalar, cpu->fpr[b]),
-                        fma(cpu->ps1[a], scalar, cpu->ps1[b]));
+    f64 ps0 = single_fma_value(cpu, cpu->fpr[a], cpu->fpr[c], cpu->fpr[b]);
+    f64 ps1 = single_fma_value(cpu, cpu->ps1[a], cpu->fpr[c], cpu->ps1[b]);
+    write_paired_result(
+        cpu, d, paired_fma_nan(cpu->fpr[a], cpu->fpr[b], cpu->fpr[c], ps0),
+        paired_fma_nan(cpu->ps1[a], cpu->ps1[b], cpu->fpr[c], ps1));
 }
 
 void ppc_ps_madds1(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
-    f64 scalar = force_25_bit(cpu->ps1[c]);
-    write_paired_result(cpu, d, fma(cpu->fpr[a], scalar, cpu->fpr[b]),
-                        fma(cpu->ps1[a], scalar, cpu->ps1[b]));
+    f64 ps0 = single_fma_value(cpu, cpu->fpr[a], cpu->ps1[c], cpu->fpr[b]);
+    f64 ps1 = single_fma_value(cpu, cpu->ps1[a], cpu->ps1[c], cpu->ps1[b]);
+    write_paired_result(
+        cpu, d, paired_fma_nan(cpu->fpr[a], cpu->fpr[b], cpu->ps1[c], ps0),
+        paired_fma_nan(cpu->ps1[a], cpu->ps1[b], cpu->ps1[c], ps1));
 }
 
 void ppc_ps_sum0(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
-    write_paired_result(cpu, d, cpu->fpr[a] + cpu->ps1[b], cpu->ps1[c]);
+    write_paired_result(
+        cpu, d,
+        paired_binary_nan(cpu->fpr[a], cpu->ps1[b],
+                          cpu->fpr[a] + cpu->ps1[b]),
+        cpu->ps1[c]);
 }
 
 void ppc_ps_sum1(CPUState* cpu, u8 d, u8 a, u8 c, u8 b) {
-    write_paired_result(cpu, d, cpu->fpr[c], cpu->fpr[a] + cpu->ps1[b]);
+    write_paired_result(
+        cpu, d, cpu->fpr[c],
+        paired_binary_nan(cpu->fpr[a], cpu->ps1[b],
+                          cpu->fpr[a] + cpu->ps1[b]));
 }
 
 void ppc_ps_muls0(CPUState* cpu, u8 d, u8 a, u8 c) {
     f64 scalar = force_25_bit(cpu->fpr[c]);
-    write_paired_result(cpu, d, cpu->fpr[a] * scalar, cpu->ps1[a] * scalar);
+    write_paired_result(
+        cpu, d,
+        paired_binary_nan(cpu->fpr[a], cpu->fpr[c], cpu->fpr[a] * scalar),
+        paired_binary_nan(cpu->ps1[a], cpu->fpr[c], cpu->ps1[a] * scalar));
 }
 
 void ppc_ps_muls1(CPUState* cpu, u8 d, u8 a, u8 c) {
     f64 scalar = force_25_bit(cpu->ps1[c]);
-    write_paired_result(cpu, d, cpu->fpr[a] * scalar, cpu->ps1[a] * scalar);
+    write_paired_result(
+        cpu, d,
+        paired_binary_nan(cpu->fpr[a], cpu->ps1[c], cpu->fpr[a] * scalar),
+        paired_binary_nan(cpu->ps1[a], cpu->ps1[c], cpu->ps1[a] * scalar));
 }
 
 void ppc_ps_res_op(CPUState* cpu, u8 d, u8 b) {

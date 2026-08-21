@@ -10,6 +10,7 @@
 #include "backend/emitter.h"
 #include "backend/dispatch.h"
 #include "backend/codegen.h"
+#include "backend/variant_output.h"
 #include "backend/symbols.h"
 #include "analysis/code_section.h"
 #include "analysis/embedded_data.h"
@@ -23,7 +24,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <time.h>
 #ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
@@ -52,23 +52,10 @@ static u32 c_chunk_instructions(void) {
 }
 
 #ifdef DOLRECOMP_ENABLE_LLVM
-// 128, measured. A chunk is one LLVM function, so this is the block count the
-// register allocator keeps the whole guest register file live across. Against
-// the previous 1024 default this is +57.9% throughput and -66% .text on Mario
-// Kart; 64 gains a further 1.4% but its range overlaps 128's, so it is not a
-// proven gain. See docs/LLVM-EXPERIMENTS.md E002-E004.
 #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
-// v6 carries the execution budget across generated function calls.
-// Any change that alters generated code must bump this, because
-// llvm_job_hash() omits the pass pipeline, opt level and LLVM version.
-// v7: ps1 preservation fix in dolir_builder (lfd and fmr/fneg/fabs/fnabs/fsel
-// no longer splat into the high paired-single slot). Default codegen changed,
-// so every cached object from v6 is stale.
-#define DOLLLVM_CACHE_VERSION "dolllvm-v7"
-// The LLVM optimisation level used for generated objects. Named so it can be
-// folded into the cache key; changing it must not reuse cached objects.
-#define DOLLLVM_OPT_LEVEL 2
+// SSA regions, ABI v4 variants and ThinLTO summaries.
+#define DOLLLVM_CACHE_VERSION "dolllvm-v19"
 
 typedef struct {
     const PPCInst* insts;
@@ -78,30 +65,47 @@ typedef struct {
     u32 total;
     const DolLLVMFunctionRange* ranges;
     u32 range_count;
+    const u32* entry_points;
+    u32 entry_point_count;
+    DolLLVMTargetProfile target_profile;
+    DolLLVMSemantics semantics;
+    DolLLVMInstrumentation instrumentation;
+    const char* profile_generate_path;
+    const char* profile_use_path;
+    u64 partition_seed;
+    u32 ram_size;
+    u32 mem2_size;
+    char symbol_suffix[32];
+    char thinlto_path[1400];
     u64 hash;
     char name[128];
     char path[1400];
     char cache_path[1400];
+    char cache_bitcode_path[1400];
 } LLVMChunkJob;
 
-// The floor is 32, not the 128 the C path uses.
-//
-// A chunk becomes exactly one LLVM function, so this value is the number of
-// basic blocks the register allocator has to keep the whole promoted guest
-// register file live across -- and that scope is what drives the generated
-// code size. Measured on Mario Kart (LLVM-EXPERIMENTS E002/E003), against the
-// 1024 default:
-//
-//     1024   .text 1,012,522,870   speed 0.3288
-//      256   .text   450,227,766   speed 0.4404   +33.9%
-//      128   .text   345,215,974   speed 0.5192   +57.9%
-//
-// monotonic, with disjoint confidence ranges at every step, so 128 was the
-// binding constraint rather than the optimum. Smaller chunks do eventually
-// cost -- a call that leaves the chunk returns through the dispatcher instead
-// of branching -- so this is a curve with a minimum, not a free win. Sweep it
-// per title rather than assuming this one's answer.
-#define DOLLLVM_MIN_CHUNK_INSTRUCTIONS 32u
+static u32 parse_llvm_target_set(const char* text,
+                                 DolLLVMTargetProfile profiles[5]) {
+    char copy[128];
+    if (!text || strlen(text) >= sizeof(copy))
+        return 0;
+    snprintf(copy, sizeof(copy), "%s", text);
+    u32 count = 0;
+    char* cursor = copy;
+    while (cursor && *cursor && count < 5u) {
+        char* comma = strchr(cursor, ',');
+        if (comma)
+            *comma = '\0';
+        if (!dolllvm_parse_target_profile(cursor, &profiles[count]))
+            return 0;
+        for (u32 i = 0; i < count; i++)
+            if (profiles[i] == profiles[count])
+                return 0;
+        count++;
+        cursor = comma ? comma + 1 : NULL;
+    }
+    return count;
+}
 
 static u32 llvm_chunk_instructions(void) {
     const char* configured = getenv("DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS");
@@ -110,12 +114,10 @@ static u32 llvm_chunk_instructions(void) {
     char* end = NULL;
     errno = 0;
     unsigned long value = strtoul(configured, &end, 10);
-    if (errno || !end || *end || value < DOLLLVM_MIN_CHUNK_INSTRUCTIONS ||
-        value > 4096u) {
+    if (errno || !end || *end || value < 128u || value > 4096u) {
         fprintf(stderr,
-                "warning: DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS must be %u..4096; "
+                "warning: DOLRECOMP_LLVM_CHUNK_INSTRUCTIONS must be 128..4096; "
                 "using %u\n",
-                DOLLLVM_MIN_CHUNK_INSTRUCTIONS,
                 DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS);
         return DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS;
     }
@@ -140,10 +142,11 @@ static u32 llvm_worker_batch_size(void) {
 }
 
 // Validate the object format selected by the target triple.
-static int valid_object_file(const char* path) {
-    return dolllvm_object_matches_triple(path, getenv("DOLRECOMP_LLVM_TARGET"))
-               ? 1
-               : 0;
+static int valid_object_file(const LLVMChunkJob* job, const char* path) {
+    DolLLVMOptions options = {0};
+    options.target_triple = getenv("DOLRECOMP_LLVM_TARGET");
+    options.target_profile = job->target_profile;
+    return dolllvm_object_matches_options(path, &options) ? 1 : 0;
 }
 
 static int llvm_job_stamp_path(const LLVMChunkJob* job, char* path,
@@ -230,6 +233,20 @@ static u64 hash_bytes(u64 hash, const void* data, size_t size) {
     return hash;
 }
 
+static u64 hash_file_contents(u64 hash, const char* path) {
+    if (!path || !path[0])
+        return hash;
+    FILE* file = fopen(path, "rb");
+    if (!file)
+        return hash_bytes(hash, path, strlen(path));
+    unsigned char bytes[4096];
+    size_t count;
+    while ((count = fread(bytes, 1, sizeof(bytes), file)) != 0)
+        hash = hash_bytes(hash, bytes, count);
+    fclose(file);
+    return hash;
+}
+
 static u64 llvm_job_hash(const LLVMChunkJob* job) {
     u64 hash = 1469598103934665603ull;
     hash = hash_bytes(hash, DOLLLVM_CACHE_VERSION, strlen(DOLLLVM_CACHE_VERSION));
@@ -237,19 +254,35 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     hash = hash_bytes(hash, &job->count, sizeof(job->count));
     u32 state_size = (u32)sizeof(CPUState);
     hash = hash_bytes(hash, &state_size, sizeof(state_size));
+    hash = hash_bytes(hash, &job->target_profile,
+                      sizeof(job->target_profile));
+    hash = hash_bytes(hash, job->symbol_suffix, strlen(job->symbol_suffix));
+    hash = hash_bytes(hash, &job->semantics, sizeof(job->semantics));
+    hash = hash_bytes(hash, &job->instrumentation,
+                      sizeof(job->instrumentation));
+    hash = hash_bytes(hash, &job->partition_seed,
+                      sizeof(job->partition_seed));
+    hash = hash_bytes(hash, &job->ram_size, sizeof(job->ram_size));
+    hash = hash_bytes(hash, &job->mem2_size, sizeof(job->mem2_size));
+    hash = hash_file_contents(hash, job->profile_use_path);
+    if (job->profile_generate_path)
+        hash = hash_bytes(hash, job->profile_generate_path,
+                          strlen(job->profile_generate_path));
+    const char* codegen_level = getenv("DOLRECOMP_LLVM_CODEGEN_LEVEL");
+    if (!codegen_level || !codegen_level[0])
+        codegen_level = "2";
+    hash = hash_bytes(hash, codegen_level, strlen(codegen_level));
+    const char* write_journal = getenv("DOLRECOMP_LLVM_WRITE_JOURNAL");
+    if (!write_journal)
+        write_journal = "0";
+    hash = hash_bytes(hash, write_journal, strlen(write_journal));
     // Host triples must distinguish caches when no target was requested.
     char triple[256];
-    if (dolllvm_effective_triple(getenv("DOLRECOMP_LLVM_TARGET"), triple,
-                                 sizeof(triple)))
+    DolLLVMOptions target_options = {0};
+    target_options.target_triple = getenv("DOLRECOMP_LLVM_TARGET");
+    target_options.target_profile = job->target_profile;
+    if (dolllvm_effective_triple(&target_options, triple, sizeof(triple)))
         hash = hash_bytes(hash, triple, strlen(triple));
-    // LLVM version, target CPU and features, and the pass pipeline. Without
-    // these a codegen experiment reuses objects built with the old settings
-    // and reports them as its result.
-    char codegen[1024];
-    if (dolllvm_codegen_fingerprint(codegen, sizeof(codegen)))
-        hash = hash_bytes(hash, codegen, strlen(codegen));
-    u32 opt_level = (u32)DOLLLVM_OPT_LEVEL;
-    hash = hash_bytes(hash, &opt_level, sizeof(opt_level));
     for (u32 i = 0; i < job->count; i++) {
         hash = hash_bytes(hash, &job->insts[i].address,
                           sizeof(job->insts[i].address));
@@ -259,7 +292,73 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     }
     for (u32 i = 0; i < job->range_count; i++)
         hash = hash_bytes(hash, &job->ranges[i], sizeof(job->ranges[i]));
+    for (u32 i = 0; i < job->entry_point_count; i++) {
+        u32 address = job->entry_points[i];
+        if (address >= job->function_address &&
+            address < job->function_address + job->count * 4u)
+            hash = hash_bytes(hash, &address, sizeof(address));
+    }
     return hash;
+}
+
+static int compare_u32(const void* left, const void* right) {
+    u32 a = *(const u32*)left;
+    u32 b = *(const u32*)right;
+    return a < b ? -1 : a > b;
+}
+
+static int llvm_code_address(const LoadedCodeSection* sections,
+                             u32 section_count, u32 address) {
+    for (u32 i = 0; i < section_count; i++) {
+        const LoadedCodeSection* section = &sections[i];
+        if (section->data && address >= section->address &&
+            address < section->address + section->size &&
+            ((address - section->address) & 3u) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static u32* collect_llvm_entry_points(const LoadedCodeSection* sections,
+                                      u32 section_count, u32 program_entry,
+                                      const DolRecompSymbolMap* symbols,
+                                      u32* result_count) {
+    size_t capacity = 1u + (symbols ? symbols->count : 0u);
+    for (u32 i = 0; i < section_count; i++)
+        capacity += sections[i].size / 4u;
+    u32* points = (u32*)malloc(capacity * sizeof(*points));
+    if (!points)
+        return NULL;
+    u32 count = 0;
+    if (llvm_code_address(sections, section_count, program_entry))
+        points[count++] = program_entry;
+    if (symbols) {
+        for (u32 i = 0; i < symbols->count; i++) {
+            u32 address = symbols->symbols[i].address;
+            if (llvm_code_address(sections, section_count, address))
+                points[count++] = address;
+        }
+    }
+    for (u32 section_index = 0; section_index < section_count;
+         section_index++) {
+        const LoadedCodeSection* section = &sections[section_index];
+        for (u32 offset = 0; section->data && offset + 4u <= section->size;
+             offset += 4u) {
+            u32 address = section->address + offset;
+            PPCInst inst = ppc_decode(read_be32(section->data + offset), address);
+            if ((inst.op == PPC_OP_B || inst.op == PPC_OP_BC) &&
+                llvm_code_address(sections, section_count, inst.branch_target))
+                points[count++] = inst.branch_target;
+        }
+    }
+    qsort(points, count, sizeof(*points), compare_u32);
+    u32 unique = 0;
+    for (u32 i = 0; i < count; i++) {
+        if (!unique || points[i] != points[unique - 1u])
+            points[unique++] = points[i];
+    }
+    *result_count = unique;
+    return points;
 }
 
 static int llvm_cache_dir(char* path, size_t size) {
@@ -291,18 +390,23 @@ static int llvm_cache_dir(char* path, size_t size) {
 }
 
 static int reuse_llvm_object(const LLVMChunkJob* job) {
-    if (getenv("DOLRECOMP_LLVM_RESUME") && valid_object_file(job->path) &&
+    if (getenv("DOLRECOMP_LLVM_RESUME") && valid_object_file(job, job->path) &&
+        file_exists(job->thinlto_path) &&
         valid_llvm_job_stamp(job))
         return 1;
-    if (!job->cache_path[0] || !valid_object_file(job->cache_path) ||
-        !copy_file(job->cache_path, job->path))
+    if (!job->cache_path[0] || !valid_object_file(job, job->cache_path) ||
+        !file_exists(job->cache_bitcode_path) ||
+        !copy_file(job->cache_path, job->path) ||
+        !copy_file(job->cache_bitcode_path, job->thinlto_path))
         return 0;
     write_llvm_job_stamp(job);
     return 1;
 }
 
 static void cache_llvm_object(const LLVMChunkJob* job) {
-    if (!job->cache_path[0] || valid_object_file(job->cache_path))
+    if (!job->cache_path[0] ||
+        (valid_object_file(job, job->cache_path) &&
+         file_exists(job->cache_bitcode_path)))
         return;
     char temp[1440];
 #ifdef _WIN32
@@ -318,29 +422,21 @@ static void cache_llvm_object(const LLVMChunkJob* job) {
         return;
     if (rename(temp, job->cache_path) != 0)
         remove(temp);
+    if (snprintf(temp, sizeof(temp), "%s.tmp.%d", job->cache_bitcode_path,
+                 process_id) >= (int)sizeof(temp))
+        return;
+    remove(temp);
+    if (!copy_file(job->thinlto_path, temp))
+        return;
+    if (rename(temp, job->cache_bitcode_path) != 0)
+        remove(temp);
 }
 
 static int emit_llvm_chunk_job(const void* data, void* user) {
     const LLVMChunkJob* job = (const LLVMChunkJob*)data;
     (void)user;
-    if (reuse_llvm_object(job)) {
-#ifdef _WIN32
-        // Say so. A silent reuse is indistinguishable from a regeneration in
-        // the log, and "the cache was hit" is exactly the thing that must not
-        // be assumed when checking whether a codegen change was really tested.
-        printf("[%u/%u] Reusing cached LLVM object %s\n", job->index,
-               job->total, job->name);
-        fflush(stdout);
-#endif
+    if (reuse_llvm_object(job))
         return 1;
-    }
-#ifdef _WIN32
-    // See run_llvm_chunk_jobs: on Windows this is the only live progress.
-    printf("[%u/%u] Emitting LLVM object %s\n", job->index, job->total,
-           job->name);
-    fflush(stdout);
-    time_t started = time(NULL);
-#endif
     char temp_path[1440];
 #ifdef _WIN32
     int process_id = _getpid();
@@ -362,10 +458,27 @@ static int emit_llvm_chunk_job(const void* data, void* user) {
     }
     DolLLVMOptions options = {0};
     options.target_triple = getenv("DOLRECOMP_LLVM_TARGET");
-    options.optimization_level = DOLLLVM_OPT_LEVEL;
+    options.target_profile = job->target_profile;
+    options.semantics = job->semantics;
+    options.instrumentation = job->instrumentation;
+    options.symbol_suffix = job->symbol_suffix;
+    options.profile_generate_path = job->profile_generate_path;
+    options.profile_use_path = job->profile_use_path;
+    options.partition_seed = job->partition_seed;
+    options.emit_thinlto = 1;
+    options.thinlto_path = job->thinlto_path;
+    options.fixed_memory_layout = 1;
+    options.ram_size = job->ram_size;
+    options.mem2_size = job->mem2_size;
+    options.optimization_level = 3;
     options.verify = 1;
     options.function_ranges = job->ranges;
     options.function_range_count = job->range_count;
+    options.entry_points = job->entry_points;
+    options.entry_point_count = job->entry_point_count;
+    const char* write_journal = getenv("DOLRECOMP_LLVM_WRITE_JOURNAL");
+    if (write_journal && !strcmp(write_journal, "1"))
+        options.instrumentation = DOLLLVM_INSTRUMENTATION_LOCKSTEP;
     char ir_path[1440];
     const char* dump_ir = getenv("DOLRECOMP_LLVM_DUMP_IR");
     if (dump_ir && (!strcmp(dump_ir, "1") || strstr(job->name, dump_ir))) {
@@ -393,12 +506,6 @@ static int emit_llvm_chunk_job(const void* data, void* user) {
     }
     if (!ok)
         remove(temp_path);
-#ifdef _WIN32
-    printf("[%u/%u] %s LLVM object %s (%llds)\n", job->index, job->total,
-           ok ? "Finished" : "FAILED", job->name,
-           (long long)(time(NULL) - started));
-    fflush(stdout);
-#endif
     return ok;
 }
 
@@ -419,12 +526,11 @@ static int run_llvm_chunk_jobs(const LLVMChunkJob* jobs, u32 count,
                                u32 requested_jobs) {
     u32 workers = effective_chunk_jobs(count, requested_jobs);
 #ifdef _WIN32
-    // Progress is reported from inside the job, not dumped up front. The
-    // Windows path used to print every line before starting any work, so a
-    // chunk that hung produced a complete-looking log and no indication of
-    // which chunk was stuck -- one such hang ran 49 minutes with nothing to
-    // point at. A start line, and a done line carrying elapsed seconds, means
-    // the stuck chunk is the one with no matching completion.
+    for (u32 i = 0; i < count; i++) {
+        printf("[%u/%u] Emitting LLVM object %s\n",
+               jobs[i].index, jobs[i].total, jobs[i].name);
+        fflush(stdout);
+    }
     return run_parallel_jobs(jobs, sizeof(*jobs), count, workers,
                              emit_llvm_chunk_job, NULL);
 #else
@@ -561,7 +667,14 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
                                    const char* output_path,
                                    DolRecompCPU cpu, u32 entry_point,
                                    u32 requested_jobs, int local_chunks_dir,
-                                   const DolRecompSymbolMap* symbols) {
+                                   const DolRecompSymbolMap* symbols,
+                                   const CliOptions* options) {
+    DolLLVMTargetProfile profiles[5];
+    u32 profile_count = parse_llvm_target_set(options->llvm_targets, profiles);
+    if (!profile_count) {
+        fprintf(stderr, "error: invalid or duplicate LLVM target set\n");
+        return 0;
+    }
     char stem[1024];
     char header_path[1100];
     char symbol_header_path[1100];
@@ -632,15 +745,22 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
 
     FunctionList funcs = {0};
     SMCAnalysis smc = {0};
+    DolLLVMFunctionRange* ranges = NULL;
+    u32 entry_point_count = 0;
+    u32* entry_points = collect_llvm_entry_points(
+        sections, section_count, entry_point, symbols, &entry_point_count);
+    if (!entry_points)
+        goto fail;
     u32 file_count = 0;
     u32 range_count = 0;
-    const u32 chunk_instructions = llvm_chunk_instructions();
+    const u32 chunk_instructions = options->partition_instructions
+                                       ? options->partition_instructions
+                                       : llvm_chunk_instructions();
     for (u32 s = 0; s < section_count; s++)
         range_count +=
             ((sections[s].size / 4u) + chunk_instructions - 1u) /
             chunk_instructions;
-    DolLLVMFunctionRange* ranges =
-        (DolLLVMFunctionRange*)calloc(range_count, sizeof(*ranges));
+    ranges = (DolLLVMFunctionRange*)calloc(range_count, sizeof(*ranges));
     if (!ranges)
         goto fail;
     char cache_dir[1100] = "";
@@ -693,8 +813,9 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
 
         u32 chunk_total =
             (num_insts + chunk_instructions - 1u) / chunk_instructions;
+        u32 job_total = chunk_total * profile_count;
         LLVMChunkJob* chunk_jobs =
-            (LLVMChunkJob*)calloc(chunk_total, sizeof(*chunk_jobs));
+            (LLVMChunkJob*)calloc(job_total, sizeof(*chunk_jobs));
         if (!chunk_jobs) {
             free(insts);
             goto fail;
@@ -704,31 +825,81 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
             if (chunk_count > chunk_instructions)
                 chunk_count = chunk_instructions;
             u32 function_address = section->address + start * 4u;
-            u32 job_index = start / chunk_instructions;
-            LLVMChunkJob* job = &chunk_jobs[job_index];
-            if (snprintf(job->name, sizeof(job->name), "chunk_%04u_%s%u_%08X.o",
-                         file_count, section->label, section->index,
-                         function_address) >= (int)sizeof(job->name) ||
-                !join_path(job->path, sizeof(job->path), chunks_dir, job->name)) {
-                free(chunk_jobs);
-                free(insts);
-                goto fail;
-            }
-            job->insts = insts + start;
-            job->count = chunk_count;
-            job->function_address = function_address;
-            job->index = file_count + 1u;
-            job->total = range_count;
-            job->ranges = ranges;
-            job->range_count = range_count;
-            job->hash = llvm_job_hash(job);
-            if (cache_dir[0]) {
-                char cache_name[64];
-                snprintf(cache_name, sizeof(cache_name), "%016llx.o",
-                         (unsigned long long)job->hash);
-                if (!join_path(job->cache_path, sizeof(job->cache_path),
-                               cache_dir, cache_name))
-                    job->cache_path[0] = '\0';
+            u32 chunk_index = start / chunk_instructions;
+            u32 output_index = file_count / profile_count;
+            LLVMChunkJob* job = &chunk_jobs[chunk_index * profile_count];
+            for (u32 variant = 0; variant < profile_count; variant++) {
+                LLVMChunkJob* target_job = &job[variant];
+                const char* target_suffix =
+                    dolllvm_target_profile_suffix(profiles[variant]);
+                if (variant)
+                    snprintf(target_job->symbol_suffix,
+                             sizeof(target_job->symbol_suffix), "__%s",
+                             target_suffix);
+                int name_length = variant
+                    ? snprintf(target_job->name, sizeof(target_job->name),
+                               "chunk_%04u_%s%u_%08X_%s.o",
+                               output_index, section->label,
+                               section->index, function_address, target_suffix)
+                    : snprintf(target_job->name, sizeof(target_job->name),
+                               "chunk_%04u_%s%u_%08X.o", output_index,
+                               section->label, section->index,
+                               function_address);
+                if (name_length >= (int)sizeof(target_job->name) ||
+                    !join_path(target_job->path, sizeof(target_job->path),
+                               chunks_dir, target_job->name)) {
+                    free(chunk_jobs);
+                    free(insts);
+                    goto fail;
+                }
+                if (snprintf(target_job->thinlto_path,
+                             sizeof(target_job->thinlto_path), "%s.bc",
+                             target_job->path) >=
+                    (int)sizeof(target_job->thinlto_path)) {
+                    free(chunk_jobs);
+                    free(insts);
+                    goto fail;
+                }
+                target_job->insts = insts + start;
+                target_job->count = chunk_count;
+                target_job->function_address = function_address;
+                target_job->index = file_count + variant + 1u;
+                target_job->total = range_count * profile_count;
+                target_job->ranges = ranges;
+                target_job->range_count = range_count;
+                target_job->entry_points = entry_points;
+                target_job->entry_point_count = entry_point_count;
+                target_job->target_profile = profiles[variant];
+                target_job->semantics = options->fast_semantics
+                                            ? DOLLLVM_SEMANTICS_FAST
+                                            : DOLLLVM_SEMANTICS_EXACT;
+                target_job->instrumentation = options->lockstep_instrumentation
+                                                  ? DOLLLVM_INSTRUMENTATION_LOCKSTEP
+                                                  : DOLLLVM_INSTRUMENTATION_NONE;
+                target_job->profile_generate_path =
+                    options->profile_generate_path;
+                target_job->profile_use_path = options->profile_use_path;
+                target_job->partition_seed = options->partition_seed;
+                target_job->ram_size = GC_MAIN_RAM_SIZE;
+                target_job->mem2_size = cpu == DOLRECOMP_CPU_GEKKO
+                                             ? 0u
+                                             : WII_MEM2_SIZE;
+                target_job->hash = llvm_job_hash(target_job);
+                if (cache_dir[0]) {
+                    char cache_name[64];
+                    snprintf(cache_name, sizeof(cache_name), "%016llx.o",
+                             (unsigned long long)target_job->hash);
+                    if (!join_path(target_job->cache_path,
+                                   sizeof(target_job->cache_path), cache_dir,
+                                   cache_name))
+                        target_job->cache_path[0] = '\0';
+                    if (target_job->cache_path[0] &&
+                        snprintf(target_job->cache_bitcode_path,
+                                 sizeof(target_job->cache_bitcode_path),
+                                 "%s.bc", target_job->cache_path) >=
+                            (int)sizeof(target_job->cache_bitcode_path))
+                        target_job->cache_path[0] = '\0';
+                }
             }
             DolIRModule audit;
             dolir_module_init(&audit);
@@ -772,19 +943,29 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
             }
             dolir_module_free(&audit);
             emit_chunk_prototype(header, function_address);
+            for (u32 variant = 1; variant < profile_count; variant++)
+                fprintf(header, "void func_%08X%s(CPUState* ctx);\n",
+                        function_address, job[variant].symbol_suffix);
             if (!function_list_add(&funcs, function_address,
                                    function_address + chunk_count * 4u)) {
                 free(chunk_jobs);
                 free(insts);
                 goto fail;
             }
-            fprintf(manifest, "// object: chunks/%s\n", job->name);
-            file_count++;
+            for (u32 variant = 0; variant < profile_count; variant++) {
+                fprintf(manifest, "// object: chunks/%s\n",
+                        job[variant].name);
+                fprintf(manifest, "// object[%s]: chunks/%s\n",
+                        dolllvm_target_profile_name(profiles[variant]),
+                        job[variant].name);
+            }
+            fprintf(manifest, "// ThinLTO summaries: chunks/*.o.bc\n");
+            file_count += profile_count;
         }
-        u32 active_jobs = effective_chunk_jobs(chunk_total, requested_jobs);
+        u32 active_jobs = effective_chunk_jobs(job_total, requested_jobs);
         printf("  writing %u LLVM objects with %u job%s\n",
-               chunk_total, active_jobs, active_jobs == 1 ? "" : "s");
-        if (!run_llvm_chunk_jobs(chunk_jobs, chunk_total, requested_jobs)) {
+               job_total, active_jobs, active_jobs == 1 ? "" : "s");
+        if (!run_llvm_chunk_jobs(chunk_jobs, job_total, requested_jobs)) {
             free(chunk_jobs);
             free(insts);
             goto fail;
@@ -802,6 +983,8 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
         printf("warning: executable memory writes detected; report: %s\n", report);
     }
     emit_dispatch_helpers(header, &funcs, entry_point);
+    emit_llvm_variant_table(header, &funcs, profiles, profile_count,
+                            options->fast_semantics);
     emit_footer(header);
     fprintf(manifest, "\n// %u native objects\n", file_count);
     fclose(header);
@@ -810,6 +993,7 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
     smc_analysis_free(&smc);
     function_list_free(&funcs);
     free(ranges);
+    free(entry_points);
     printf("done!\n  header: %s\n  objects: %s (%u files)\n",
            header_path, chunks_dir, file_count);
     return 1;
@@ -818,6 +1002,7 @@ fail:
     smc_analysis_free(&smc);
     function_list_free(&funcs);
     free(ranges);
+    free(entry_points);
     fclose(header);
     fclose(manifest);
     fclose(fallback_report);
@@ -831,13 +1016,14 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
                                     DolRecompCPU cpu, u32 entry_point, u32 jobs,
                                     int local_chunks_dir,
                                     const DolRecompSymbolMap* symbols,
-                                    DolRecompBackend backend) {
+                                    const CliOptions* options) {
 #ifdef DOLRECOMP_ENABLE_LLVM
-    if (backend == DOLRECOMP_BACKEND_LLVM)
+    if (options->backend == DOLRECOMP_BACKEND_LLVM)
         return emit_code_sections_llvm(sections, section_count, output_path, cpu,
-                                       entry_point, jobs, local_chunks_dir, symbols);
+                                       entry_point, jobs, local_chunks_dir,
+                                       symbols, options);
 #else
-    if (backend == DOLRECOMP_BACKEND_LLVM) {
+    if (options->backend == DOLRECOMP_BACKEND_LLVM) {
         fprintf(stderr, "error: LLVM backend is unavailable in this build\n");
         return 0;
     }
@@ -1081,29 +1267,10 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             file_count++;
         }
 
-        // Direct cross-chunk calls bypass the chassis dispatcher. That is unsafe
-        // for runtimes which validate mutable guest code at dispatch boundaries,
-        // so only emit them after an explicit opt-in for controlled benchmarks.
-        // funcs accumulates across sections; targets in a later section still
-        // fall back to the dispatcher because their symbols are not known yet.
-        const char* direct = getenv("DOLRECOMP_UNSAFE_DIRECT_CALLS");
-        u32* chunk_starts = NULL;
-        if (direct && strcmp(direct, "1") == 0) {
-            printf("  unsafe cross-chunk direct calls enabled\n");
-            chunk_starts = (u32*)malloc((size_t)funcs.count * sizeof(u32));
-            if (chunk_starts) {
-                for (u32 i = 0; i < funcs.count; ++i)
-                    chunk_starts[i] = funcs.ranges[i].start;
-                emit_set_chunk_table(chunk_starts, funcs.count);
-            }
-        }
-
         u32 active_jobs = effective_chunk_jobs(section_job_count, jobs);
         printf("  writing %u chunks with %u job%s\n",
                section_job_count, active_jobs, active_jobs == 1 ? "" : "s");
         if (!run_chunk_jobs(chunk_jobs, section_job_count, jobs)) {
-            emit_set_chunk_table(NULL, 0);
-            free(chunk_starts);
             smc_analysis_free(&smc);
             function_list_free(&funcs);
             free(chunk_jobs);
@@ -1112,8 +1279,6 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             fclose(manifest);
             return 0;
         }
-        emit_set_chunk_table(NULL, 0);
-        free(chunk_starts);
 
         free(chunk_jobs);
         free(insts);
@@ -1173,7 +1338,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
 int emit_dol_split(const DOLFile* dol, const char* output_path,
                           DolRecompCPU cpu, u32 jobs, int local_chunks_dir,
                           const DolRecompSymbolMap* symbols,
-                          DolRecompBackend backend) {
+                          const CliOptions* options) {
     LoadedCodeSection sections[DOL_NUM_TEXT];
     u32 section_count = 0;
 
@@ -1198,12 +1363,12 @@ int emit_dol_split(const DOLFile* dol, const char* output_path,
 
     return emit_code_sections_split(sections, section_count, output_path, cpu,
                                     dol->header.entry_point, jobs,
-                                    local_chunks_dir, symbols, backend);
+                                    local_chunks_dir, symbols, options);
 }
 
 int emit_rpx_split(const RPXFile* rpx, const char* output_path,
                           DolRecompCPU cpu, u32 jobs, int local_chunks_dir,
-                          DolRecompBackend backend) {
+                          const CliOptions* options) {
     LoadedCodeSection sections[RPX_MAX_CODE_SECTIONS];
 
     for (u32 i = 0; i < rpx->code_section_count; i++) {
@@ -1221,12 +1386,12 @@ int emit_rpx_split(const RPXFile* rpx, const char* output_path,
 
     return emit_code_sections_split(sections, rpx->code_section_count,
                                     output_path, cpu, 0, jobs,
-                                    local_chunks_dir, NULL, backend);
+                                    local_chunks_dir, NULL, options);
 }
 
 int emit_rel_split(const RELFile* rel, const char* output_path,
                           DolRecompCPU cpu, u32 jobs, int local_chunks_dir,
-                          DolRecompBackend backend) {
+                          const CliOptions* options) {
     LoadedCodeSection* sections =
         (LoadedCodeSection*)calloc(rel->section_count, sizeof(LoadedCodeSection));
     if (!sections) {
@@ -1253,7 +1418,7 @@ int emit_rel_split(const RELFile* rel, const char* output_path,
 
     int ok = emit_code_sections_split(sections, section_count, output_path, cpu,
                                       rel->entry_point, jobs, local_chunks_dir,
-                                      NULL, backend);
+                                      NULL, options);
     free(sections);
     return ok;
 }
@@ -1311,7 +1476,7 @@ int check_duplicate_rel_module(const RELBatchItem* items, u32 count,
 int emit_rel_directory(const char* input_dir, const char* output_root,
                               const char* title_id, int titleless_mode,
                               DolRecompCPU cpu, u32 jobs, u32 start_base,
-                              DolRecompBackend backend) {
+                              const CliOptions* options) {
     PathList paths = {0};
     RELBatchItem* items = NULL;
     RELModuleMapEntry* map_entries = NULL;
@@ -1372,7 +1537,8 @@ int emit_rel_directory(const char* input_dir, const char* output_root,
             goto done;
         }
         printf("\nwriting output to: %s\n", rel_output_path);
-        if (!emit_rel_split(&items[i].rel, rel_output_path, cpu, jobs, 1, backend))
+        if (!emit_rel_split(&items[i].rel, rel_output_path, cpu, jobs, 1,
+                            options))
             goto done;
     }
 

@@ -14,16 +14,16 @@
 
 int emit_dol_split(const DOLFile* dol, const char* output_path,
                    DolRecompCPU cpu, u32 jobs, int local_chunks_dir,
-                   const DolRecompSymbolMap* symbols, DolRecompBackend backend);
+                   const DolRecompSymbolMap* symbols, const CliOptions* options);
 int emit_rpx_split(const RPXFile* rpx, const char* output_path,
                    DolRecompCPU cpu, u32 jobs, int local_chunks_dir,
-                   DolRecompBackend backend);
+                   const CliOptions* options);
 int emit_rel_split(const RELFile* rel, const char* output_path,
                    DolRecompCPU cpu, u32 jobs, int local_chunks_dir,
-                   DolRecompBackend backend);
+                   const CliOptions* options);
 int emit_rel_directory(const char* input_dir, const char* output_root,
                        const char* title_id, int titleless_mode,
                        DolRecompCPU cpu, u32 jobs, u32 start_base,
-                       DolRecompBackend backend);
+                       const CliOptions* options);
 
 #endif

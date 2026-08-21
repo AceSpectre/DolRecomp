@@ -16,6 +16,13 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "  -jN                            Use N worker jobs for split C output (e.g. -j14)\n");
     fprintf(stderr, "  --cpu gekko|broadway|espresso  Select CPU profile (default: broadway)\n");
     fprintf(stderr, "  --backend c|llvm               Select generated-code backend (default: c)\n");
+    fprintf(stderr, "  --targets <set>                host, x86-64-v2, x86-64-v3, aarch64, aarch64-a57\n");
+    fprintf(stderr, "  --semantics exact|fast         PowerPC floating-point semantics (default: exact)\n");
+    fprintf(stderr, "  --instrumentation none|lockstep  Compile release or state-journal objects\n");
+    fprintf(stderr, "  --profile-generate <path>      Emit counters for a later profile run\n");
+    fprintf(stderr, "  --profile-use <path>           Optimize with an existing profile\n");
+    fprintf(stderr, "  --partition-instructions <n>   Reproducible object partition size\n");
+    fprintf(stderr, "  --partition-seed <n>           Stable partition naming seed\n");
     fprintf(stderr, "  --gamecube                     GameCube mode (no title ID required)\n");
     fprintf(stderr, "  --rel-base <addr>              Override first virtual load address for REL codegen\n");
     fprintf(stderr, "  --map <path>                   Load optional function names from a linker MAP\n");
@@ -125,6 +132,37 @@ int parse_u32_arg(const char* text, const char* name, u32* value_out) {
     return 1;
 }
 
+static int valid_target_set(const char* text) {
+    const char* start = text;
+    while (start && *start) {
+        const char* end = strchr(start, ',');
+        size_t length = end ? (size_t)(end - start) : strlen(start);
+        const char* names[] = {
+            "host", "x86-64-v2", "x86-64-v3", "aarch64", "aarch64-a57",
+        };
+        int found = 0;
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+            found |= strlen(names[i]) == length &&
+                     strncmp(start, names[i], length) == 0;
+        if (!found)
+            return 0;
+        start = end ? end + 1 : NULL;
+    }
+    return text && text[0];
+}
+
+static int parse_u64_value(const char* text, const char* name, u64* result) {
+    char* end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(text, &end, 0);
+    if (errno || !end || *end) {
+        fprintf(stderr, "error: %s must be an unsigned integer\n", name);
+        return 0;
+    }
+    *result = (u64)value;
+    return 1;
+}
+
 int parse_cli(int argc, char** argv, CliOptions* opts) {
     const char* positional[3];
     int positional_count = 0;
@@ -133,6 +171,7 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
     opts->cpu = DOLRECOMP_CPU_GEKKO;
     opts->backend = DOLRECOMP_BACKEND_C;
     opts->jobs = 1;
+    opts->llvm_targets = "host";
 
     for (int i = 1; i < argc; i++) {
         const char* arg = argv[i];
@@ -180,6 +219,118 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
                 fprintf(stderr, "error: unknown backend '%s'\n", name);
                 return 0;
             }
+            continue;
+        }
+
+        if (strcmp(arg, "--targets") == 0) {
+            if (i + 1 >= argc || !valid_target_set(argv[i + 1])) {
+                fprintf(stderr, "error: --targets needs a comma-separated target set\n");
+                return 0;
+            }
+            opts->llvm_targets = argv[++i];
+            continue;
+        }
+
+        if (strncmp(arg, "--targets=", 10) == 0) {
+            if (!valid_target_set(arg + 10)) {
+                fprintf(stderr, "error: invalid LLVM target set '%s'\n", arg + 10);
+                return 0;
+            }
+            opts->llvm_targets = arg + 10;
+            continue;
+        }
+
+        if (strcmp(arg, "--semantics") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --semantics needs exact or fast\n");
+                return 0;
+            }
+            arg = argv[++i];
+            if (ascii_case_equal(arg, "exact")) opts->fast_semantics = 0;
+            else if (ascii_case_equal(arg, "fast")) opts->fast_semantics = 1;
+            else {
+                fprintf(stderr, "error: --semantics needs exact or fast\n");
+                return 0;
+            }
+            continue;
+        }
+
+        if (strncmp(arg, "--semantics=", 12) == 0) {
+            const char* mode = arg + 12;
+            if (ascii_case_equal(mode, "exact")) opts->fast_semantics = 0;
+            else if (ascii_case_equal(mode, "fast")) opts->fast_semantics = 1;
+            else {
+                fprintf(stderr, "error: --semantics needs exact or fast\n");
+                return 0;
+            }
+            continue;
+        }
+
+        if (strcmp(arg, "--instrumentation") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --instrumentation needs none or lockstep\n");
+                return 0;
+            }
+            arg = argv[++i];
+            if (ascii_case_equal(arg, "none")) opts->lockstep_instrumentation = 0;
+            else if (ascii_case_equal(arg, "lockstep")) opts->lockstep_instrumentation = 1;
+            else {
+                fprintf(stderr, "error: --instrumentation needs none or lockstep\n");
+                return 0;
+            }
+            continue;
+        }
+
+        if (strncmp(arg, "--instrumentation=", 18) == 0) {
+            const char* mode = arg + 18;
+            if (ascii_case_equal(mode, "none")) opts->lockstep_instrumentation = 0;
+            else if (ascii_case_equal(mode, "lockstep")) opts->lockstep_instrumentation = 1;
+            else {
+                fprintf(stderr, "error: --instrumentation needs none or lockstep\n");
+                return 0;
+            }
+            continue;
+        }
+
+        if (strcmp(arg, "--profile-generate") == 0 ||
+            strcmp(arg, "--profile-use") == 0) {
+            int generate = strcmp(arg, "--profile-generate") == 0;
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: %s needs a path\n", arg);
+                return 0;
+            }
+            if (generate) opts->profile_generate_path = argv[++i];
+            else opts->profile_use_path = argv[++i];
+            continue;
+        }
+
+        if (strncmp(arg, "--profile-generate=", 19) == 0) {
+            opts->profile_generate_path = arg + 19;
+            continue;
+        }
+
+        if (strncmp(arg, "--profile-use=", 14) == 0) {
+            opts->profile_use_path = arg + 14;
+            continue;
+        }
+
+        if (strcmp(arg, "--partition-instructions") == 0) {
+            if (i + 1 >= argc ||
+                !parse_u32_arg(argv[++i], "--partition-instructions",
+                               &opts->partition_instructions) ||
+                opts->partition_instructions < 128u ||
+                opts->partition_instructions > 4096u) {
+                fprintf(stderr, "error: partition instructions must be 128..4096\n");
+                return 0;
+            }
+            continue;
+        }
+
+        if (strcmp(arg, "--partition-seed") == 0) {
+            if (i + 1 >= argc ||
+                !parse_u64_value(argv[++i], "--partition-seed",
+                                 &opts->partition_seed))
+                return 0;
             continue;
         }
 
@@ -316,6 +467,11 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
         return 0;
     }
 #endif
+
+    if (opts->profile_generate_path && opts->profile_use_path) {
+        fprintf(stderr, "error: profile generation and use are mutually exclusive\n");
+        return 0;
+    }
 
     opts->input_path = positional[0];
 

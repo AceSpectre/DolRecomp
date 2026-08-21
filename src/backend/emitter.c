@@ -1970,3 +1970,4 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     c_function_cfg_destroy(&cfg);
     return true;
 }
+// dear lord this thing is huge

@@ -8,11 +8,7 @@ Luckily, we have you covered there. check out ![ModernGekko!](https://github.com
 
 ## Actual Progress
 
-We'd rather show real game progress than pad the README with synthetic tests and tiny demos, so here is Luigi's Mansion reaching the title screen through DolRecomp:
-
-![Luigi's Mansion title screen running via DolRecomp](assets/mansion.png)
-
-And many more in the discord!
+Moved to recomp projects channel in ExpansionPak discord, where you can see all the recomps made by the community!
 
 ## Important!
 
@@ -35,7 +31,9 @@ apparently this wasn't as obvious as i'd hope it to be..
 - Wii U RPX loading works for executable sections. Compressed RPX sections need zlib.
 - DOL/RPX/REL frontends validate executable entry points before codegen.
 - The decoder currently recognizes 236 PowerPC/Gekko/Broadway/Espresso opcodes. (Espresso may need more looking at)
-- The backend emits C in split chunks with `-jN` worker support.
+- The C backend emits portable split output with `-jN` worker support.
+- The LLVM 19/20 backend emits SSA-based x86-64-v2, x86-64-v3, generic
+  ARMv8-A, and Cortex-A57 objects with static module ABI v4 selection.
 - Generated dispatch can hand known function addresses to host replacements before entering compiled code, and replacements can call the original generated function.
 - The generated C is a compile target only, no runtime
 
@@ -46,6 +44,17 @@ Requirements:
 - CMake 3.16 or newer
 - A C11 compiler
 - zlib, optional but required for compressed RPX sections (Wii U)
+
+LLVM object generation additionally requires LLVM 19 or 20 development files:
+
+```sh
+cmake -S . -B build-llvm -DDOLRECOMP_ENABLE_LLVM=ON \
+  -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
+cmake --build build-llvm --config Release
+ctest --test-dir build-llvm -C Release --output-on-failure
+```
+
+it doesn't work without it trust me
 
 From the repo root:
 
@@ -202,6 +211,26 @@ Output rules:
 - `-jN` controls how many worker jobs write split C chunks.
 - If `database/titles.txt` is missing during Wii mode, DolRecomp prints a warning and uses GameCube mode.
 
+LLVM output is selected with `--backend=llvm`. Exact PowerPC floating-point
+semantics are the default. A typical dual-x86 build is:
+
+```sh
+dolrecomp --gamecube --backend=llvm \
+  --targets=x86-64-v2,x86-64-v3 --semantics=exact game.dol build
+```
+
+Use `--targets=aarch64` for generic ARMv8-A or
+`--targets=aarch64-a57` for Switch-class Cortex-A57 output. Multiple targets
+produce isolated symbols, ThinLTO summary sidecars, and an ABI v4 variant table.
+The runtime calls `dolrecomp_initialize_module` once and keeps the selected
+dispatch pointer. Unsupported features are rejected before execution.
+
+`--instrumentation=lockstep` builds memory-journal objects separately from
+release output. `--profile-generate <file>` and `--profile-use <profdata>`
+enable LLVM IR PGO. `--partition-instructions 128..4096` and
+`--partition-seed <n>` control reproducible partition inputs. Fast semantics
+must be requested explicitly with `--semantics=fast`.
+
 ## CPU Coverage
 
 The current CPU opcode set has 236 implemented opcodes.
@@ -227,7 +256,7 @@ The current CPU opcode set has 236 implemented opcodes.
 ```text
 src/
   frontend/     DOL/RPX loading and PowerPC decode
-  backend/      split C output
+  backend/      C and target-neutral LLVM object output
   core/         CPU state and behavior helpers
 
 tests/          decoder, CPU behavior, RPX, and codegen tests

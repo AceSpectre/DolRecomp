@@ -26,6 +26,19 @@ static u8 cache_operation;
 static u32 cache_address;
 static u32 cache_cia;
 static u32 external_write_count;
+static u32 spr_state[1024];
+
+static u32 read_spr(CPUState* cpu, u16 spr, u32 cia) {
+    (void)cpu;
+    (void)cia;
+    return spr_state[spr];
+}
+
+static void write_spr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
+    (void)cpu;
+    (void)cia;
+    spr_state[spr] = value;
+}
 
 static void fallback(CPUState* cpu, u32 raw, u32 cia) {
     fallback_bad |= raw != 0;
@@ -71,6 +84,8 @@ int main(void) {
     cpu.msr = 1u << 13;
     cpu.downcount = 0;
     cpu.instruction_fallback = fallback;
+    cpu.spr_read = read_spr;
+    cpu.spr_write = write_spr;
     func_80001000(&cpu);
     CHECK(cpu.gpr[3] == 10);
     CHECK(mem_read32(&cpu, GC_RAM_BASE) == 9);
@@ -83,7 +98,7 @@ int main(void) {
     cpu.gpr[3] = 0xA5A55A5Au;
     func_80002000(&cpu);
     CHECK(cpu.gpr[4] == 0xA5A55A5Au);
-    CHECK(cpu.spr[273] == 0xA5A55A5Au);
+    CHECK(spr_state[273] == 0xA5A55A5Au);
     CHECK(cpu.pc == 0x81234564u);
 
     prepare_call(&cpu, 0x80002100u);

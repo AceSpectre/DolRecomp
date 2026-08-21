@@ -33,3 +33,6 @@ void emit_instruction(FILE* out, const PPCInst* inst);
 void emit_footer(FILE* out);
 
 #endif /* DOLRECOMP_EMITTER_H */
+
+// i would just like to mention, that those comments have been here since the beginning of time.
+// do not judge old me

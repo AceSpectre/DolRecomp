@@ -93,6 +93,7 @@ DolIRValue dolir_append(DolIRFunction* function, DolIRBlock* block,
     inst->aux = aux;
     inst->guest_pc = guest_pc;
     inst->effects = effects;
+    dolir_populate_effects(inst);
     return result;
 }
 
@@ -107,7 +108,8 @@ DolIRType dolir_state_type(DolIRStateSlot slot) {
         return DOLIR_TYPE_F64;
     if (slot == DOLIR_STATE_TIMEBASE || slot == DOLIR_STATE_DOWNCOUNT)
         return DOLIR_TYPE_I64;
-    if (slot == DOLIR_STATE_RESERVE_VALID)
+    if (slot == DOLIR_STATE_RESERVE_VALID || slot == DOLIR_STATE_XER_CA ||
+        slot == DOLIR_STATE_XER_OV || slot == DOLIR_STATE_XER_SO)
         return DOLIR_TYPE_I1;
     return DOLIR_TYPE_I32;
 }

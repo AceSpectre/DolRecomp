@@ -3,7 +3,8 @@ project(DolRecomp C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-option(DOLRECOMP_ENABLE_LLVM "Build the x86-64 LLVM object backend" OFF)
+option(DOLRECOMP_ENABLE_LLVM "Build the LLVM object backend" OFF)
+option(DOLRECOMP_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 
 # Discover LLVM before creating targets so its MSVC runtime choice is uniform.
 if(DOLRECOMP_ENABLE_LLVM)
@@ -19,8 +20,14 @@ endif()
 # Portable warnings for local development and CI.
 if(MSVC)
     add_compile_options(/W3)
+    if(DOLRECOMP_WARNINGS_AS_ERRORS)
+        add_compile_options(/WX)
+    endif()
 else()
     add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+    if(DOLRECOMP_WARNINGS_AS_ERRORS)
+        add_compile_options(-Werror)
+    endif()
 endif()
 
 if(NOT DEFINED ZLIB_ROOT)
@@ -82,6 +89,7 @@ endif()
 
 add_library(dr_ir STATIC
     src/ir/dolir.c
+    src/ir/dolir_effects.c
     src/ir/dolir_builder.c
 )
 target_include_directories(dr_ir PUBLIC ${DOLRECOMP_SRC})
@@ -90,10 +98,26 @@ target_link_libraries(dr_ir PUBLIC dr_frontend)
 if(DOLRECOMP_ENABLE_LLVM)
     add_library(dr_llvm STATIC
         src/backend/llvm/llvm_backend.cpp
-        src/backend/llvm/llvm_control_flow.cpp
-        src/backend/llvm/llvm_function_emitter.cpp
-        src/backend/llvm/llvm_memory_lowering.cpp
-        src/backend/llvm/llvm_runtime_lowering.cpp
+        src/backend/llvm/target.cpp
+        src/backend/llvm/passes.cpp
+        src/backend/llvm/branch_targets.cpp
+        src/backend/llvm/control_flow.cpp
+        src/backend/llvm/emitter.cpp
+        src/backend/llvm/memory.cpp
+        src/backend/llvm/register_state.cpp
+        src/backend/llvm/state_controls.cpp
+        src/backend/llvm/exits.cpp
+        src/backend/llvm/instructions.cpp
+        src/backend/llvm/runtime.cpp
+        src/backend/llvm/floating_point.cpp
+        src/backend/llvm/fp_fixups.cpp
+        src/backend/llvm/fpr_state.cpp
+        src/backend/llvm/paired_single.cpp
+        src/backend/llvm/paired_fma.cpp
+        src/backend/llvm/psq_convert.cpp
+        src/backend/llvm/psq.cpp
+        src/backend/llvm/psq_static.cpp
+        src/backend/llvm/special_instructions.cpp
     )
     target_include_directories(dr_llvm PUBLIC ${DOLRECOMP_SRC})
     target_include_directories(dr_llvm SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
@@ -110,14 +134,14 @@ if(DOLRECOMP_ENABLE_LLVM)
                 "${DOLRECOMP_LLVM_SHARED_IMPORT}")
         else()
             llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS
-                Core Support Analysis Passes Target MC native nativecodegen)
+                Core Support Analysis BitWriter Passes Target MC native nativecodegen)
             target_link_libraries(dr_llvm PRIVATE ${DOLRECOMP_LLVM_LIBS})
         endif()
     elseif(TARGET LLVM)
         target_link_libraries(dr_llvm PRIVATE LLVM)
     else()
         llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS
-            Core Support Analysis Passes Target MC native nativecodegen)
+            Core Support Analysis BitWriter Passes Target MC native nativecodegen)
         target_link_libraries(dr_llvm PRIVATE ${DOLRECOMP_LLVM_LIBS})
     endif()
 endif()
@@ -136,6 +160,8 @@ add_library(dr_backend STATIC
     src/backend/dispatch.c
     src/backend/codegen.c
     src/backend/symbols.c
+    src/backend/module_abi.c
+    src/backend/variant_output.c
 )
 target_include_directories(dr_backend PUBLIC ${DOLRECOMP_SRC})
 target_link_libraries(dr_backend PUBLIC dr_frontend dr_analysis)
@@ -166,10 +192,23 @@ if(DOLRECOMP_ENABLE_LLVM)
     endif()
 endif()
 
+add_executable(test_cli tests/test_cli.c)
+target_link_libraries(test_cli PRIVATE dr_app)
+if(DOLRECOMP_ENABLE_LLVM)
+    set_property(TARGET test_cli PROPERTY LINKER_LANGUAGE CXX)
+endif()
+
 add_executable(dolir_stats tools/dolir_stats.c)
 target_link_libraries(dolir_stats PRIVATE dr_ir dr_frontend dr_analysis)
 
 enable_testing()
+
+add_test(NAME cli COMMAND test_cli)
+
+add_test(NAME source_policy
+    COMMAND ${CMAKE_COMMAND}
+        -DREPO_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/check_source_policy.cmake)
 
 add_executable(test_opcodes tests/test_opcodes.c)
 target_link_libraries(test_opcodes PRIVATE dr_frontend)
@@ -210,6 +249,10 @@ add_test(NAME jumptables COMMAND test_jumptables)
 add_executable(test_dispatch tests/test_dispatch.c)
 target_link_libraries(test_dispatch PRIVATE dr_backend)
 add_test(NAME dispatch COMMAND test_dispatch)
+
+add_executable(test_module_abi tests/test_module_abi.c)
+target_link_libraries(test_module_abi PRIVATE dr_backend dr_cpu)
+add_test(NAME module_abi COMMAND test_module_abi)
 
 add_executable(test_c_cfg tests/test_c_cfg.c)
 target_link_libraries(test_c_cfg PRIVATE dr_backend)
@@ -262,27 +305,100 @@ target_link_libraries(test_dolir PRIVATE dr_ir)
 add_test(NAME dolir COMMAND test_dolir)
 
 if(DOLRECOMP_ENABLE_LLVM)
-    add_executable(test_llvm_backend tests/test_llvm_backend.cpp)
-    target_link_libraries(test_llvm_backend PRIVATE dr_llvm)
-    add_test(NAME llvm_backend COMMAND test_llvm_backend
+    add_executable(llvm_fixture tests/llvm_fixture.cpp)
+    target_link_libraries(llvm_fixture PRIVATE dr_llvm)
+    add_test(NAME llvm_fixture COMMAND llvm_fixture
              ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.o
              ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll)
+    add_executable(llvm_ir_test tests/llvm_ir_test.cpp)
+    target_include_directories(llvm_ir_test SYSTEM PRIVATE
+        ${LLVM_INCLUDE_DIRS})
+    target_compile_definitions(llvm_ir_test PRIVATE ${LLVM_DEFINITIONS})
+    target_link_libraries(llvm_ir_test PRIVATE dr_llvm)
+    add_test(NAME llvm_ir COMMAND llvm_ir_test
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.instrumented
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.pgo
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.o.v2.bc
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.fast)
+    set_tests_properties(llvm_ir PROPERTIES DEPENDS llvm_fixture)
     set(DOLRECOMP_TEST_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.o)
     set(DOLRECOMP_TEST_IR ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.ll)
     add_custom_command(
         OUTPUT ${DOLRECOMP_TEST_OBJECT} ${DOLRECOMP_TEST_IR}
-        COMMAND test_llvm_backend ${DOLRECOMP_TEST_OBJECT} ${DOLRECOMP_TEST_IR}
-        DEPENDS test_llvm_backend
+        BYPRODUCTS
+            ${DOLRECOMP_TEST_OBJECT}.v2
+            ${DOLRECOMP_TEST_OBJECT}.v2.copy
+            ${DOLRECOMP_TEST_OBJECT}.v2.bc
+            ${DOLRECOMP_TEST_OBJECT}.v2.copy.bc
+            ${DOLRECOMP_TEST_OBJECT}.v3
+            ${DOLRECOMP_TEST_OBJECT}.arm64
+            ${DOLRECOMP_TEST_OBJECT}.a57
+            ${DOLRECOMP_TEST_OBJECT}.instrumented
+            ${DOLRECOMP_TEST_IR}.instrumented
+            ${DOLRECOMP_TEST_OBJECT}.pgo
+            ${DOLRECOMP_TEST_IR}.pgo
+            ${DOLRECOMP_TEST_OBJECT}.fast
+            ${DOLRECOMP_TEST_IR}.fast
+        COMMAND llvm_fixture ${DOLRECOMP_TEST_OBJECT} ${DOLRECOMP_TEST_IR}
+        DEPENDS llvm_fixture
         VERBATIM
     )
     set_source_files_properties(${DOLRECOMP_TEST_OBJECT}
         PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
-    add_executable(test_llvm_execute tests/test_llvm_execute.c ${DOLRECOMP_TEST_OBJECT})
-    target_link_libraries(test_llvm_execute PRIVATE dr_cpu)
-    add_test(NAME llvm_execute COMMAND test_llvm_execute)
-    add_executable(test_llvm_pipeline tests/test_llvm_pipeline.c)
-    target_include_directories(test_llvm_pipeline PRIVATE ${DOLRECOMP_SRC})
-    add_test(NAME llvm_pipeline COMMAND test_llvm_pipeline
+    add_executable(llvm_smoke_test tests/llvm_smoke_test.c ${DOLRECOMP_TEST_OBJECT})
+    target_link_libraries(llvm_smoke_test PRIVATE dr_cpu)
+    add_test(NAME llvm_smoke COMMAND llvm_smoke_test)
+    add_executable(llvm_semantics_test
+        tests/llvm_semantics_test.c ${DOLRECOMP_TEST_OBJECT})
+    target_link_libraries(llvm_semantics_test PRIVATE dr_cpu)
+    add_test(NAME llvm_semantics COMMAND llvm_semantics_test)
+    add_executable(native_interception_test
+        tests/native_interception_test.c ${DOLRECOMP_TEST_OBJECT})
+    target_link_libraries(native_interception_test PRIVATE dr_cpu)
+    add_test(NAME native_interception COMMAND native_interception_test)
+    add_executable(paired_single_test
+        tests/paired_single_test.c ${DOLRECOMP_TEST_OBJECT})
+    target_link_libraries(paired_single_test PRIVATE dr_cpu)
+    add_test(NAME paired_single COMMAND paired_single_test)
+    add_executable(llvm_backend_bench
+        benchmarks/llvm_backend_bench.c ${DOLRECOMP_TEST_OBJECT})
+    target_link_libraries(llvm_backend_bench PRIVATE dr_cpu)
+    find_program(DOLRECOMP_LLVM_OBJDUMP
+        NAMES llvm-objdump-${LLVM_VERSION_MAJOR} llvm-objdump
+        HINTS ${LLVM_TOOLS_BINARY_DIR})
+    if(DOLRECOMP_LLVM_OBJDUMP)
+        add_test(NAME llvm_codegen
+            COMMAND ${CMAKE_COMMAND}
+                -DOBJDUMP=${DOLRECOMP_LLVM_OBJDUMP}
+                -DX86_OBJECT=${DOLRECOMP_TEST_OBJECT}.v3
+                -DARM_OBJECT=${DOLRECOMP_TEST_OBJECT}.a57
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/check_llvm_codegen.cmake)
+        set_tests_properties(llvm_codegen PROPERTIES DEPENDS llvm_fixture)
+    endif()
+    add_executable(llvm_pipeline_test tests/llvm_pipeline_test.c)
+    target_include_directories(llvm_pipeline_test PRIVATE ${DOLRECOMP_SRC})
+    add_test(NAME llvm_pipeline COMMAND llvm_pipeline_test
              $<TARGET_FILE:dolrecomp>
              ${CMAKE_CURRENT_BINARY_DIR}/llvm_pipeline)
+    add_test(NAME llvm_generated_compile
+        COMMAND ${CMAKE_COMMAND}
+            -DC_COMPILER=${CMAKE_C_COMPILER}
+            -DC_COMPILER_ID=${CMAKE_C_COMPILER_ID}
+            -DGENERATED_C=${CMAKE_CURRENT_BINARY_DIR}/llvm_pipeline/out/generated/generated.c
+            -DREPO_SRC=${CMAKE_CURRENT_SOURCE_DIR}/src
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/compile_generated_llvm.cmake)
+    set_tests_properties(llvm_generated_compile PROPERTIES DEPENDS llvm_pipeline)
+    if(UNIX AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+        add_test(NAME llvm_variant_runtime
+            COMMAND ${CMAKE_COMMAND}
+                -DC_COMPILER=${CMAKE_C_COMPILER}
+                "-DC_FLAGS=${CMAKE_C_FLAGS}"
+                -DGENERATED_DIR=${CMAKE_CURRENT_BINARY_DIR}/llvm_pipeline/out/generated
+                -DCPU_LIBRARY=$<TARGET_FILE:dr_cpu>
+                -DBACKEND_LIBRARY=$<TARGET_FILE:dr_backend>
+                -DREPO_SRC=${CMAKE_CURRENT_SOURCE_DIR}/src
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake/link_generated_variants.cmake)
+        set_tests_properties(llvm_variant_runtime PROPERTIES DEPENDS llvm_pipeline)
+    endif()
 endif()

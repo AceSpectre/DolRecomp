@@ -36,11 +36,12 @@ static inline u32 bswap32(u32 v) {
 
 // big-endian read/write
 static inline u16 read_be16(const u8* p) {
-    return (u16)((p[0] << 8) | p[1]);
+    return (u16)(((u16)p[0] << 8) | (u16)p[1]);
 }
 
 static inline u32 read_be32(const u8* p) {
-    return (u32)((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]);
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) |
+           ((u32)p[2] << 8) | (u32)p[3];
 }
 
 static inline u64 read_be64(const u8* p) {

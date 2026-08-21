@@ -58,6 +58,7 @@ static char* emit_dispatch_to_string(void) {
     emit_chunk_prototype(f, BASE + 0x80u);
     emit_chunk_prototype(f, BASE + 0x1000u);
     emit_dispatch_helpers(f, &funcs, BASE);
+    emit_function_lookup(f, &funcs, "__x86_64_v3");
     function_list_free(&funcs);
     fflush(f);
 
@@ -100,6 +101,11 @@ int main(void) {
     check(strstr(code, "static const DolRecompFunction chunk_functions[]") != NULL &&
           strstr(code, "return chunk_functions[offset / 0x00000040u];") != NULL,
           "contiguous chunks use indexed dispatch");
+    check(strstr(code, "dolrecomp_find_original__x86_64_v3") != NULL &&
+          strstr(code, "func_80003000__x86_64_v3,") != NULL &&
+          strstr(code, "func_80003040__x86_64_v3,") != NULL &&
+          strstr(code, "return func_80004000__x86_64_v3;") != NULL,
+          "target variants use indexed dispatch");
     check(strstr(code, "ctx->pc = address;") != NULL,
           "call helpers set the entry pc");
     check(strstr(code, "#if defined(DOLRECOMP_ENABLE_REPLACEMENTS)") != NULL &&

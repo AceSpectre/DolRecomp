@@ -1,10 +1,11 @@
-#include "backend/llvm/llvm_function_emitter.h"
+#include "backend/llvm/emitter.h"
 #include "cpu/cpu.h"
 
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/MDBuilder.h>
 
 namespace dolllvm {
 
@@ -38,7 +39,8 @@ Value *FunctionEmitter::externalRead(Value *address, u32 width) {
   BasicBlock *call = BasicBlock::Create(context_, "read_external", function_);
   BasicBlock *zero = BasicBlock::Create(context_, "read_unmapped", function_);
   BasicBlock *join = BasicBlock::Create(context_, "read_slow_join", function_);
-  builder_.CreateCondBr(builder_.CreateIsNotNull(fn), call, zero);
+  builder_.CreateCondBr(builder_.CreateIsNotNull(fn), call, zero,
+                        MDBuilder(context_).createBranchWeights(2000, 1));
   builder_.SetInsertPoint(call);
   materialize(current_pc_);
   auto *functionType = FunctionType::get(
@@ -55,13 +57,9 @@ Value *FunctionEmitter::externalRead(Value *address, u32 width) {
   builder_.CreateCondBr(builder_.CreateICmpEQ(exception, builder_.getInt32(0)),
                         resume, failed);
   builder_.SetInsertPoint(failed);
-  builder_.CreateRetVoid();
+  returnFromBody();
   builder_.SetInsertPoint(resume);
-  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
-    if (used_[slot])
-      reloadState(static_cast<DolIRStateSlot>(slot));
-  }
-  builder_.CreateStore(builder_.getInt64(0), cycles_);
+  reloadUsedState();
   builder_.CreateBr(join);
   BasicBlock *calledEnd = builder_.GetInsertBlock();
   builder_.SetInsertPoint(zero);
@@ -76,43 +74,38 @@ Value *FunctionEmitter::externalRead(Value *address, u32 width) {
 
 Value *FunctionEmitter::emitGuestLoad(Value *address, Type *resultType,
                                       u32 width, bool sign) {
+  materializeFPRF();
   Value *normalized = normalizeAddress(address);
-  Value *ramSize =
-      loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, ram_size));
-  Value *exramSize =
-      loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exram_size));
-  Value *mem1 = rangeCheck(normalized, GC_RAM_BASE, ramSize, width);
+  Value *mem1 = rangeCheck(normalized, GC_RAM_BASE, ram_size_, width);
   BasicBlock *mem1Block = BasicBlock::Create(context_, "load_mem1", function_);
   BasicBlock *checkMem2 =
       BasicBlock::Create(context_, "load_check_mem2", function_);
   BasicBlock *mem2Block = BasicBlock::Create(context_, "load_mem2", function_);
   BasicBlock *slowBlock = BasicBlock::Create(context_, "load_slow", function_);
   BasicBlock *join = BasicBlock::Create(context_, "load_join", function_);
-  builder_.CreateCondBr(mem1, mem1Block, checkMem2);
+  builder_.CreateCondBr(mem1, mem1Block, checkMem2,
+                        MDBuilder(context_).createBranchWeights(2000, 1));
 
   builder_.SetInsertPoint(mem1Block);
-  Value *ram =
-      loadOffset(PointerType::getUnqual(context_), offsetof(CPUState, ram));
   Value *mem1Offset =
       builder_.CreateSub(normalized, builder_.getInt32(GC_RAM_BASE));
   Value *mem1Ptr =
-      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram, mem1Offset);
+      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, mem1Offset);
   Value *mem1Value = endianLoad(mem1Ptr, resultType, width);
   builder_.CreateBr(join);
 
   builder_.SetInsertPoint(checkMem2);
-  Value *exram =
-      loadOffset(PointerType::getUnqual(context_), offsetof(CPUState, exram));
   Value *inMem2 = builder_.CreateAnd(
-      builder_.CreateIsNotNull(exram),
-      rangeCheck(normalized, WII_MEM2_BASE, exramSize, width));
-  builder_.CreateCondBr(inMem2, mem2Block, slowBlock);
+      builder_.CreateIsNotNull(mem2_),
+      rangeCheck(normalized, WII_MEM2_BASE, mem2_size_, width));
+  builder_.CreateCondBr(inMem2, mem2Block, slowBlock,
+                        MDBuilder(context_).createBranchWeights(2000, 1));
 
   builder_.SetInsertPoint(mem2Block);
   Value *mem2Offset =
       builder_.CreateSub(normalized, builder_.getInt32(WII_MEM2_BASE));
   Value *mem2Ptr =
-      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), exram, mem2Offset);
+      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), mem2_, mem2Offset);
   Value *mem2Value = endianLoad(mem2Ptr, resultType, width);
   builder_.CreateBr(join);
 
@@ -149,6 +142,8 @@ void FunctionEmitter::clearReservation(Value *address) {
 }
 
 void FunctionEmitter::journal(Value *offset, u32 width) {
+  if (!write_journal_)
+    return;
   Type *ptr = PointerType::getUnqual(context_);
   GlobalVariable *journal = cast<GlobalVariable>(
       module_.getOrInsertGlobal("g_mem_write_journal", ptr));
@@ -157,7 +152,8 @@ void FunctionEmitter::journal(Value *offset, u32 width) {
   Value *fn = builder_.CreateLoad(ptr, journal);
   BasicBlock *call = BasicBlock::Create(context_, "journal", function_);
   BasicBlock *done = BasicBlock::Create(context_, "journal_done", function_);
-  builder_.CreateCondBr(builder_.CreateIsNotNull(fn), call, done);
+  builder_.CreateCondBr(builder_.CreateIsNotNull(fn), call, done,
+                        MDBuilder(context_).createBranchWeights(2000, 1));
   builder_.SetInsertPoint(call);
   auto *functionType = FunctionType::get(
       Type::getVoidTy(context_),
@@ -204,57 +200,48 @@ void FunctionEmitter::externalWrite(Value *address, Value *value, u32 width) {
   builder_.CreateCondBr(builder_.CreateICmpEQ(exception, builder_.getInt32(0)),
                         resume, failed);
   builder_.SetInsertPoint(failed);
-  builder_.CreateRetVoid();
+  returnFromBody();
   builder_.SetInsertPoint(resume);
-  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
-    if (used_[slot])
-      reloadState(static_cast<DolIRStateSlot>(slot));
-  }
-  builder_.CreateStore(builder_.getInt64(0), cycles_);
+  reloadUsedState();
   builder_.CreateBr(done);
   builder_.SetInsertPoint(done);
 }
 
 void FunctionEmitter::emitGuestStore(Value *address, Value *value, u32 width) {
+  materializeFPRF();
   clearReservation(address);
   Value *normalized = normalizeAddress(address);
-  Value *ramSize =
-      loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, ram_size));
-  Value *exramSize =
-      loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, exram_size));
   BasicBlock *mem1Block = BasicBlock::Create(context_, "store_mem1", function_);
   BasicBlock *checkMem2 =
       BasicBlock::Create(context_, "store_check_mem2", function_);
   BasicBlock *mem2Block = BasicBlock::Create(context_, "store_mem2", function_);
   BasicBlock *slowBlock = BasicBlock::Create(context_, "store_slow", function_);
   BasicBlock *join = BasicBlock::Create(context_, "store_join", function_);
-  builder_.CreateCondBr(rangeCheck(normalized, GC_RAM_BASE, ramSize, width),
-                        mem1Block, checkMem2);
+  builder_.CreateCondBr(rangeCheck(normalized, GC_RAM_BASE, ram_size_, width),
+                        mem1Block, checkMem2,
+                        MDBuilder(context_).createBranchWeights(2000, 1));
 
   builder_.SetInsertPoint(mem1Block);
-  Value *ram =
-      loadOffset(PointerType::getUnqual(context_), offsetof(CPUState, ram));
   Value *mem1Offset =
       builder_.CreateSub(normalized, builder_.getInt32(GC_RAM_BASE));
   journal(mem1Offset, width);
   Value *mem1Ptr =
-      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram, mem1Offset);
+      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, mem1Offset);
   endianStore(mem1Ptr, value, width);
   builder_.CreateBr(join);
 
   builder_.SetInsertPoint(checkMem2);
-  Value *exram =
-      loadOffset(PointerType::getUnqual(context_), offsetof(CPUState, exram));
   Value *inMem2 = builder_.CreateAnd(
-      builder_.CreateIsNotNull(exram),
-      rangeCheck(normalized, WII_MEM2_BASE, exramSize, width));
-  builder_.CreateCondBr(inMem2, mem2Block, slowBlock);
+      builder_.CreateIsNotNull(mem2_),
+      rangeCheck(normalized, WII_MEM2_BASE, mem2_size_, width));
+  builder_.CreateCondBr(inMem2, mem2Block, slowBlock,
+                        MDBuilder(context_).createBranchWeights(2000, 1));
 
   builder_.SetInsertPoint(mem2Block);
   Value *mem2Offset =
       builder_.CreateSub(normalized, builder_.getInt32(WII_MEM2_BASE));
   Value *mem2Ptr =
-      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), exram, mem2Offset);
+      builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), mem2_, mem2Offset);
   endianStore(mem2Ptr, value, width);
   builder_.CreateBr(join);
 

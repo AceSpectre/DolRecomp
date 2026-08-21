@@ -12,24 +12,58 @@ typedef struct {
     u32 end;
 } DolLLVMFunctionRange;
 
+typedef enum {
+    DOLLLVM_TARGET_HOST,
+    DOLLLVM_TARGET_X86_64_V2,
+    DOLLLVM_TARGET_X86_64_V3,
+    DOLLLVM_TARGET_AARCH64_GENERIC,
+    DOLLLVM_TARGET_AARCH64_A57,
+} DolLLVMTargetProfile;
+
+typedef enum {
+    DOLLLVM_SEMANTICS_EXACT,
+    DOLLLVM_SEMANTICS_FAST,
+} DolLLVMSemantics;
+
+typedef enum {
+    DOLLLVM_INSTRUMENTATION_NONE,
+    DOLLLVM_INSTRUMENTATION_LOCKSTEP,
+} DolLLVMInstrumentation;
+
 typedef struct {
     const char* target_triple;
+    DolLLVMTargetProfile target_profile;
+    DolLLVMSemantics semantics;
+    DolLLVMInstrumentation instrumentation;
     int optimization_level;
     int verify;
     int emit_ir;
     const char* ir_path;
+    const char* symbol_suffix;
+    const char* profile_generate_path;
+    const char* profile_use_path;
+    const char* thinlto_path;
+    int emit_thinlto;
+    int fixed_memory_layout;
+    u32 ram_size;
+    u32 mem2_size;
+    u64 partition_seed;
     const DolLLVMFunctionRange* function_ranges;
     u32 function_range_count;
+    const u32* entry_points;
+    u32 entry_point_count;
 } DolLLVMOptions;
 
 bool dolllvm_emit_object(const DolIRModule* module, const char* object_path,
                          const DolLLVMOptions* options, FILE* diagnostics);
-
-// Resolve an optional target to the triple used for emission.
-bool dolllvm_effective_triple(const char* requested, char* out, size_t size);
-
-// Validate an object's magic against the effective target triple.
-bool dolllvm_object_matches_triple(const char* path, const char* requested);
+bool dolllvm_effective_triple(const DolLLVMOptions* options, char* out,
+                              size_t size);
+bool dolllvm_object_matches_options(const char* path,
+                                    const DolLLVMOptions* options);
+bool dolllvm_parse_target_profile(const char* name,
+                                  DolLLVMTargetProfile* profile);
+const char* dolllvm_target_profile_name(DolLLVMTargetProfile profile);
+const char* dolllvm_target_profile_suffix(DolLLVMTargetProfile profile);
 
 // Profile-guided optimization for the LLVM backend.
 //

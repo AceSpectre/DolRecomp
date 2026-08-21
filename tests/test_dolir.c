@@ -22,6 +22,9 @@ static bool test_native_loop(void) {
     dolir_module_init(&module);
     CHECK(dolir_build_chunk(&module, insts, 5, 0x80001000u));
     CHECK(dolir_verify(&module, stderr));
+    CHECK(module.functions[0].blocks[0].raw == 0x38600000u);
+    CHECK(module.functions[0].blocks[0].terminator.kind ==
+          DOLIR_TERM_FALLTHROUGH);
     CHECK(module.functions[0].blocks[3].terminator.kind == DOLIR_TERM_COND_BRANCH);
     CHECK(module.functions[0].blocks[3].terminator.targets[0] == 1);
     CHECK(module.functions[0].blocks[4].terminator.kind == DOLIR_TERM_INDIRECT);
@@ -75,11 +78,18 @@ static bool test_float_record_and_paired_compare(void) {
         for (u32 i = 0; i < block->instruction_count; i++) {
             DolIRInstruction* instruction = &block->instructions[i];
             if (instruction->op == DOLIR_OP_STATE_WRITE &&
-                instruction->aux == DOLIR_STATE_CR)
+                instruction->aux >= DOLIR_STATE_CR0 &&
+                instruction->aux <= DOLIR_STATE_CR7)
                 cr_writes++;
             if (instruction->op == DOLIR_OP_HELPER_CALL &&
-                instruction->aux == DOLIR_HELPER_EXACT_PAIRED)
+                instruction->aux == DOLIR_HELPER_EXACT_PAIRED) {
                 exact_paired++;
+                CHECK(instruction->exact_fp);
+                CHECK(dolir_state_mask_test(instruction->state_uses,
+                                            DOLIR_STATE_FPSCR));
+                CHECK(dolir_state_mask_test(instruction->state_defs,
+                                            DOLIR_STATE_FPSCR));
+            }
         }
     }
     CHECK(cr_writes == 2 && exact_paired == 2);

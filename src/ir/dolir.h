@@ -10,6 +10,7 @@ extern "C" {
 
 #define DOLIR_NO_VALUE 0u
 #define DOLIR_NO_BLOCK 0xFFFFFFFFu
+#define DOLIR_STATE_MASK_WORDS ((DOLIR_STATE_COUNT + 63u) / 64u)
 
 typedef u32 DolIRValue;
 
@@ -37,7 +38,14 @@ typedef enum {
     DOLIR_STATE_LR,
     DOLIR_STATE_CTR,
     DOLIR_STATE_CR,
+    // Virtual SSA-only CR fields. The LLVM backend extracts these from the
+    // architectural packed CR and repacks them only at observation boundaries.
+    DOLIR_STATE_CR0,
+    DOLIR_STATE_CR7 = DOLIR_STATE_CR0 + 7,
     DOLIR_STATE_XER,
+    DOLIR_STATE_XER_CA,
+    DOLIR_STATE_XER_OV,
+    DOLIR_STATE_XER_SO,
     DOLIR_STATE_FPSCR,
     DOLIR_STATE_MSR,
     DOLIR_STATE_SRR0,
@@ -208,10 +216,14 @@ typedef struct {
     u64 immediate;
     u32 guest_pc;
     u32 effects;
+    u64 state_uses[DOLIR_STATE_MASK_WORDS];
+    u64 state_defs[DOLIR_STATE_MASK_WORDS];
+    bool exact_fp;
 } DolIRInstruction;
 
 typedef enum {
     DOLIR_TERM_NONE,
+    DOLIR_TERM_FALLTHROUGH,
     DOLIR_TERM_BRANCH,
     DOLIR_TERM_COND_BRANCH,
     DOLIR_TERM_INDIRECT,
@@ -235,6 +247,7 @@ typedef struct {
 
 typedef struct {
     u32 guest_address;
+    u32 raw;
     u32 cycle_cost;
     DolIRInstruction* instructions;
     u32 instruction_count;
@@ -280,6 +293,8 @@ const char* dolir_type_name(DolIRType type);
 const char* dolir_op_name(DolIROp op);
 bool dolir_verify(const DolIRModule* module, FILE* diagnostics);
 void dolir_dump(const DolIRModule* module, FILE* out);
+void dolir_populate_effects(DolIRInstruction* instruction);
+bool dolir_state_mask_test(const u64* mask, DolIRStateSlot slot);
 
 #ifdef __cplusplus
 }

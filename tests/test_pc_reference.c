@@ -12,6 +12,19 @@
 
 static int pass_count = 0;
 static int fail_count = 0;
+static u32 spr_state[1024];
+
+static u32 read_spr(CPUState* cpu, u16 spr, u32 cia) {
+    (void)cpu;
+    (void)cia;
+    return spr == 287 ? PPC_GEKKO_PVR : spr_state[spr];
+}
+
+static void write_spr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
+    (void)cpu;
+    (void)cia;
+    spr_state[spr] = value;
+}
 
 static void check_eq(u32 got, u32 want, const char* name) {
     printf("PCREF,%s,0x%08X,0x%08X,%s\n",
@@ -3358,6 +3371,8 @@ int main(void) {
     CPUState cpu;
     if (!cpu_init(&cpu))
         return 1;
+    cpu.spr_read = read_spr;
+    cpu.spr_write = write_spr;
 
     printf("PC CPU behavior checks\n\n");
 

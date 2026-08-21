@@ -237,3 +237,6 @@ int symbol_name_to_identifier(const char* name, char* output, size_t output_size
     output[written] = '\0';
     return 1;
 }
+
+// the long awaited symbol map!!
+// you might be screwed if you don't have one though

@@ -2,49 +2,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-// How dolrecomp_find_original resolves a guest address to a generated chunk.
-//
-// "linear" is the historical emission and stays the default: a chain of range
-// tests, with consecutive equal-stride chunks collapsed into one indexed jump
-// table. That is O(1) when every chunk is the same size -- a fixed-128 plan on
-// this title emits exactly 2 tests -- and O(chunks) when they are not. The
-// control-flow-aligned plans of E008 emitted 2,089 (func/128/512) and 5,224
-// (func/32/256) tests, taken on every dispatch into the module, and those two
-// arms rank by chain length exactly as they rank by measured slowness. So no
-// throughput number from an irregular-boundary plan is interpretable under
-// this lookup. See docs/LLVM-EXPERIMENTS.md W001, "Ops finding".
-//
-// "indexed" removes that confound: a 4 KiB page index over the covered guest
-// range selects a small window of runs, and the window is walked forward. The
-// walk is bounded by the number of runs that intersect one page, so the lookup
-// is O(1) in the number of chunks regardless of how irregular the plan is.
-//
-// The default is unchanged because the shipping C module is pinned by hash and
-// must stay byte-identical; this selects an experiment, not a new default.
 typedef enum {
     DISPATCH_LOOKUP_LINEAR = 0,
     DISPATCH_LOOKUP_INDEXED = 1
 } DispatchLookupMode;
 
-// A 4 KiB page is small enough that a page holds only a handful of runs even
-// under the most irregular plan measured here (E008a's mean chunk was 87
-// instructions, so ~11 per page), and the whole index is one u32 per page.
 #define DISPATCH_PAGE_SHIFT 12u
-
-// Refuse the page index if the code sections are scattered far enough apart
-// that the table would dwarf the thing it indexes. 256 MiB of guest address
-// space is 65,536 pages, 256 KiB of table; MEM1 is 24 MiB, so this never fires
-// on a GameCube title and exists so a bad input degrades rather than explodes.
 #define DISPATCH_MAX_INDEX_PAGES 65536u
 
 static DispatchLookupMode dispatch_lookup_mode(void) {
     const char* configured = getenv("DOLRECOMP_DISPATCH_LOOKUP");
-    if (!configured || !configured[0])
+    if (!configured || !configured[0] || !strcmp(configured, "linear"))
         return DISPATCH_LOOKUP_LINEAR;
     if (!strcmp(configured, "indexed"))
         return DISPATCH_LOOKUP_INDEXED;
-    if (!strcmp(configured, "linear"))
-        return DISPATCH_LOOKUP_LINEAR;
     fprintf(stderr,
             "warning: DOLRECOMP_DISPATCH_LOOKUP must be linear|indexed; using "
             "linear\n");
@@ -112,15 +83,15 @@ static u32 uniform_run_end(const FunctionList* funcs, u32 first) {
 }
 
 static void emit_lookup_run(FILE* out, const FunctionList* funcs,
-                            u32 first, u32 end) {
+                            u32 first, u32 end, const char* symbol_suffix) {
     const FunctionRange* first_range = &funcs->ranges[first];
 
     if (end == first + 1u || first_range->start >= first_range->end) {
         fprintf(out,
                 "    if (address >= 0x%08Xu && address < 0x%08Xu && "
-                "((address - 0x%08Xu) & 3u) == 0u) return func_%08X;\n",
+                "((address - 0x%08Xu) & 3u) == 0u) return func_%08X%s;\n",
                 first_range->start, first_range->end,
-                first_range->start, first_range->start);
+                first_range->start, first_range->start, symbol_suffix);
         return;
     }
 
@@ -137,7 +108,8 @@ static void emit_lookup_run(FILE* out, const FunctionList* funcs,
     fprintf(out,
             "            static const DolRecompFunction chunk_functions[] = {\n");
     for (u32 i = first; i < end; i++) {
-        fprintf(out, "                func_%08X,\n", funcs->ranges[i].start);
+        fprintf(out, "                func_%08X%s,\n",
+                funcs->ranges[i].start, symbol_suffix);
     }
     fprintf(out, "            };\n");
     fprintf(out, "            return chunk_functions[offset / 0x%08Xu];\n",
@@ -156,18 +128,15 @@ static int range_compare(const void* a, const void* b) {
     return 0;
 }
 
-// Emit the page-indexed lookup. Returns 0 if this plan cannot be indexed, in
-// which case the caller falls back to the linear chain -- correctness never
-// depends on which one is emitted.
 static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
     FunctionRange* sorted = NULL;
     u32* run_first = NULL;
     u32* page_first = NULL;
     u32 sorted_count = 0;
     u32 run_count = 0;
-    u32 page_count = 0;
-    u32 base = 0;
-    u32 limit = 0;
+    u32 page_count;
+    u32 base;
+    u32 limit;
     u32 max_per_page = 0;
     FunctionList view = {0};
 
@@ -177,8 +146,6 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
     sorted = (FunctionRange*)malloc(funcs->count * sizeof(*sorted));
     if (!sorted)
         return 0;
-
-    // An empty range can never match, and it would divide by zero below.
     for (u32 i = 0; i < funcs->count; i++) {
         if (funcs->ranges[i].start < funcs->ranges[i].end)
             sorted[sorted_count++] = funcs->ranges[i];
@@ -189,16 +156,11 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
     }
     qsort(sorted, sorted_count, sizeof(*sorted), range_compare);
 
-    // The walk below assumes ranges are disjoint, so that the first run whose
-    // end passes the address is the only run that can contain it. The linear
-    // chain instead returns the first range that matches in list order, so on
-    // an overlapping plan the two would disagree. Refuse rather than differ.
     for (u32 i = 1; i < sorted_count; i++) {
         if (sorted[i].start < sorted[i - 1].end) {
             fprintf(stderr,
-                    "warning: DOLRECOMP_DISPATCH_LOOKUP=indexed needs disjoint "
-                    "chunk ranges (0x%08X overlaps 0x%08X); using linear\n",
-                    sorted[i].start, sorted[i - 1].start);
+                    "warning: indexed dispatch needs disjoint chunk ranges; "
+                    "using linear\n");
             free(sorted);
             return 0;
         }
@@ -208,20 +170,13 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
     limit = sorted[sorted_count - 1].end;
     page_count = ((limit - base) >> DISPATCH_PAGE_SHIFT) + 1u;
     if (page_count > DISPATCH_MAX_INDEX_PAGES) {
-        fprintf(stderr,
-                "warning: DOLRECOMP_DISPATCH_LOOKUP=indexed needs the code "
-                "sections within %u pages (got %u); using linear\n",
-                DISPATCH_MAX_INDEX_PAGES, page_count);
         free(sorted);
         return 0;
     }
 
-    // Reuse uniform_run_end so the runs -- and therefore the emitted function
-    // table -- are exactly the ones the linear chain would have produced.
     view.ranges = sorted;
     view.count = sorted_count;
     view.capacity = sorted_count;
-
     run_first = (u32*)malloc((sorted_count + 1u) * sizeof(*run_first));
     page_first = (u32*)malloc(page_count * sizeof(*page_first));
     if (!run_first || !page_first) {
@@ -237,8 +192,6 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
     }
     run_first[run_count] = sorted_count;
 
-    // page_first[p] is the first run whose end passes the start of page p, so
-    // the forward walk from it can only skip runs that also intersect the page.
     {
         u32 run = 0;
         for (u32 page = 0; page < page_count; page++) {
@@ -250,20 +203,15 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
         }
     }
 
-    // The walk length is bounded by the runs intersecting one page. Report it,
-    // because it is the number that makes the lookup O(1) rather than O(runs).
-    {
-        u32 run = 0;
-        for (u32 page = 0; page < page_count; page++) {
-            u32 page_end = base + ((page + 1u) << DISPATCH_PAGE_SHIFT);
-            u32 here = 0;
-            for (run = page_first[page];
-                 run < run_count && sorted[run_first[run]].start < page_end;
-                 run++)
-                here++;
-            if (here > max_per_page)
-                max_per_page = here;
-        }
+    for (u32 page = 0; page < page_count; page++) {
+        u32 page_end = base + ((page + 1u) << DISPATCH_PAGE_SHIFT);
+        u32 here = 0;
+        for (u32 run = page_first[page];
+             run < run_count && sorted[run_first[run]].start < page_end;
+             run++)
+            here++;
+        if (here > max_per_page)
+            max_per_page = here;
     }
 
     fprintf(out, "\n#define DOLRECOMP_LOOKUP_RUNS %uu\n", run_count);
@@ -286,8 +234,6 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
         fprintf(out, "    0x%08Xu,\n", sorted[run_first[i + 1u] - 1u].end);
     fprintf(out, "};\n");
 
-    // A run of one chunk gets its own width as the stride, so the division
-    // always yields index 0 and no branch is needed to special-case it.
     fprintf(out,
             "\nstatic const u32 dolrecomp_run_stride[DOLRECOMP_LOOKUP_RUNS] "
             "DOLRECOMP_UNUSED = {\n");
@@ -319,7 +265,9 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
         fprintf(out, "    %uu,\n", page_first[i]);
     fprintf(out, "};\n");
 
-    fprintf(out, "\nstatic inline DolRecompFunction dolrecomp_find_original(u32 address) {\n");
+    fprintf(out,
+            "\nstatic inline DolRecompFunction "
+            "dolrecomp_find_original(u32 address) {\n");
     fprintf(out, "    u32 page;\n");
     fprintf(out, "    u32 run;\n");
     fprintf(out, "    u32 offset;\n");
@@ -353,11 +301,15 @@ static int emit_lookup_indexed(FILE* out, const FunctionList* funcs) {
     return 1;
 }
 
-static void emit_lookup_linear(FILE* out, const FunctionList* funcs) {
-    fprintf(out, "\nstatic inline DolRecompFunction dolrecomp_find_original(u32 address) {\n");
+void emit_function_lookup(FILE* out, const FunctionList* funcs,
+                          const char* symbol_suffix) {
+    fprintf(out,
+            "\nstatic inline DolRecompFunction "
+            "dolrecomp_find_original%s(u32 address) {\n",
+            symbol_suffix);
     for (u32 first = 0; first < funcs->count;) {
         u32 end = uniform_run_end(funcs, first);
-        emit_lookup_run(out, funcs, first, end);
+        emit_lookup_run(out, funcs, first, end, symbol_suffix);
         first = end;
     }
     fprintf(out, "    return NULL;\n");
@@ -383,7 +335,7 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     fprintf(out, "#endif\n");
     if (dispatch_lookup_mode() != DISPATCH_LOOKUP_INDEXED ||
         !emit_lookup_indexed(out, funcs))
-        emit_lookup_linear(out, funcs);
+        emit_function_lookup(out, funcs, "");
     fprintf(out, "\nstatic inline int dolrecomp_call_original(CPUState* ctx, u32 address) {\n");
     fprintf(out, "    DolRecompFunction fn = dolrecomp_find_original(address);\n");
     fprintf(out, "    if (!fn) return 0;\n");

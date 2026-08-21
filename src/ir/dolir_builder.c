@@ -108,6 +108,66 @@ static u32 ppc_mask32(u8 mb, u8 me) {
     }
 }
 
+static DolIRStateSlot cr_field_slot(u8 field) {
+    return (DolIRStateSlot)(DOLIR_STATE_CR0 + field);
+}
+
+static DolIRValue read_cr_field(Builder* b, u8 field) {
+    return read_slot(b, cr_field_slot(field));
+}
+
+static void write_cr_field(Builder* b, u8 field, DolIRValue value) {
+    write_slot(b, cr_field_slot(field),
+               binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32, value, c32(b, 0xFu)));
+}
+
+static DolIRValue pack_cr(Builder* b) {
+    DolIRValue packed = c32(b, 0);
+    for (u8 field = 0; field < 8; field++) {
+        DolIRValue value = binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32,
+                                  read_cr_field(b, field),
+                                  c32(b, 28u - 4u * field));
+        packed = binary(b, DOLIR_OP_OR, DOLIR_TYPE_I32, packed, value);
+    }
+    return packed;
+}
+
+static DolIRValue pack_xer(Builder* b) {
+    DolIRValue packed = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
+                               read_slot(b, DOLIR_STATE_XER),
+                               c32(b, ~0xE0000000u));
+    const DolIRStateSlot slots[3] = {
+        DOLIR_STATE_XER_CA, DOLIR_STATE_XER_OV, DOLIR_STATE_XER_SO,
+    };
+    const u32 shifts[3] = {29, 30, 31};
+    for (u32 index = 0; index < 3; index++) {
+        DolIRValue bit = zext_value(b, DOLIR_TYPE_I32,
+                                    read_slot(b, slots[index]));
+        bit = binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32, bit,
+                     c32(b, shifts[index]));
+        packed = binary(b, DOLIR_OP_OR, DOLIR_TYPE_I32, packed, bit);
+    }
+    return packed;
+}
+
+static void unpack_xer(Builder* b, DolIRValue packed) {
+    write_slot(b, DOLIR_STATE_XER,
+               binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32, packed,
+                      c32(b, ~0xE0000000u)));
+    write_slot(b, DOLIR_STATE_XER_CA,
+               trunc_value(b, DOLIR_TYPE_I1,
+                           binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32, packed,
+                                  c32(b, 29))));
+    write_slot(b, DOLIR_STATE_XER_OV,
+               trunc_value(b, DOLIR_TYPE_I1,
+                           binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32, packed,
+                                  c32(b, 30))));
+    write_slot(b, DOLIR_STATE_XER_SO,
+               trunc_value(b, DOLIR_TYPE_I1,
+                           binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32, packed,
+                                  c32(b, 31))));
+}
+
 static void set_cr_field(Builder* b, u8 field, DolIRValue lhs,
                          DolIRValue rhs, bool is_signed) {
     DolIROp lt_op = is_signed ? DOLIR_OP_ICMP_SLT : DOLIR_OP_ICMP_ULT;
@@ -119,14 +179,10 @@ static void set_cr_field(Builder* b, u8 field, DolIRValue lhs,
                   select_value(b, DOLIR_TYPE_I32, gt, c32(b, 4), c32(b, 0)));
     bits = binary(b, DOLIR_OP_OR, DOLIR_TYPE_I32, bits,
                   select_value(b, DOLIR_TYPE_I32, eq, c32(b, 2), c32(b, 0)));
-    DolIRValue xer = read_slot(b, DOLIR_STATE_XER);
-    DolIRValue so = binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32, xer, c32(b, 31));
     bits = binary(b, DOLIR_OP_OR, DOLIR_TYPE_I32, bits,
-                  binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32, so, c32(b, 1)));
-    u32 shift = 4u * (7u - field);
-    bits = binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32, bits, c32(b, shift));
-    DolIRValue cr = read_slot(b, DOLIR_STATE_CR);
-    write_slot(b, DOLIR_STATE_CR, insert_masked(b, cr, bits, 0xFu << shift));
+                  zext_value(b, DOLIR_TYPE_I32,
+                             read_slot(b, DOLIR_STATE_XER_SO)));
+    write_cr_field(b, field, bits);
 }
 
 static void set_cr0(Builder* b, DolIRValue value) {
@@ -136,11 +192,9 @@ static void set_cr0(Builder* b, DolIRValue value) {
 static void set_cr1_from_fpscr(Builder* b) {
     DolIRValue bits = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
         binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32,
-               read_slot(b, DOLIR_STATE_FPSCR), c32(b, 4)),
-        c32(b, 0x0F000000u));
-    write_slot(b, DOLIR_STATE_CR,
-               insert_masked(b, read_slot(b, DOLIR_STATE_CR), bits,
-                             0x0F000000u));
+               read_slot(b, DOLIR_STATE_FPSCR), c32(b, 28)),
+        c32(b, 0xFu));
+    write_cr_field(b, 1, bits);
 }
 
 static void fpscr_updated(Builder* b) {
@@ -170,17 +224,12 @@ static void record_if_needed(Builder* b, DolIRValue value) {
 }
 
 static void set_xer_ca(Builder* b, DolIRValue carry) {
-    DolIRValue xer = read_slot(b, DOLIR_STATE_XER);
-    DolIRValue wide = zext_value(b, DOLIR_TYPE_I32, carry);
-    wide = binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32, wide, c32(b, 29));
-    write_slot(b, DOLIR_STATE_XER, insert_masked(b, xer, wide, 0x20000000u));
+    write_slot(b, DOLIR_STATE_XER_CA, carry);
 }
 
 static DolIRValue xer_ca(Builder* b) {
-    return binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
-                  binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32,
-                         read_slot(b, DOLIR_STATE_XER), c32(b, 29)),
-                  c32(b, 1));
+    return zext_value(b, DOLIR_TYPE_I32,
+                      read_slot(b, DOLIR_STATE_XER_CA));
 }
 
 static DolIRValue add_wide_with_carry(Builder* b, DolIRValue a,
@@ -216,9 +265,9 @@ static DolIRValue branch_condition(Builder* b) {
         ctr_ok = ((b->inst->bo >> 1) & 1u) ? unary(b, DOLIR_OP_NOT, DOLIR_TYPE_I1, nz) : nz;
     }
     if ((b->inst->bo & 0x10u) == 0) {
-        DolIRValue cr = read_slot(b, DOLIR_STATE_CR);
-        DolIRValue bit = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32, cr,
-                                c32(b, 0x80000000u >> b->inst->bi));
+        DolIRValue field = read_cr_field(b, b->inst->bi / 4u);
+        DolIRValue bit = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32, field,
+                                c32(b, 8u >> (b->inst->bi & 3u)));
         DolIRValue set = binary(b, DOLIR_OP_ICMP_NE, DOLIR_TYPE_I1, bit, c32(b, 0));
         cr_ok = ((b->inst->bo >> 3) & 1u) ? set : unary(b, DOLIR_OP_NOT, DOLIR_TYPE_I1, set);
     }
@@ -296,7 +345,7 @@ u32 dolir_instruction_cycle_cost(const PPCInst* inst) {
 }
 
 static void normal_fallthrough(Builder* b, u32 index, u32 count) {
-    b->block->terminator.kind = index + 1u < count ? DOLIR_TERM_BRANCH : DOLIR_TERM_SIDE_EXIT;
+    b->block->terminator.kind = DOLIR_TERM_FALLTHROUGH;
     b->block->terminator.targets[0] = index + 1u < count ? index + 1u : DOLIR_NO_BLOCK;
     b->block->terminator.target_addresses[0] = b->inst->address + 4u;
     b->block->terminator.guest_pc = b->inst->address;
@@ -395,9 +444,7 @@ static bool lower_integer(Builder* b) {
                                      zext_value(b, DOLIR_TYPE_I64, a),
                                      zext_value(b, DOLIR_TYPE_I64, c));
             if (i->op == PPC_OP_ADDE || i->op == PPC_OP_ADDEO) {
-                DolIRValue ca = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
-                                      binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32,
-                                             read_slot(b, DOLIR_STATE_XER), c32(b, 29)), c32(b, 1));
+                DolIRValue ca = xer_ca(b);
                 wide = binary(b, DOLIR_OP_ADD, DOLIR_TYPE_I64, wide,
                               zext_value(b, DOLIR_TYPE_I64, ca));
             }
@@ -425,9 +472,7 @@ static bool lower_integer(Builder* b) {
                                      zext_value(b, DOLIR_TYPE_I64, c));
             DolIRValue carry_in = c32(b, (i->op == PPC_OP_SUBFC || i->op == PPC_OP_SUBFCO) ? 1 : 0);
             if (i->op == PPC_OP_SUBFE || i->op == PPC_OP_SUBFEO)
-                carry_in = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
-                                  binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32,
-                                         read_slot(b, DOLIR_STATE_XER), c32(b, 29)), c32(b, 1));
+                carry_in = xer_ca(b);
             wide = binary(b, DOLIR_OP_ADD, DOLIR_TYPE_I64, wide,
                           zext_value(b, DOLIR_TYPE_I64, carry_in));
             result = trunc_value(b, DOLIR_TYPE_I32, wide);
@@ -878,7 +923,6 @@ static bool lower_float(Builder* b) {
     }
     case PPC_OP_MCRFS: {
         u32 source_shift = 4u * (7u - i->crfS);
-        u32 destination_shift = 4u * (7u - i->crfD);
         DolIRValue fpscr = read_slot(b, DOLIR_STATE_FPSCR);
         DolIRValue field = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
             binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32, fpscr,
@@ -887,11 +931,7 @@ static bool lower_float(Builder* b) {
             binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32, fpscr,
                    c32(b, ~((0xFu << source_shift) & 0x83F80700u))));
         fpscr_updated(b);
-        field = binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32, field,
-                       c32(b, destination_shift));
-        write_slot(b, DOLIR_STATE_CR,
-            insert_masked(b, read_slot(b, DOLIR_STATE_CR), field,
-                          0xFu << destination_shift));
+        write_cr_field(b, i->crfD, field);
         return true;
     }
     case PPC_OP_MTFSFI: {
@@ -1085,7 +1125,6 @@ static bool lower_paired(Builder* b) {
 
 static bool spr_slot(u16 spr, DolIRStateSlot* slot) {
     switch (spr) {
-    case 1: *slot = DOLIR_STATE_XER; return true;
     case 8: *slot = DOLIR_STATE_LR; return true;
     case 9: *slot = DOLIR_STATE_CTR; return true;
     case 18: *slot = DOLIR_STATE_DSISR; return true;
@@ -1105,55 +1144,55 @@ static bool spr_slot(u16 spr, DolIRStateSlot* slot) {
 
 static bool lower_state(Builder* b) {
     const PPCInst* i = b->inst;
-    DolIRValue cr;
     switch (i->op) {
     case PPC_OP_MFCR:
-        set_gpr(b, i->rD, read_slot(b, DOLIR_STATE_CR));
+        set_gpr(b, i->rD, pack_cr(b));
         return true;
     case PPC_OP_MTCRF: {
-        u32 mask = 0;
         for (u32 field = 0; field < 8; field++)
-            if (i->crm & (0x80u >> field))
-                mask |= 0xFu << (28u - 4u * field);
-        cr = read_slot(b, DOLIR_STATE_CR);
-        write_slot(b, DOLIR_STATE_CR, insert_masked(b, cr, gpr(b, i->rS), mask));
+            if (i->crm & (0x80u >> field)) {
+                DolIRValue value = binary(
+                    b, DOLIR_OP_LSHR, DOLIR_TYPE_I32, gpr(b, i->rS),
+                    c32(b, 28u - 4u * field));
+                write_cr_field(b, (u8)field, value);
+            }
         return true;
     }
     case PPC_OP_MCRF: {
-        u32 dst_shift = 28u - 4u * i->crfD;
-        u32 src_shift = 28u - 4u * i->crfS;
-        cr = read_slot(b, DOLIR_STATE_CR);
-        DolIRValue field = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
-                                  binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32,
-                                         cr, c32(b, src_shift)), c32(b, 0xF));
-        field = binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32, field, c32(b, dst_shift));
-        write_slot(b, DOLIR_STATE_CR, insert_masked(b, cr, field, 0xFu << dst_shift));
+        write_cr_field(b, i->crfD, read_cr_field(b, i->crfS));
         return true;
     }
     case PPC_OP_MCRXR: {
-        u32 shift = 28u - 4u * i->crfD;
-        DolIRValue xer = read_slot(b, DOLIR_STATE_XER);
-        DolIRValue field = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
-                                  binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32,
-                                         xer, c32(b, 28)), c32(b, 0xF));
-        field = binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32, field, c32(b, shift));
-        write_slot(b, DOLIR_STATE_CR,
-                   insert_masked(b, read_slot(b, DOLIR_STATE_CR), field,
-                                 0xFu << shift));
-        write_slot(b, DOLIR_STATE_XER,
-                   binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
-                          xer, c32(b, ~0xE0000000u)));
+        DolIRValue field = binary(
+            b, DOLIR_OP_SHL, DOLIR_TYPE_I32,
+            zext_value(b, DOLIR_TYPE_I32,
+                       read_slot(b, DOLIR_STATE_XER_SO)), c32(b, 3));
+        field = binary(
+            b, DOLIR_OP_OR, DOLIR_TYPE_I32, field,
+            binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32,
+                   zext_value(b, DOLIR_TYPE_I32,
+                              read_slot(b, DOLIR_STATE_XER_OV)), c32(b, 2)));
+        field = binary(
+            b, DOLIR_OP_OR, DOLIR_TYPE_I32, field,
+            binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32,
+                   zext_value(b, DOLIR_TYPE_I32,
+                              read_slot(b, DOLIR_STATE_XER_CA)), c32(b, 1)));
+        write_cr_field(b, i->crfD, field);
+        write_slot(b, DOLIR_STATE_XER_CA, c1(b, false));
+        write_slot(b, DOLIR_STATE_XER_OV, c1(b, false));
+        write_slot(b, DOLIR_STATE_XER_SO, c1(b, false));
         return true;
     }
     case PPC_OP_CRAND: case PPC_OP_CRANDC: case PPC_OP_CREQV: case PPC_OP_CRNAND:
     case PPC_OP_CRNOR: case PPC_OP_CROR: case PPC_OP_CRORC: case PPC_OP_CRXOR: {
-        cr = read_slot(b, DOLIR_STATE_CR);
         DolIRValue av = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
-                               binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32, cr,
-                                      c32(b, 31u - i->rA)), c32(b, 1));
+                               binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32,
+                                      read_cr_field(b, i->rA / 4u),
+                                      c32(b, 3u - (i->rA & 3u))), c32(b, 1));
         DolIRValue bv = binary(b, DOLIR_OP_AND, DOLIR_TYPE_I32,
-                               binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32, cr,
-                                      c32(b, 31u - i->rB)), c32(b, 1));
+                               binary(b, DOLIR_OP_LSHR, DOLIR_TYPE_I32,
+                                      read_cr_field(b, i->rB / 4u),
+                                      c32(b, 3u - (i->rB & 3u))), c32(b, 1));
         if (i->op == PPC_OP_CRANDC || i->op == PPC_OP_CRORC)
             bv = binary(b, DOLIR_OP_XOR, DOLIR_TYPE_I32, bv, c32(b, 1));
         DolIROp op = (i->op == PPC_OP_CRAND || i->op == PPC_OP_CRANDC || i->op == PPC_OP_CRNAND) ? DOLIR_OP_AND :
@@ -1161,15 +1200,22 @@ static bool lower_state(Builder* b) {
         DolIRValue bit = binary(b, op, DOLIR_TYPE_I32, av, bv);
         if (i->op == PPC_OP_CREQV || i->op == PPC_OP_CRNAND || i->op == PPC_OP_CRNOR)
             bit = binary(b, DOLIR_OP_XOR, DOLIR_TYPE_I32, bit, c32(b, 1));
-        bit = binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32, bit, c32(b, 31u - i->rD));
-        write_slot(b, DOLIR_STATE_CR,
-                   insert_masked(b, cr, bit, 0x80000000u >> i->rD));
+        u32 field = i->rD / 4u;
+        u32 shift = 3u - (i->rD & 3u);
+        bit = binary(b, DOLIR_OP_SHL, DOLIR_TYPE_I32, bit, c32(b, shift));
+        write_cr_field(b, (u8)field,
+                       insert_masked(b, read_cr_field(b, (u8)field), bit,
+                                     1u << shift));
         return true;
     }
     case PPC_OP_MFSPR: {
         if (i->spr != 1 && i->spr != 8 && i->spr != 9 &&
             i->spr != 268 && i->spr != 269)
             require_supervisor(b);
+        if (i->spr == 1) {
+            set_gpr(b, i->rD, pack_xer(b));
+            return true;
+        }
         DolIRStateSlot slot;
         if (spr_slot(i->spr, &slot)) {
             set_gpr(b, i->rD, read_slot(b, slot));
@@ -1187,6 +1233,10 @@ static bool lower_state(Builder* b) {
     case PPC_OP_MTSPR: {
         if (i->spr != 1 && i->spr != 8 && i->spr != 9)
             require_supervisor(b);
+        if (i->spr == 1) {
+            unpack_xer(b, gpr(b, i->rS));
+            return true;
+        }
         if (i->spr == 284 || i->spr == 285) {
             DolIRValue old = read_slot(b, DOLIR_STATE_TIMEBASE);
             DolIRValue value = zext_value(b, DOLIR_TYPE_I64, gpr(b, i->rS));
@@ -1385,6 +1435,7 @@ bool dolir_build_chunk(DolIRModule* module, const PPCInst* insts, u32 count,
 
     for (u32 n = 0; n < count; n++) {
         Builder b = {function, &function->blocks[n], &insts[n]};
+        b.block->raw = b.inst->raw;
         b.block->cycle_cost = dolir_instruction_cycle_cost(b.inst);
         if (b.inst->embedded_data) {
             b.block->terminator.kind = DOLIR_TERM_FALLBACK;
