@@ -163,6 +163,7 @@ if(DOLRECOMP_ENABLE_LLVM)
         llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS ${DOLRECOMP_LLVM_COMPONENTS})
         target_link_libraries(dr_llvm PRIVATE ${DOLRECOMP_LLVM_LIBS})
     endif()
+endif()
 
 add_library(dr_analysis STATIC
     src/analysis/embedded_data.c
