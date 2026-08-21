@@ -133,9 +133,19 @@ if(DOLRECOMP_ENABLE_LLVM)
         Passes
         Target
         MC
-        all-targets
+        native
+        nativecodegen
+        # Specific target backends required by target.cpp
+        X86CodeGen
+        X86AsmParser
+        AArch64CodeGen
+        AArch64AsmParser
+        ARMCodeGen
+        ARMAsmParser
+        RISCVCodeGen
+        RISCVAsmParser
     )
-    
+
     if(TARGET LLVM)
         target_link_libraries(dr_llvm PRIVATE LLVM)
     elseif(MINGW)
@@ -143,7 +153,6 @@ if(DOLRECOMP_ENABLE_LLVM)
             NAMES LLVM-${LLVM_VERSION_MAJOR} LLVM
             HINTS ${LLVM_LIBRARY_DIRS}
             NO_DEFAULT_PATH)
-
         if(DOLRECOMP_LLVM_SHARED_IMPORT MATCHES "[.]dll[.]a$")
             target_link_libraries(dr_llvm PRIVATE "${DOLRECOMP_LLVM_SHARED_IMPORT}")
         else()
@@ -154,7 +163,6 @@ if(DOLRECOMP_ENABLE_LLVM)
         llvm_map_components_to_libnames(DOLRECOMP_LLVM_LIBS ${DOLRECOMP_LLVM_COMPONENTS})
         target_link_libraries(dr_llvm PRIVATE ${DOLRECOMP_LLVM_LIBS})
     endif()
-endif()
 
 add_library(dr_analysis STATIC
     src/analysis/embedded_data.c
