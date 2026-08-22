@@ -1,41 +1,13 @@
 # DolRecomp
 
-DolRecomp is a static recompiler for GameCube, Wii, and experimental Wii U CPU code. It reads executable code sections, decodes PowerPC instructions, and emits split C that can be compiled and tested on a PC.
+DolRecomp is a static recompiler for GameCube and Wii.
 
-The current project is CPU only. You will need to supply your own runtime.
 
-Luckily, we have you covered there. check out ![ModernGekko!](https://github.com/ExpansionPak/ModernGekko)
+This project is CPU only. You will need to supply your own runtime or use ModernGekko's template: ![ModernGekko-Template!](https://github.com/ExpansionPak/ModernGekko-Template)
 
 ## Actual Progress
 
 Moved to recomp projects channel in ExpansionPak discord, where you can see all the recomps made by the community!
-
-## Important!
-
-GitHub Issues are for reproducible bugs, build failures, incorrect output, missing instruction support, and other actionable problems with the tool
-
-Please include enough information to reproduce the issue, such as:
-- the input type being tested(Dol, RPX)
-- the failing instruction or function, if known
-- the commit/build used
-- steps to reproduce
-
-Vague reports such as "it doesn't work" are not actionable and may be closed. Issues are not the place for non-technical complaints or drama.
-
-apparently this wasn't as obvious as i'd hope it to be..
-
-## Status
-
-- GameCube/Wii DOL loading works.
-- GameCube/Wii REL loading works for single modules and folders of modules.
-- Wii U RPX loading works for executable sections. Compressed RPX sections need zlib.
-- DOL/RPX/REL frontends validate executable entry points before codegen.
-- The decoder currently recognizes 236 PowerPC/Gekko/Broadway/Espresso opcodes. (Espresso may need more looking at)
-- The C backend emits portable split output with `-jN` worker support.
-- The LLVM 19/20 backend emits SSA-based x86-64-v2, x86-64-v3, generic
-  ARMv8-A, and Cortex-A57 objects with static module ABI v4 selection.
-- Generated dispatch can hand known function addresses to host replacements before entering compiled code, and replacements can call the original generated function.
-- The generated C is a compile target only, no runtime
 
 ## Build
 
@@ -181,7 +153,7 @@ Without a MAP, the same replacement dispatcher can use literal guest addresses.
 An explicitly supplied MAP that cannot be parsed or does not match any executable
 section is rejected.
 
-Disc extraction is available as a subcommand for future installer work. It accepts `.iso` and `.wbfs` only:
+Disc extraction is available as a subcommand for future installer/launcher work. It accepts `.iso` and `.wbfs` only:
 
 ```sh
 # Windows
@@ -205,79 +177,27 @@ dolrecomp.exe extract --wit C:\path\to\wit.exe game.wbfs extracted
 
 Output rules:
 
-- If the last argument ends in `.c`, that exact split-output manifest is used.
-- If the last argument is a directory, Wii output goes under `<title-id>_generated` folder.
-- GameCube and Wii U directory output goes under `generated` folder.
-- `-jN` controls how many worker jobs write split C chunks.
-- If `database/titles.txt` is missing during Wii mode, DolRecomp prints a warning and uses GameCube mode.
-
-LLVM output is selected with `--backend=llvm`. Exact PowerPC floating-point
-semantics are the default. A typical dual-x86 build is:
-
-```sh
-dolrecomp --gamecube --backend=llvm \
-  --targets=x86-64-v2,x86-64-v3 --semantics=exact game.dol build
-```
-
-Use `--targets=aarch64` for generic ARMv8-A or
-`--targets=aarch64-a57` for Switch-class Cortex-A57 output. Multiple targets
-produce isolated symbols, ThinLTO summary sidecars, and an ABI v4 variant table.
-The runtime calls `dolrecomp_initialize_module` once and keeps the selected
-dispatch pointer. Unsupported features are rejected before execution.
-
-`--instrumentation=lockstep` builds memory-journal objects separately from
-release output. `--profile-generate <file>` and `--profile-use <profdata>`
-enable LLVM IR PGO. `--partition-instructions 128..4096` and
-`--partition-seed <n>` control reproducible partition inputs. Fast semantics
-must be requested explicitly with `--semantics=fast`.
+<sub>rewrite this portion soon<sub>
 
 ## CPU Coverage
 
-The current CPU opcode set has 236 implemented opcodes.
+the whole damn thing this readme is long enough dude
 
-| Area | Opcodes |
-|------|---------|
-| Immediate arithmetic | addi, addic, addic., addis, mulli, subfic |
-| Register arithmetic | add, addo, addc, addco, adde, addeo, addme, addmeo, addze, addzeo, divw, divwo, divwu, divwuo, mulhw, mulhwu, mullw, mullwo, neg, nego, subf, subfo, subfc, subfco, subfe, subfeo, subfme, subfmeo, subfze, subfzeo |
-| Compare / branch / CR | b[l][a], bc[l][a], bclr/blr, bcctr/bctr, cmp/cmpw, cmpi/cmpwi, cmpl/cmplw, cmpli/cmplwi, crand, crandc, creqv, crnand, crnor, cror, crorc, crxor, mcrf, mcrxr, mfcr, mtcrf, rfi, sc, tw, twi |
-| Logical / rotate / shift | and, andc, andi., andis., cntlzw, eqv, extsb, extsh, nand, nor, or, orc, ori, oris, rlwimi, rlwinm, rlwnm, slw, sraw, srawi, srw, xor, xori, xoris |
-| Loads | lbz, lbzu, lbzx, lbzux, lfd, lfdu, lfdux, lfdx, lfs, lfsu, lfsux, lfsx, lha, lhau, lhax, lhaux, lhbrx, lhz, lhzu, lhzx, lhzux, lmw, lswi, lswx, lwarx, lwbrx, lwz, lwzu, lwzx, lwzux |
-| Stores | stb, stbu, stbux, stbx, stfd, stfdu, stfdux, stfdx, stfiwx, stfs, stfsu, stfsux, stfsx, sth, sthbrx, sthu, sthux, sthx, stmw, stswi, stswx, stw, stwbrx, stwcx., stwu, stwux, stwx |
-| Floating point | fabs, fadd, fadds, fcmpo, fcmpu, fctiw, fctiwz, fdiv, fdivs, fmadd, fmadds, fmr, fmsub, fmsubs, fmul, fmuls, fneg, fnabs, fnmadd, fnmadds, fnmsub, fnmsubs, fres, frsp, frsqrte, fsel, fsub, fsubs |
-| FPSCR control | mcrfs, mffs, mtfsb0, mtfsb1, mtfsf, mtfsfi |
-| Paired-single memory | psq_l, psq_lu, psq_lux, psq_lx, psq_st, psq_stu, psq_stux, psq_stx |
-| Paired-single arithmetic | ps_abs, ps_add, ps_cmpo0, ps_cmpo1, ps_cmpu0, ps_cmpu1, ps_div, ps_madd, ps_madds0, ps_madds1, ps_merge00, ps_merge01, ps_merge10, ps_merge11, ps_mr, ps_msub, ps_mul, ps_muls0, ps_muls1, ps_nabs, ps_neg, ps_nmadd, ps_nmsub, ps_res, ps_rsqrte, ps_sel, ps_sub, ps_sum0, ps_sum1 |
-| Cache / memory control | dcbf, dcbi, dcbst, dcbt, dcbtst, dcbz, dcbz_l, eieio, icbi, isync, sync, tlbie, tlbsync |
-| SPR / system moves | eciwx, ecowx, mfmsr, mfspr/mflr/mfctr/mfxer, mfsr, mfsrin, mftb/mftbu, mtmsr, mtspr/mtlr/mtctr/mtxer, mtsr, mtsrin |
-
-
-## Repository Layout
-
-```text
-src/
-  frontend/     DOL/RPX loading and PowerPC decode
-  backend/      C and target-neutral LLVM object output
-  core/         CPU state and behavior helpers
-
-tests/          decoder, CPU behavior, RPX, and codegen tests
-docs/           project notes
-tools/          optional developer utilities
-```
 
 ## Contribution
 
-Forks are welcome. Contribution will not be accepted at the very moment, because this codebase changes rapidly.
+See CONTRIBUTING.md
 
 # Notices
 
 - No AI code is used in DolRecomp. This is human hand-made project by a group of passionate developers, who want the best for the Retro Gaming community.
 
-- This repo is still not finished, but it's good enough to work with now. Any problems you run into with it can be reported in the Discord with it's relative channel (#dolrecomp)
+note: we have been accepting AI contribution (controlled in areas we want it to be), the rule changed a bit ago but the readme wasn't updated.
+
+tldr: low quality code is not accepted. the full AI contribution guidelines will probably be added to the contribution markdown, but for now there it is
+
 
 - SMC is currently *unhandled*. You will need to patch the functions manually. DolRecomp will highlight suspicious 
 instructions for review. Patching it out at analysis-time may silently break real behavior, so we're leaving that alone
 
-- Wii U support is not actively being worked on, it was just used as a small experiment that kinda ended up working out 
-pretty well on the 1 game I tried it on (Kirby and the Rainbow Curse). Don't expect it to work super good or anything
-
-<sub>though it may be picked up in the future<sub>
+- Wii U support is unfinished.
