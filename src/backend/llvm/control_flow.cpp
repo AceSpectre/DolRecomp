@@ -166,23 +166,29 @@ bool FunctionEmitter::emitTerminator(const DolIRTerminator &term,
             blocks_[block]);
       builder_.SetInsertPoint(unknown);
     }
-    for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
-      if (dirty_[slot]) {
-        auto stateSlot = static_cast<DolIRStateSlot>(slot);
-        storeContext(stateSlot,
-                     builder_.CreateLoad(type(dolir_state_type(stateSlot)),
-                                         state_[slot]));
+    if (native_abi_) {
+      if (!cold_escapes_)
+        settleCycles();
+      returnNative(target);
+    } else {
+      for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+        if (dirty_[slot]) {
+          auto stateSlot = static_cast<DolIRStateSlot>(slot);
+          storeContext(stateSlot,
+                       builder_.CreateLoad(type(dolir_state_type(stateSlot)),
+                                           state_[slot]));
+        }
       }
+      storeContext(DOLIR_STATE_PC, target);
+      Value *downcount =
+          loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, downcount));
+      Value *cycles = builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
+      builder_.CreateStore(builder_.CreateSub(downcount, cycles),
+                           bytePtr(offsetof(CPUState, downcount)));
+      builder_.CreateStore(builder_.getInt64(0), cycles_);
+      builder_.CreateStore(builder_.getInt64(0), pending_cycles_);
+      returnFromBody();
     }
-    storeContext(DOLIR_STATE_PC, target);
-    Value *downcount =
-        loadOffset(Type::getInt64Ty(context_), offsetof(CPUState, downcount));
-    Value *cycles = builder_.CreateLoad(Type::getInt64Ty(context_), cycles_);
-    builder_.CreateStore(builder_.CreateSub(downcount, cycles),
-                         bytePtr(offsetof(CPUState, downcount)));
-    builder_.CreateStore(builder_.getInt64(0), cycles_);
-    builder_.CreateStore(builder_.getInt64(0), pending_cycles_);
-    returnFromBody();
     return true;
   }
   case DOLIR_TERM_SIDE_EXIT:
@@ -193,8 +199,14 @@ bool FunctionEmitter::emitTerminator(const DolIRTerminator &term,
     return true;
   }
   case DOLIR_TERM_RETURN:
-    materialize(term.target_addresses[0]);
-    returnFromBody();
+    if (native_abi_) {
+      if (!cold_escapes_)
+        settleCycles();
+      returnNative(builder_.getInt32(term.target_addresses[0]));
+    } else {
+      materialize(term.target_addresses[0]);
+      returnFromBody();
+    }
     return true;
   case DOLIR_TERM_SYSTEM_CALL: {
     materialize(term.guest_pc);

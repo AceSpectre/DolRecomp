@@ -1,11 +1,15 @@
+#include "backend/llvm/llvm_backend.h"
+
 #include <cstdio>
 #include <memory>
+#include <string>
 
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/ModuleSummaryIndex.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/SourceMgr.h>
 
@@ -18,8 +22,24 @@
     }                                                                          \
   } while (0)
 
+static std::string read_stream(FILE *stream) {
+  std::string text;
+  char buffer[512];
+  std::fflush(stream);
+  std::rewind(stream);
+  size_t count;
+  while ((count = std::fread(buffer, 1, sizeof(buffer), stream)) != 0)
+    text.append(buffer, count);
+  return text;
+}
+
+static void mark_output(DolLLVMFunctionRange &range, DolIRStateSlot slot) {
+  range.output_state[static_cast<u32>(slot) / 64u] |=
+      1ull << (static_cast<u32>(slot) % 64u);
+}
+
 int main(int argc, char **argv) {
-  CHECK(argc == 6);
+  CHECK(argc == 8);
   llvm::LLVMContext context;
   llvm::SMDiagnostic diagnostic;
   std::unique_ptr<llvm::Module> module =
@@ -61,7 +81,7 @@ int main(int argc, char **argv) {
                             name == "func_80002E00_budget";
         auto *direct_call = llvm::dyn_cast<llvm::CallInst>(call);
         tail_edge |= function.getName() == "func_80002D00_budget" &&
-                     direct_call && direct_call->isMustTailCall();
+                     direct_call && direct_call->isTailCall();
       }
     }
   }
@@ -71,6 +91,20 @@ int main(int argc, char **argv) {
   }
   CHECK(known_edge);
   CHECK(state_phi && tail_edge && weighted_branch);
+  llvm::Function *nativeCaller = module->getFunction("func_80003500_budget");
+  llvm::Function *nativeCallee = module->getFunction("func_80003600_budget");
+  CHECK(nativeCaller != nullptr && nativeCallee != nullptr);
+  CHECK(nativeCaller->getCallingConv() == llvm::CallingConv::Fast);
+  CHECK(nativeCallee->getCallingConv() == llvm::CallingConv::Fast);
+  CHECK(nativeCaller->getReturnType()->isStructTy());
+  CHECK(nativeCallee->getReturnType()->isStructTy());
+  CHECK(nativeCaller->arg_size() == 8);
+  CHECK(nativeCallee->arg_size() == 8);
+  CHECK(llvm::cast<llvm::StructType>(nativeCaller->getReturnType())
+            ->getNumElements() == 3);
+  for (llvm::Type *element :
+       llvm::cast<llvm::StructType>(nativeCaller->getReturnType())->elements())
+    CHECK(element->isIntegerTy(64));
 
   auto check_paired_function = [](llvm::Function *function,
                                   unsigned minimum_math,
@@ -250,5 +284,87 @@ int main(int argc, char **argv) {
   for (llvm::Function &function : *fast)
     if (!function.isDeclaration())
       CHECK(!function.hasFnAttribute("strictfp"));
+
+  std::unique_ptr<llvm::Module> split =
+      llvm::parseIRFile(argv[6], diagnostic, context);
+  CHECK(split != nullptr);
+  llvm::Function *splitCaller = split->getFunction("func_80004000_budget");
+  CHECK(splitCaller != nullptr && splitCaller->arg_size() == 8);
+  CHECK(splitCaller->getCallingConv() == llvm::CallingConv::Fast);
+  CHECK(splitCaller->getReturnType()->isStructTy());
+  llvm::CallBase *splitCall = nullptr;
+  for (llvm::BasicBlock &block : *splitCaller)
+    for (llvm::Instruction &instruction : block)
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (call->getCalledFunction() &&
+            call->getCalledFunction()->getName() == "func_80004100_budget")
+          splitCall = call;
+  CHECK(splitCall != nullptr && splitCall->arg_size() == 8);
+  CHECK(splitCall->getCallingConv() == llvm::CallingConv::Fast);
+  CHECK(splitCall->getType()->isStructTy());
+  CHECK(llvm::cast<llvm::StructType>(splitCall->getType())->getNumElements() ==
+        2);
+  CHECK(!llvm::isa<llvm::LoadInst>(splitCall->getArgOperand(3)));
+  for (unsigned index = 4; index < splitCall->arg_size(); index++)
+    CHECK(!llvm::isa<llvm::LoadInst>(splitCall->getArgOperand(index)));
+  auto contextDerived = [](llvm::Value *pointer, llvm::Value *context) {
+    llvm::Value *value = pointer;
+    for (;;) {
+      value = value->stripPointerCasts();
+      auto *gep = llvm::dyn_cast<llvm::GEPOperator>(value);
+      if (!gep)
+        break;
+      value = gep->getPointerOperand();
+    }
+    return value == context;
+  };
+  for (llvm::Instruction &instruction : *splitCall->getParent()) {
+    if (&instruction == splitCall)
+      break;
+    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction))
+      CHECK(
+          !contextDerived(store->getPointerOperand(), splitCaller->getArg(0)) &&
+          !contextDerived(store->getPointerOperand(), splitCaller->getArg(1)));
+  }
+
+  std::unique_ptr<llvm::Module> arm =
+      llvm::parseIRFile(argv[7], diagnostic, context);
+  CHECK(arm != nullptr);
+  llvm::Function *armCaller =
+      arm->getFunction("func_80003500_budget__aarch64_a57");
+  llvm::Function *armWrapper = arm->getFunction("func_80003500__aarch64_a57");
+  CHECK(armCaller != nullptr && armWrapper != nullptr);
+  CHECK(armCaller->getCallingConv() == llvm::CallingConv::Fast);
+  CHECK(armCaller->getReturnType()->isStructTy());
+  CHECK(llvm::cast<llvm::StructType>(armCaller->getReturnType())
+            ->getNumElements() == 3);
+  CHECK(arm->getFunction("_setjmp") != nullptr);
+  CHECK(arm->getFunction("_longjmp") != nullptr);
+
+  DolLLVMFunctionRange pressure{};
+  pressure.start = 0x80005000u;
+  pressure.end = 0x80005004u;
+  pressure.abi_flags = DOLLLVM_FUNCTION_ABI_NATIVE;
+  for (u32 index = 0; index < 3; index++)
+    mark_output(pressure,
+                static_cast<DolIRStateSlot>(DOLIR_STATE_FPR0 + index));
+  FILE *stats = std::tmpfile();
+  CHECK(stats != nullptr);
+  dolllvm_report_abi_stats(&pressure, 1, "x86_64-pc-linux-gnu", stats);
+  std::string report = read_stream(stats);
+  CHECK(report.find("sret_functions=0 cycle_memory_functions=1") !=
+        std::string::npos);
+  std::fclose(stats);
+
+  for (u32 index = 3; index < 8; index++)
+    mark_output(pressure,
+                static_cast<DolIRStateSlot>(DOLIR_STATE_FPR0 + index));
+  stats = std::tmpfile();
+  CHECK(stats != nullptr);
+  dolllvm_report_abi_stats(&pressure, 1, "aarch64-unknown-linux-gnu", stats);
+  report = read_stream(stats);
+  CHECK(report.find("sret_functions=0 cycle_memory_functions=1") !=
+        std::string::npos);
+  std::fclose(stats);
   return 0;
 }

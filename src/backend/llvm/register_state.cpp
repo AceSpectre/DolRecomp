@@ -75,6 +75,15 @@ void FunctionEmitter::scanState() {
       }
     }
   }
+  if (!abi_range_)
+    return;
+  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+    auto stateSlot = static_cast<DolIRStateSlot>(slot);
+    used_[slot] = used_[slot] || stateInput(abi_range_, stateSlot) ||
+                  stateOutput(abi_range_, stateSlot);
+    dirty_[slot] = dirty_[slot] || stateOutput(abi_range_, stateSlot) ||
+                   (native_abi_ && stateInput(abi_range_, stateSlot));
+  }
 }
 
 void FunctionEmitter::scanContinuations() {

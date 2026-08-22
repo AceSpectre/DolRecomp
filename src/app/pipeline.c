@@ -55,7 +55,7 @@ static u32 c_chunk_instructions(void) {
 #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
 // SSA regions, ABI v4 variants and ThinLTO summaries.
-#define DOLLLVM_CACHE_VERSION "dolllvm-v19"
+#define DOLLLVM_CACHE_VERSION "dolllvm-v22"
 
 typedef struct {
     const PPCInst* insts;
@@ -291,6 +291,10 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
     target_options.target_profile = job->target_profile;
     if (dolllvm_effective_triple(&target_options, triple, sizeof(triple)))
         hash = hash_bytes(hash, triple, strlen(triple));
+    char codegen[1024];
+    if (dolllvm_codegen_fingerprint(&target_options, codegen,
+                                    sizeof(codegen)))
+        hash = hash_bytes(hash, codegen, strlen(codegen));
     for (u32 i = 0; i < job->count; i++) {
         hash = hash_bytes(hash, &job->insts[i].address,
                           sizeof(job->insts[i].address));
@@ -324,6 +328,107 @@ static int llvm_code_address(const LoadedCodeSection* sections,
             ((address - section->address) & 3u) == 0)
             return 1;
     }
+    return 0;
+}
+
+static const DolLLVMFunctionRange* llvm_range_for(
+    const DolLLVMFunctionRange* ranges, u32 count, u32 address) {
+    for (u32 i = 0; i < count; i++)
+        if (address >= ranges[i].start && address < ranges[i].end)
+            return &ranges[i];
+    return NULL;
+}
+
+static int append_llvm_abi_edge(DolLLVMCallEdge** edges, u32* count,
+                                u32* capacity, u32 caller, u32 callee) {
+    if (*count == *capacity) {
+        u32 next = *capacity ? *capacity * 2u : 256u;
+        DolLLVMCallEdge* resized =
+            (DolLLVMCallEdge*)realloc(*edges, (size_t)next * sizeof(**edges));
+        if (!resized)
+            return 0;
+        *edges = resized;
+        *capacity = next;
+    }
+    (*edges)[*count].caller_start = caller;
+    (*edges)[*count].callee_address = callee;
+    (*count)++;
+    return 1;
+}
+
+static int prepare_llvm_function_abis(
+    const LoadedCodeSection* sections, u32 section_count,
+    u32 chunk_instructions, DolLLVMFunctionRange* ranges, u32 range_count) {
+    DolLLVMCallEdge* edges = NULL;
+    u32 edge_count = 0;
+    u32 edge_capacity = 0;
+    u32 range_index = 0;
+    for (u32 s = 0; s < section_count; s++) {
+        const LoadedCodeSection* section = &sections[s];
+        if (!section->data && section->size)
+            goto fail;
+        u32 instruction_count = section->size / 4u;
+        for (u32 start = 0; start < instruction_count;
+             start += chunk_instructions) {
+            u32 count = instruction_count - start;
+            if (count > chunk_instructions)
+                count = chunk_instructions;
+            PPCInst* instructions =
+                (PPCInst*)malloc((size_t)count * sizeof(*instructions));
+            if (!instructions)
+                goto fail;
+            for (u32 i = 0; i < count; i++) {
+                u32 raw = read_be32(section->data + (start + i) * 4u);
+                instructions[i] = ppc_decode(
+                    raw, section->address + (start + i) * 4u);
+                if (instructions[i].op == PPC_OP_UNKNOWN &&
+                    embedded_data_word(section->embedded_data_mode, raw))
+                    instructions[i].embedded_data = true;
+            }
+            DolIRModule module;
+            dolir_module_init(&module);
+            int ok = dolir_build_chunk(&module, instructions, count,
+                                       section->address + start * 4u);
+            free(instructions);
+            if (!ok || range_index >= range_count ||
+                !dolllvm_analyze_function_abi(&module.functions[0],
+                                              &ranges[range_index])) {
+                dolir_module_free(&module);
+                goto fail;
+            }
+            const DolIRFunction* function = &module.functions[0];
+            for (u32 block = 0; block < function->block_count; block++) {
+                const DolIRTerminator* term =
+                    &function->blocks[block].terminator;
+                u32 targets = term->kind == DOLIR_TERM_COND_BRANCH ? 2u :
+                    term->kind == DOLIR_TERM_FALLTHROUGH ||
+                    term->kind == DOLIR_TERM_BRANCH ? 1u :
+                    term->kind == DOLIR_TERM_INDIRECT ? 2u : 0u;
+                for (u32 slot = 0; slot < targets; slot++) {
+                    const DolLLVMFunctionRange* target = llvm_range_for(
+                        ranges, range_count, term->target_addresses[slot]);
+                    if (target && target->start != ranges[range_index].start &&
+                        !append_llvm_abi_edge(
+                            &edges, &edge_count, &edge_capacity,
+                            ranges[range_index].start,
+                            term->target_addresses[slot])) {
+                        dolir_module_free(&module);
+                        goto fail;
+                    }
+                }
+            }
+            dolir_module_free(&module);
+            range_index++;
+        }
+    }
+    if (range_index != range_count ||
+        !dolllvm_propagate_function_abis(ranges, range_count, edges,
+                                         edge_count))
+        goto fail;
+    free(edges);
+    return 1;
+fail:
+    free(edges);
     return 0;
 }
 
@@ -784,6 +889,19 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
             ranges[range_index].start = sections[s].address + start * 4u;
             ranges[range_index].end = ranges[range_index].start + count * 4u;
             range_index++;
+        }
+    }
+    if (!prepare_llvm_function_abis(sections, section_count,
+                                    chunk_instructions, ranges, range_count))
+        goto fail;
+    if (getenv("DOLRECOMP_LLVM_ABI_STATS")) {
+        for (u32 variant = 0; variant < profile_count; variant++) {
+            DolLLVMOptions stats_options = {0};
+            char triple[128];
+            stats_options.target_profile = profiles[variant];
+            if (dolllvm_effective_triple(&stats_options, triple,
+                                         sizeof(triple)))
+                dolllvm_report_abi_stats(ranges, range_count, triple, stdout);
         }
     }
     for (u32 s = 0; s < section_count; s++) {

@@ -7,10 +7,25 @@
 extern "C" {
 #endif
 
+typedef enum {
+    DOLLLVM_FUNCTION_ABI_NATIVE = 1u << 0,
+} DolLLVMFunctionABIFlag;
+
+#define DOLLLVM_NATIVE_ABI_VERSION 1u
+
 typedef struct {
     u32 start;
     u32 end;
+    u64 input_state[DOLIR_STATE_MASK_WORDS];
+    u64 output_state[DOLIR_STATE_MASK_WORDS];
+    u64 escape_state[DOLIR_STATE_MASK_WORDS];
+    u32 abi_flags;
 } DolLLVMFunctionRange;
+
+typedef struct {
+    u32 caller_start;
+    u32 callee_address;
+} DolLLVMCallEdge;
 
 typedef enum {
     DOLLLVM_TARGET_HOST,
@@ -64,6 +79,16 @@ bool dolllvm_parse_target_profile(const char* name,
                                   DolLLVMTargetProfile* profile);
 const char* dolllvm_target_profile_name(DolLLVMTargetProfile profile);
 const char* dolllvm_target_profile_suffix(DolLLVMTargetProfile profile);
+
+bool dolllvm_analyze_function_abi(const DolIRFunction *function,
+                                  DolLLVMFunctionRange *range);
+bool dolllvm_propagate_function_abis(DolLLVMFunctionRange *ranges,
+                                     u32 range_count,
+                                     const DolLLVMCallEdge *edges,
+                                     u32 edge_count);
+void dolllvm_report_abi_stats(const DolLLVMFunctionRange *ranges,
+                              u32 range_count, const char *target_triple,
+                              FILE *output);
 
 // Profile-guided optimization for the LLVM backend.
 //
@@ -131,7 +156,8 @@ int dolllvm_pgo_stale_policy(void);
 // LLVM version, target CPU and feature string, relocation and code model, and
 // the pass pipeline. Hash this alongside the instruction words, or a codegen
 // change silently reuses objects built with the old settings.
-bool dolllvm_codegen_fingerprint(char* out, size_t size);
+bool dolllvm_codegen_fingerprint(const DolLLVMOptions* options, char* out,
+                                 size_t size);
 
 #ifdef __cplusplus
 }

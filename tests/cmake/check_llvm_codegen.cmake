@@ -187,3 +187,34 @@ endif()
 if(NOT arm_disassembly MATCHES "rev")
     message(FATAL_ERROR "AArch64 object has no REV endian instruction")
 endif()
+
+execute_process(
+    COMMAND "${OBJDUMP}" -dr
+            --disassemble-symbols=func_80003500__aarch64_a57
+            "${ARM_OBJECT}"
+    RESULT_VARIABLE arm_abi_status
+    OUTPUT_VARIABLE arm_abi_disassembly
+    ERROR_VARIABLE arm_abi_error
+)
+if(NOT arm_abi_status EQUAL 0)
+    message(FATAL_ERROR "AArch64 ABI disassembly failed: ${arm_abi_error}")
+endif()
+if(NOT arm_abi_disassembly MATCHES "setjmp" OR
+   NOT arm_abi_disassembly MATCHES "func_80003500_budget__aarch64_a57")
+    message(FATAL_ERROR "AArch64 wrapper has no cold escape boundary")
+endif()
+
+execute_process(
+    COMMAND "${OBJDUMP}" -dr
+            --disassemble-symbols=func_80003500_budget__aarch64_a57
+            "${ARM_OBJECT}"
+    RESULT_VARIABLE arm_call_status
+    OUTPUT_VARIABLE arm_call_disassembly
+    ERROR_VARIABLE arm_call_error
+)
+if(NOT arm_call_status EQUAL 0)
+    message(FATAL_ERROR "AArch64 call disassembly failed: ${arm_call_error}")
+endif()
+if(NOT arm_call_disassembly MATCHES "longjmp")
+    message(FATAL_ERROR "AArch64 native body has no cold escape")
+endif()

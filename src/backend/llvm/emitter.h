@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <llvm/ADT/StringRef.h>
+#include <llvm/IR/CallingConv.h>
 #include <llvm/IR/IRBuilder.h>
 
 namespace llvm {
@@ -17,9 +18,11 @@ class Argument;
 class BasicBlock;
 class ConstantInt;
 class Function;
+class FunctionType;
 class LLVMContext;
 class Module;
 class PHINode;
+class StructType;
 class Type;
 class Value;
 class raw_ostream;
@@ -53,6 +56,13 @@ private:
   std::string blockName(u32 index) const;
   std::string symbolName(llvm::StringRef base) const;
   llvm::Type *type(DolIRType type);
+  llvm::FunctionType *bodyFunctionType(const DolLLVMFunctionRange *range);
+  llvm::CallingConv::ID bodyCallingConvention() const;
+  llvm::Type *nativeResultType(const DolLLVMFunctionRange *range);
+  llvm::StructType *chainType();
+  bool stateInput(const DolLLVMFunctionRange *range, DolIRStateSlot slot) const;
+  bool stateOutput(const DolLLVMFunctionRange *range,
+                   DolIRStateSlot slot) const;
   std::size_t stateOffset(DolIRStateSlot slot) const;
   llvm::Value *bytePtr(std::size_t offset);
   llvm::Value *loadContext(DolIRStateSlot slot);
@@ -72,9 +82,24 @@ private:
   void chargeCycles(llvm::Value *cycles);
   void syncDirtyState();
   void settleCycles();
-  void flushCallCounters();
+  void flushCallCounters(bool force_cycles = false);
   void reloadCallCounters();
   void returnFromBody();
+  void returnNative(llvm::Value *pc);
+  llvm::Value *nativeResult(llvm::Value *pc, bool native, bool from_context);
+  llvm::Value *nativeOutputs(bool from_context);
+  u32 nativeOutputLaneCount(const DolLLVMFunctionRange *range);
+  bool nativeCyclesInResult(const DolLLVMFunctionRange *range);
+  u32 nativeResultLaneCount(const DolLLVMFunctionRange *range);
+  llvm::Value *nativeCycleValue(llvm::Value *result,
+                                const DolLLVMFunctionRange *range);
+  llvm::Value *nativeOutputValue(llvm::Value *result,
+                                 const DolLLVMFunctionRange *range,
+                                 DolIRStateSlot slot);
+  llvm::Value *nativeResultPC(llvm::Value *result);
+  llvm::Value *nativeResultContinues(llvm::Value *result);
+  void acceptNativeResult(llvm::Value *result,
+                          const DolLLVMFunctionRange *range);
   void materialize(u32 pc);
   void materialize(llvm::Value *pc);
   void sideExit(u32 pc);
@@ -175,6 +200,7 @@ private:
   llvm::IRBuilder<> builder_;
   llvm::Function *function_ = nullptr;
   llvm::Argument *ctx_ = nullptr;
+  llvm::Argument *chain_ = nullptr;
   llvm::BasicBlock *entry_ = nullptr;
   llvm::AllocaInst *cycles_ = nullptr;
   llvm::AllocaInst *guard_cycles_local_ = nullptr;
@@ -183,7 +209,11 @@ private:
   llvm::Value *guard_cycles_ = nullptr;
   // Termination backstop for zero-cycle loops.
   llvm::Value *guard_steps_ = nullptr;
+  llvm::Value *control_pc_ = nullptr;
   llvm::Value *entry_pc_ = nullptr;
+  llvm::Value *return_pc_ = nullptr;
+  llvm::Value *initial_cycles_ = nullptr;
+  std::array<llvm::Argument *, DOLIR_STATE_COUNT> native_inputs_{};
   llvm::Value *ram_ = nullptr;
   llvm::Value *ram_size_ = nullptr;
   llvm::Value *mem2_ = nullptr;
@@ -221,6 +251,10 @@ private:
   std::vector<u32> continuations_;
   const DolLLVMFunctionRange *ranges_ = nullptr;
   u32 range_count_ = 0;
+  const DolLLVMFunctionRange *abi_range_ = nullptr;
+  bool native_abi_ = false;
+  bool cold_escapes_ = false;
+  bool intrinsic_escapes_ = false;
   const u32 *entry_points_ = nullptr;
   u32 entry_point_count_ = 0;
   bool write_journal_ = false;

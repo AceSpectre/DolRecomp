@@ -7,10 +7,12 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalVariable.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/Format.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/TargetParser/Triple.h>
 
 namespace dolllvm {
 
@@ -30,13 +32,22 @@ FunctionEmitter::FunctionEmitter(LLVMContext &context, Module &module,
       symbol_suffix_(options.symbol_suffix ? options.symbol_suffix : ""),
       fixed_memory_layout_(options.fixed_memory_layout != 0),
       expected_ram_size_(options.ram_size),
-      expected_mem2_size_(options.mem2_size) {}
+      expected_mem2_size_(options.mem2_size) {
+  const Triple triple(module_.getTargetTriple());
+  intrinsic_escapes_ = triple.isX86();
+  cold_escapes_ =
+      intrinsic_escapes_ || (triple.isAArch64() && !triple.isOSWindows());
+  for (u32 index = 0; index < range_count_; index++) {
+    if (ranges_[index].start != source_.guest_start)
+      continue;
+    abi_range_ = &ranges_[index];
+    native_abi_ = (abi_range_->abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE) != 0;
+    break;
+  }
+}
 
 bool FunctionEmitter::emit(raw_ostream &diagnostics) {
-  auto *pointer = PointerType::getUnqual(context_);
-  auto *type = FunctionType::get(
-      Type::getVoidTy(context_),
-      {pointer, pointer, pointer, pointer, Type::getInt32Ty(context_)}, false);
+  auto *type = bodyFunctionType(abi_range_);
   const std::string bodyName =
       symbolName(std::string(source_.name) + "_budget");
   function_ = module_.getFunction(bodyName);
@@ -47,7 +58,7 @@ bool FunctionEmitter::emit(raw_ostream &diagnostics) {
     diagnostics << "dolllvm: conflicting native body " << bodyName << "\n";
     return false;
   }
-  function_->setCallingConv(CallingConv::C);
+  function_->setCallingConv(bodyCallingConvention());
   function_->setVisibility(GlobalValue::HiddenVisibility);
   function_->setDSOLocal(true);
   ctx_ = function_->getArg(0);
@@ -56,14 +67,24 @@ bool FunctionEmitter::emit(raw_ostream &diagnostics) {
   ctx_->addAttr(Attribute::NoAlias);
   ctx_->addAttr(
       Attribute::getWithDereferenceableBytes(context_, sizeof(CPUState)));
-  guard_cycles_ = function_->getArg(1);
-  guard_cycles_->setName("guard_cycles");
-  guard_steps_ = function_->getArg(2);
-  guard_steps_->setName("guard_steps");
-  pending_cycles_ = function_->getArg(3);
-  pending_cycles_->setName("pending_cycles");
-  entry_pc_ = function_->getArg(4);
-  entry_pc_->setName("entry_pc");
+  chain_ = function_->getArg(1);
+  chain_->setName("chain");
+  control_pc_ = function_->getArg(2);
+  control_pc_->setName("control_pc");
+  if (native_abi_) {
+    u32 argument = 3;
+    if (nativeCyclesInResult(abi_range_)) {
+      initial_cycles_ = function_->getArg(argument++);
+      initial_cycles_->setName("initial_cycles");
+    }
+    for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+      auto stateSlot = static_cast<DolIRStateSlot>(slot);
+      if (!stateInput(abi_range_, stateSlot))
+        continue;
+      native_inputs_[slot] = function_->getArg(argument++);
+      native_inputs_[slot]->setName("in.s" + std::to_string(slot));
+    }
+  }
 
   entry_ = BasicBlock::Create(context_, "entry", function_);
   fallback_block_ =
@@ -107,49 +128,6 @@ bool FunctionEmitter::emit(raw_ostream &diagnostics) {
   if (verifyFunction(*function_, &diagnostics))
     return false;
   return emitWrapper(diagnostics);
-}
-
-bool FunctionEmitter::emitWrapper(raw_ostream &diagnostics) {
-  auto *pointer = PointerType::getUnqual(context_);
-  auto *type = FunctionType::get(Type::getVoidTy(context_), {pointer}, false);
-  const std::string wrapperName = symbolName(source_.name);
-  Function *wrapper = module_.getFunction(wrapperName);
-  if (!wrapper)
-    wrapper = Function::Create(type, GlobalValue::ExternalLinkage, wrapperName,
-                               module_);
-  if (wrapper->getFunctionType() != type || !wrapper->empty()) {
-    diagnostics << "dolllvm: conflicting native entry " << source_.name << "\n";
-    return false;
-  }
-  wrapper->setCallingConv(CallingConv::C);
-  wrapper->setVisibility(GlobalValue::HiddenVisibility);
-  wrapper->setDSOLocal(true);
-  wrapper->getArg(0)->setName("ctx");
-  wrapper->getArg(0)->addAttr(Attribute::NonNull);
-  wrapper->getArg(0)->addAttr(
-      Attribute::getWithDereferenceableBytes(context_, sizeof(CPUState)));
-
-  BasicBlock *entry = BasicBlock::Create(context_, "entry", wrapper);
-  IRBuilder<> builder(entry);
-  AllocaInst *guardCycles =
-      builder.CreateAlloca(Type::getInt64Ty(context_), nullptr, "guard_cycles");
-  AllocaInst *guardSteps =
-      builder.CreateAlloca(Type::getInt64Ty(context_), nullptr, "guard_steps");
-  AllocaInst *pendingCycles = builder.CreateAlloca(Type::getInt64Ty(context_),
-                                                   nullptr, "pending_cycles");
-  builder.CreateStore(builder.getInt64(0), guardCycles);
-  builder.CreateStore(builder.getInt64(0), guardSteps);
-  builder.CreateStore(builder.getInt64(0), pendingCycles);
-  Value *entryPC = builder.CreateLoad(
-      Type::getInt32Ty(context_),
-      builder.CreateInBoundsGEP(Type::getInt8Ty(context_), wrapper->getArg(0),
-                                builder.getInt64(offsetof(CPUState, pc))));
-  CallInst *body =
-      builder.CreateCall(function_, {wrapper->getArg(0), guardCycles,
-                                     guardSteps, pendingCycles, entryPC});
-  body->addFnAttr(Attribute::NoInline);
-  builder.CreateRetVoid();
-  return !verifyFunction(*wrapper, &diagnostics);
 }
 
 std::string FunctionEmitter::blockName(u32 index) const {

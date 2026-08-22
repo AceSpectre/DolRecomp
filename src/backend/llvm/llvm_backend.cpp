@@ -1,19 +1,23 @@
 #include "backend/llvm/llvm_backend.h"
 
 #include "backend/llvm/emitter.h"
+#include "backend/llvm/native_abi.h"
 #include "backend/llvm/passes.h"
 #include "backend/llvm/target.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Analysis/ModuleSummaryAnalysis.h>
 #include <llvm/Analysis/ProfileSummaryInfo.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/FileSystem.h>
@@ -128,6 +132,13 @@ extern "C" bool dolllvm_emit_object(const DolIRModule *source,
     options = *given;
   else
     options.optimization_level = 3;
+  std::vector<DolLLVMFunctionRange> ranges;
+  if (options.function_ranges && options.function_range_count) {
+    ranges.assign(options.function_ranges,
+                  options.function_ranges + options.function_range_count);
+    dolllvm::prepareModuleABIs(*source, ranges);
+    options.function_ranges = ranges.data();
+  }
   if (!readableProfile(options.profile_use_path, diagnostics))
     return false;
 
@@ -211,4 +222,24 @@ dolllvm_object_matches_options(const char *path,
   std::string error;
   return dolllvm::resolveTargetProfile(options, profile, error) &&
          dolllvm::objectMatchesProfile(path, profile);
+}
+
+extern "C" bool dolllvm_codegen_fingerprint(const DolLLVMOptions *options,
+                                            char *out, size_t size) {
+  if (!out || !size)
+    return false;
+  dolllvm::TargetProfile profile;
+  std::string error;
+  if (!dolllvm::resolveTargetProfile(options, profile, error))
+    return false;
+  const int written = std::snprintf(
+      out, size,
+      "llvm=%s|triple=%s|cpu=%s|features=%s|native-abi=%u|mask-words=%u|"
+      "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
+      "escape=sjlj|cycles=return-or-chain|x86-return-registers=3|"
+      "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module",
+      LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
+      profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,
+      DOLIR_STATE_MASK_WORDS, DOLIR_STATE_COUNT);
+  return written >= 0 && static_cast<size_t>(written) < size;
 }

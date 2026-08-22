@@ -22,6 +22,7 @@ void func_80003A00(CPUState *cpu);
 void func_80003A20(CPUState *cpu);
 void func_80003A60(CPUState *cpu);
 void func_80003AA0(CPUState *cpu);
+void func_80004200(CPUState *cpu);
 
 static u32 interception_address;
 static u64 interception_queries;
@@ -130,6 +131,21 @@ static void bench_direct_call(CPUState *cpu, u32 iterations,
     checksum += cpu->gpr[3] + cpu->gpr[4] + cpu->pc;
   }
   report(mode, iterations, begin, checksum + interception_queries);
+}
+
+static void bench_call_chain(CPUState *cpu, u32 iterations) {
+  const u32 inner = 64;
+  const u32 outer = (iterations + inner - 1u) / inner;
+  volatile u64 checksum = 0;
+  double begin = seconds();
+  for (u32 i = 0; i < outer; i++) {
+    prepare(cpu, 0x80004200u);
+    cpu->gpr[4] = i;
+    cpu->gpr[5] = inner;
+    func_80004200(cpu);
+    checksum += cpu->gpr[4] + cpu->pc;
+  }
+  report("call_chain", outer * inner, begin, checksum);
 }
 
 static void set_pair(CPUState *cpu, u32 reg, f32 lane0, f32 lane1) {
@@ -349,6 +365,8 @@ int main(int argc, char **argv) {
     bench_direct_call(&cpu, iterations, "call_unrelated");
   if (!selected || !strcmp(selected, "call_target"))
     bench_direct_call(&cpu, iterations, "call_target");
+  if (!selected || !strcmp(selected, "call_chain"))
+    bench_call_chain(&cpu, iterations);
   if (!selected || !strcmp(selected, "ps_add"))
     bench_paired_add(&cpu, iterations);
   if (!selected || !strcmp(selected, "ps_chain"))

@@ -3,6 +3,7 @@
 
 #include <cstdio>
 
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Module.h>
@@ -37,30 +38,134 @@ BasicBlock *FunctionEmitter::externalDestination(const DolIRTerminator &term,
   const DolLLVMFunctionRange *range = rangeFor(target);
   if (!range)
     return nullptr;
+  const bool nativeTarget =
+      (range->abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE) != 0;
+  if (native_abi_ && !nativeTarget)
+    return nullptr;
+  if (!native_abi_ && nativeTarget && cold_escapes_)
+    return nullptr;
+  if (nativeTarget) {
+    for (u32 state = 0; state < DOLIR_STATE_COUNT; state++) {
+      auto stateSlot = static_cast<DolIRStateSlot>(state);
+      if (stateInput(range, stateSlot) && !state_[state])
+        return nullptr;
+    }
+  }
   BasicBlock *callBlock = BasicBlock::Create(
       context_, term.linked ? "direct_call" : "direct_tail", function_);
   IRBuilderBase::InsertPoint saved = builder_.saveIP();
   builder_.SetInsertPoint(callBlock);
   emitBudgetGuard(target);
-  syncDirtyState();
-  flushCallCounters();
   char name[64];
   snprintf(name, sizeof(name), "func_%08X_budget", range->start);
   const std::string targetName = symbolName(name);
-  auto callee = module_.getOrInsertFunction(
-      targetName, FunctionType::get(Type::getVoidTy(context_),
-                              {PointerType::getUnqual(context_),
-                               PointerType::getUnqual(context_),
-                               PointerType::getUnqual(context_),
-                               PointerType::getUnqual(context_),
-                               Type::getInt32Ty(context_)}, false));
+  if (!nativeTarget)
+    syncDirtyState();
+  const bool cyclesInResult = nativeTarget && nativeCyclesInResult(range);
+  if (!cyclesInResult)
+    flushCallCounters(true);
+  auto callee =
+      module_.getOrInsertFunction(targetName, bodyFunctionType(range));
   if (auto *calleeFunction = dyn_cast<Function>(callee.getCallee())) {
+    calleeFunction->setCallingConv(bodyCallingConvention());
     calleeFunction->setVisibility(GlobalValue::HiddenVisibility);
     calleeFunction->setDSOLocal(true);
   }
-  CallInst *nativeCall = builder_.CreateCall(
-      callee, {ctx_, guard_cycles_, guard_steps_, pending_cycles_,
-               builder_.getInt32(target)});
+  Value *calleeReturnPC =
+      term.linked ? static_cast<Value *>(builder_.getInt32(term.guest_pc + 4u))
+                  : return_pc_;
+  Value *control = builder_.CreateOr(
+      builder_.CreateZExt(builder_.getInt32(target),
+                          Type::getInt64Ty(context_)),
+      builder_.CreateShl(
+          builder_.CreateZExt(calleeReturnPC, Type::getInt64Ty(context_)),
+          builder_.getInt64(32)));
+  SmallVector<Value *, 32> arguments = {ctx_, chain_, control};
+  if (nativeTarget) {
+    if (cyclesInResult)
+      arguments.push_back(
+          builder_.CreateLoad(Type::getInt64Ty(context_), cycles_));
+    for (u32 state = 0; state < DOLIR_STATE_COUNT; state++) {
+      auto stateSlot = static_cast<DolIRStateSlot>(state);
+      if (stateInput(range, stateSlot))
+        arguments.push_back(stateValue(stateSlot));
+    }
+  }
+  CallInst *nativeCall = builder_.CreateCall(callee, arguments);
+  nativeCall->setCallingConv(bodyCallingConvention());
+  if (nativeTarget) {
+    if (!cyclesInResult)
+      reloadCallCounters();
+    acceptNativeResult(nativeCall, range);
+    if (cold_escapes_) {
+      if (!term.linked) {
+        if (native_abi_) {
+          returnNative(return_pc_);
+        } else {
+          materialize(return_pc_);
+          returnFromBody();
+        }
+        builder_.restoreIP(saved);
+        return callBlock;
+      }
+      const u32 continuation = term.guest_pc + 4u;
+      const bool local = continuation >= source_.guest_start &&
+                         continuation < source_.guest_end &&
+                         ((continuation - source_.guest_start) & 3u) == 0;
+      const u32 continuationBlock =
+          local ? (continuation - source_.guest_start) / 4u : 0u;
+      if (!local || continuationBlock >= blocks_.size()) {
+        sideExit(continuation);
+      } else {
+        builder_.CreateBr(blocks_[continuationBlock]);
+      }
+      builder_.restoreIP(saved);
+      return callBlock;
+    }
+    Value *returnedPC = nativeResultPC(nativeCall);
+    Value *continues = nativeResultContinues(nativeCall);
+    if (!term.linked) {
+      if (native_abi_) {
+        BasicBlock *forward =
+            BasicBlock::Create(context_, "tail_forward", function_);
+        BasicBlock *stopped =
+            BasicBlock::Create(context_, "tail_materialize", function_);
+        builder_.CreateCondBr(continues, forward, stopped);
+        builder_.SetInsertPoint(forward);
+        returnNative(returnedPC);
+        builder_.SetInsertPoint(stopped);
+        materialize(returnedPC);
+        returnFromBody();
+      } else {
+        materialize(returnedPC);
+        returnFromBody();
+      }
+      builder_.restoreIP(saved);
+      return callBlock;
+    }
+    const u32 continuation = term.guest_pc + 4u;
+    const bool local = continuation >= source_.guest_start &&
+                       continuation < source_.guest_end &&
+                       ((continuation - source_.guest_start) & 3u) == 0;
+    const u32 continuationBlock =
+        local ? (continuation - source_.guest_start) / 4u : 0u;
+    BasicBlock *resume = BasicBlock::Create(context_, "call_resume", function_);
+    BasicBlock *mismatch =
+        BasicBlock::Create(context_, "call_mismatch", function_);
+    Value *matches = builder_.CreateAnd(
+        continues,
+        builder_.CreateICmpEQ(returnedPC, builder_.getInt32(continuation)));
+    if (!local || continuationBlock >= blocks_.size())
+      matches = builder_.getFalse();
+    builder_.CreateCondBr(matches, resume, mismatch);
+    builder_.SetInsertPoint(mismatch);
+    materialize(returnedPC);
+    returnFromBody();
+    builder_.SetInsertPoint(resume);
+    builder_.CreateBr(blocks_[continuationBlock]);
+    builder_.restoreIP(saved);
+    return callBlock;
+  }
   if (!term.linked) {
     nativeCall->setTailCallKind(CallInst::TCK_MustTail);
     builder_.CreateRetVoid();
@@ -124,6 +229,5 @@ BasicBlock *FunctionEmitter::fallbackEdge(u32 pc) {
   builder_.restoreIP(saved);
   return edge;
 }
-
 
 } // namespace dolllvm

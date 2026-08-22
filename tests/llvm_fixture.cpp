@@ -3,6 +3,7 @@
 #include "ir/dolir_builder.h"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,17 @@ static std::vector<unsigned char> read_file(const std::string &path) {
 
 int main(int argc, char **argv) {
   CHECK(argc == 3);
+  DolLLVMOptions fingerprintOptions{};
+  char x86Fingerprint[1024];
+  char armFingerprint[1024];
+  fingerprintOptions.target_profile = DOLLLVM_TARGET_X86_64_V3;
+  CHECK(dolllvm_codegen_fingerprint(&fingerprintOptions, x86Fingerprint,
+                                    sizeof(x86Fingerprint)));
+  fingerprintOptions.target_profile = DOLLLVM_TARGET_AARCH64_A57;
+  CHECK(dolllvm_codegen_fingerprint(&fingerprintOptions, armFingerprint,
+                                    sizeof(armFingerprint)));
+  CHECK(std::strcmp(x86Fingerprint, armFingerprint) != 0);
+  CHECK(std::strstr(x86Fingerprint, "native-abi=1") != nullptr);
   DolIRModule module;
   dolir_module_init(&module);
 
@@ -363,19 +375,95 @@ int main(int argc, char **argv) {
   options.fixed_memory_layout = 1;
   options.ram_size = GC_MAIN_RAM_SIZE;
   options.mem2_size = WII_MEM2_SIZE;
-  const DolLLVMFunctionRange ranges[] = {
-      {0x80002D00u, 0x80002D04u},
-      {0x80002E00u, 0x80002E04u},
-      {0x80003500u, 0x80003514u},
-      {0x80003600u, 0x80003608u},
-      {0x80003B00u, 0x80003B08u},
-      {0x80003B08u, 0x80003B14u},
+  DolLLVMFunctionRange ranges[7]{};
+  const u32 range_bounds[7][2] = {
+      {0x80002D00u, 0x80002D04u}, {0x80002E00u, 0x80002E04u},
+      {0x80003500u, 0x80003514u}, {0x80003600u, 0x80003608u},
+      {0x80003B00u, 0x80003B08u}, {0x80003B08u, 0x80003B14u},
       {0x80003C00u, 0x80003C08u},
   };
+  for (u32 index = 0; index < 7; index++) {
+    ranges[index].start = range_bounds[index][0];
+    ranges[index].end = range_bounds[index][1];
+  }
   options.function_ranges = ranges;
   options.function_range_count = (u32)(sizeof(ranges) / sizeof(ranges[0]));
   CHECK(dolllvm_emit_object(&module, argv[1], &options, stderr));
   CHECK(dolllvm_object_matches_options(argv[1], &options));
+
+  DolIRModule splitCaller;
+  DolIRModule splitCallee;
+  dolir_module_init(&splitCaller);
+  dolir_module_init(&splitCallee);
+  const u32 split_caller_words[] = {
+      mfspr(0, 8), 0x38630001u, 0x480000F9u, mtspr(0, 8), 0x4E800020u,
+  };
+  const u32 split_callee_words[] = {0x38840002u, 0x4E800020u};
+  CHECK(add_chunk(&splitCaller, split_caller_words, 5, 0x80004000u));
+  CHECK(add_chunk(&splitCallee, split_callee_words, 2, 0x80004100u));
+  DolLLVMFunctionRange splitRanges[2]{};
+  splitRanges[0].start = 0x80004000u;
+  splitRanges[0].end = 0x80004014u;
+  splitRanges[1].start = 0x80004100u;
+  splitRanges[1].end = 0x80004108u;
+  CHECK(
+      dolllvm_analyze_function_abi(&splitCaller.functions[0], &splitRanges[0]));
+  CHECK(
+      dolllvm_analyze_function_abi(&splitCallee.functions[0], &splitRanges[1]));
+  const DolLLVMCallEdge splitEdge = {0x80004000u, 0x80004100u};
+  CHECK(dolllvm_propagate_function_abis(splitRanges, 2, &splitEdge, 1));
+  DolLLVMOptions splitOptions{};
+  splitOptions.optimization_level = 2;
+  splitOptions.verify = 1;
+  splitOptions.fixed_memory_layout = 1;
+  splitOptions.ram_size = GC_MAIN_RAM_SIZE;
+  splitOptions.mem2_size = WII_MEM2_SIZE;
+  splitOptions.function_ranges = splitRanges;
+  splitOptions.function_range_count = 2;
+  const std::string splitCallerObject = std::string(argv[1]) + ".abi.caller";
+  const std::string splitCalleeObject = std::string(argv[1]) + ".abi.callee";
+  const std::string splitCallerIR = std::string(argv[2]) + ".abi.caller";
+  splitOptions.emit_ir = 1;
+  splitOptions.ir_path = splitCallerIR.c_str();
+  CHECK(dolllvm_emit_object(&splitCaller, splitCallerObject.c_str(),
+                            &splitOptions, stderr));
+  splitOptions.emit_ir = 0;
+  splitOptions.ir_path = nullptr;
+  CHECK(dolllvm_emit_object(&splitCallee, splitCalleeObject.c_str(),
+                            &splitOptions, stderr));
+  dolir_module_free(&splitCaller);
+  dolir_module_free(&splitCallee);
+
+  DolIRModule loopCaller;
+  DolIRModule loopCallee;
+  dolir_module_init(&loopCaller);
+  dolir_module_init(&loopCallee);
+  const u32 loop_caller_words[] = {
+      mfspr(0, 8), mtspr(5, 9), 0x480000F9u,
+      0x4200FFFCu, mtspr(0, 8), 0x4E800020u,
+  };
+  CHECK(add_chunk(&loopCaller, loop_caller_words, 6, 0x80004200u));
+  CHECK(add_chunk(&loopCallee, split_callee_words, 2, 0x80004300u));
+  DolLLVMFunctionRange loopRanges[2]{};
+  loopRanges[0].start = 0x80004200u;
+  loopRanges[0].end = 0x80004218u;
+  loopRanges[1].start = 0x80004300u;
+  loopRanges[1].end = 0x80004308u;
+  CHECK(dolllvm_analyze_function_abi(&loopCaller.functions[0], &loopRanges[0]));
+  CHECK(dolllvm_analyze_function_abi(&loopCallee.functions[0], &loopRanges[1]));
+  const DolLLVMCallEdge loopEdge = {0x80004200u, 0x80004300u};
+  CHECK(dolllvm_propagate_function_abis(loopRanges, 2, &loopEdge, 1));
+  splitOptions.function_ranges = loopRanges;
+  const std::string loopCallerObject =
+      std::string(argv[1]) + ".abi.loop.caller";
+  const std::string loopCalleeObject =
+      std::string(argv[1]) + ".abi.loop.callee";
+  CHECK(dolllvm_emit_object(&loopCaller, loopCallerObject.c_str(),
+                            &splitOptions, stderr));
+  CHECK(dolllvm_emit_object(&loopCallee, loopCalleeObject.c_str(),
+                            &splitOptions, stderr));
+  dolir_module_free(&loopCaller);
+  dolir_module_free(&loopCallee);
 
   const std::string v2_path = std::string(argv[1]) + ".v2";
   const std::string v2_copy = std::string(argv[1]) + ".v2.copy";
@@ -408,8 +496,11 @@ int main(int argc, char **argv) {
   CHECK(dolllvm_object_matches_options(arm_path.c_str(), &options));
 
   const std::string a57_path = std::string(argv[1]) + ".a57";
+  const std::string a57_ir = std::string(argv[2]) + ".a57";
   options.target_profile = DOLLLVM_TARGET_AARCH64_A57;
   options.symbol_suffix = "__aarch64_a57";
+  options.emit_ir = 1;
+  options.ir_path = a57_ir.c_str();
   CHECK(dolllvm_emit_object(&module, a57_path.c_str(), &options, stderr));
   CHECK(dolllvm_object_matches_options(a57_path.c_str(), &options));
 

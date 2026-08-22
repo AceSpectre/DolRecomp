@@ -12,17 +12,29 @@ using namespace llvm;
 
 void FunctionEmitter::emitEntry() {
   builder_.SetInsertPoint(entry_);
+  StructType *chainTy = chainType();
+  guard_cycles_ = builder_.CreateStructGEP(chainTy, chain_, 1);
+  guard_steps_ = builder_.CreateStructGEP(chainTy, chain_, 2);
+  pending_cycles_ = builder_.CreateStructGEP(chainTy, chain_, 3);
+  entry_pc_ = builder_.CreateTrunc(control_pc_, Type::getInt32Ty(context_));
+  return_pc_ = builder_.CreateTrunc(
+      builder_.CreateLShr(control_pc_, builder_.getInt64(32)),
+      Type::getInt32Ty(context_));
   Type *pointer = PointerType::getUnqual(context_);
   cycles_ =
       builder_.CreateAlloca(Type::getInt64Ty(context_), nullptr, "cycles");
   guard_cycles_local_ = builder_.CreateAlloca(Type::getInt64Ty(context_),
                                               nullptr, "guard_cycles_local");
-  builder_.CreateStore(
-      builder_.CreateLoad(Type::getInt64Ty(context_), pending_cycles_),
-      cycles_);
-  builder_.CreateStore(
-      builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_),
-      guard_cycles_local_);
+  Value *initialCycles =
+      initial_cycles_
+          ? initial_cycles_
+          : builder_.CreateLoad(Type::getInt64Ty(context_), pending_cycles_);
+  builder_.CreateStore(initialCycles, cycles_);
+  Value *initialGuard =
+      native_abi_ && cold_escapes_
+          ? static_cast<Value *>(builder_.getInt64(0))
+          : builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_);
+  builder_.CreateStore(initialGuard, guard_cycles_local_);
   for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
     if (!used_[slot])
       continue;
@@ -36,14 +48,23 @@ void FunctionEmitter::emitEntry() {
     pair_f32_[reg] = builder_.CreateAlloca(pairF32, nullptr, "pair.f32");
     pair_f64_[reg] = builder_.CreateAlloca(pairF64, nullptr, "pair.f64");
   }
+  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
+    if (!used_[slot])
+      continue;
+    auto stateSlot = static_cast<DolIRStateSlot>(slot);
+    Value *initial = native_abi_ && native_inputs_[slot]
+                         ? static_cast<Value *>(native_inputs_[slot])
+                         : loadContext(stateSlot);
+    builder_.CreateStore(initial, state_[slot]);
+  }
 
   BasicBlock *nativeEntry =
       BasicBlock::Create(context_, "native_entry", function_);
   BasicBlock *query =
       BasicBlock::Create(context_, "interception_query", function_);
   Value *hostCall = loadOffset(pointer, offsetof(CPUState, host_call));
-  Function *expect = Intrinsic::getDeclaration(
-      &module_, Intrinsic::expect, {Type::getInt1Ty(context_)});
+  Function *expect = Intrinsic::getDeclaration(&module_, Intrinsic::expect,
+                                               {Type::getInt1Ty(context_)});
   Value *noInterception = builder_.CreateCall(
       expect, {builder_.CreateIsNull(hostCall), builder_.getTrue()});
   builder_.CreateCondBr(noInterception, nativeEntry, query);
@@ -51,10 +72,10 @@ void FunctionEmitter::emitEntry() {
   builder_.SetInsertPoint(query);
   auto available = module_.getOrInsertFunction(
       "ppc_native_region_available",
-      FunctionType::get(Type::getInt1Ty(context_),
-                        {pointer, Type::getInt32Ty(context_),
-                         Type::getInt32Ty(context_)},
-                        false));
+      FunctionType::get(
+          Type::getInt1Ty(context_),
+          {pointer, Type::getInt32Ty(context_), Type::getInt32Ty(context_)},
+          false));
   Value *canEnter = builder_.CreateCall(
       available, {ctx_, builder_.getInt32(source_.guest_start),
                   builder_.getInt32(source_.guest_end)});
@@ -64,8 +85,7 @@ void FunctionEmitter::emitEntry() {
   builder_.CreateCondBr(canEnter, nativeEntry, intercept);
 
   builder_.SetInsertPoint(intercept);
-  storeContext(DOLIR_STATE_PC, entry_pc_);
-  settleCycles();
+  materialize(entry_pc_);
   returnFromBody();
 
   builder_.SetInsertPoint(nativeEntry);
@@ -92,12 +112,6 @@ void FunctionEmitter::emitEntry() {
         builder_.CreateICmpEQ(mem2_size_,
                               builder_.getInt32(expected_mem2_size_)));
     builder_.CreateCall(assume, {mem2SizeValid});
-  }
-  for (u32 slot = 0; slot < DOLIR_STATE_COUNT; slot++) {
-    if (!used_[slot])
-      continue;
-    auto stateSlot = static_cast<DolIRStateSlot>(slot);
-    builder_.CreateStore(loadContext(stateSlot), state_[slot]);
   }
   initializeEntryControls();
   BasicBlock *bad = BasicBlock::Create(context_, "entry_miss", function_);
@@ -154,26 +168,56 @@ void FunctionEmitter::settleCycles() {
   builder_.CreateStore(builder_.getInt64(0), pending_cycles_);
 }
 
-void FunctionEmitter::flushCallCounters() {
-  builder_.CreateStore(builder_.CreateLoad(Type::getInt64Ty(context_), cycles_),
-                       pending_cycles_);
-  builder_.CreateStore(
-      builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_local_),
-      guard_cycles_);
+void FunctionEmitter::flushCallCounters(bool forceCycles) {
+  if (forceCycles || !nativeCyclesInResult(abi_range_))
+    builder_.CreateStore(
+        builder_.CreateLoad(Type::getInt64Ty(context_), cycles_),
+        pending_cycles_);
+  if (!native_abi_ || !cold_escapes_)
+    builder_.CreateStore(
+        builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_local_),
+        guard_cycles_);
 }
 
 void FunctionEmitter::reloadCallCounters() {
   builder_.CreateStore(
       builder_.CreateLoad(Type::getInt64Ty(context_), pending_cycles_),
       cycles_);
-  builder_.CreateStore(
-      builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_),
-      guard_cycles_local_);
+  if (!native_abi_ || !cold_escapes_)
+    builder_.CreateStore(
+        builder_.CreateLoad(Type::getInt64Ty(context_), guard_cycles_),
+        guard_cycles_local_);
 }
 
 void FunctionEmitter::returnFromBody() {
   flushCallCounters();
-  builder_.CreateRetVoid();
+  if (native_abi_) {
+    if (cold_escapes_) {
+      Value *buffer = builder_.CreateStructGEP(chainType(), chain_, 0);
+      if (intrinsic_escapes_) {
+        builder_.CreateCall(
+            Intrinsic::getDeclaration(&module_, Intrinsic::eh_sjlj_longjmp),
+            {buffer});
+      } else {
+        auto longjmp = module_.getOrInsertFunction(
+            "_longjmp", FunctionType::get(Type::getVoidTy(context_),
+                                          {PointerType::getUnqual(context_),
+                                           Type::getInt32Ty(context_)},
+                                          false));
+        if (auto *longjmpFunction = dyn_cast<Function>(longjmp.getCallee())) {
+          longjmpFunction->addFnAttr(Attribute::NoReturn);
+          longjmpFunction->addFnAttr(Attribute::NoUnwind);
+        }
+        builder_.CreateCall(longjmp, {buffer, builder_.getInt32(1)});
+      }
+      builder_.CreateUnreachable();
+      return;
+    }
+    Value *pc = loadOffset(Type::getInt32Ty(context_), offsetof(CPUState, pc));
+    builder_.CreateRet(nativeResult(pc, false, true));
+  } else {
+    builder_.CreateRetVoid();
+  }
 }
 
 void FunctionEmitter::materialize(u32 pc) {
@@ -198,14 +242,17 @@ void FunctionEmitter::emitBudgetGuard(u32 pc) {
       builder_.CreateLoad(Type::getInt64Ty(context_), cycles_));
   Value *over_cycles = builder_.CreateICmpUGE(
       cycles, ConstantInt::get(Type::getInt64Ty(context_), 256));
-  // Backstop for zero-cycle loops.
-  Value *steps = builder_.CreateLoad(Type::getInt64Ty(context_), guard_steps_);
-  Value *next_steps = builder_.CreateAdd(
-      steps, ConstantInt::get(Type::getInt64Ty(context_), 1));
-  builder_.CreateStore(next_steps, guard_steps_);
-  Value *over_steps = builder_.CreateICmpUGE(
-      next_steps, ConstantInt::get(Type::getInt64Ty(context_), 2048));
-  Value *exhausted = builder_.CreateOr(over_cycles, over_steps);
+  Value *exhausted = over_cycles;
+  if (!native_abi_ || !cold_escapes_) {
+    Value *steps =
+        builder_.CreateLoad(Type::getInt64Ty(context_), guard_steps_);
+    Value *next_steps = builder_.CreateAdd(
+        steps, ConstantInt::get(Type::getInt64Ty(context_), 1));
+    builder_.CreateStore(next_steps, guard_steps_);
+    Value *over_steps = builder_.CreateICmpUGE(
+        next_steps, ConstantInt::get(Type::getInt64Ty(context_), 2048));
+    exhausted = builder_.CreateOr(over_cycles, over_steps);
+  }
   BasicBlock *run = BasicBlock::Create(context_, "budget_run", function_);
   BasicBlock *exit = BasicBlock::Create(context_, "budget_exit", function_);
   builder_.CreateCondBr(exhausted, exit, run);

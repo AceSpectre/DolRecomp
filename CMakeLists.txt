@@ -103,10 +103,14 @@ if(DOLRECOMP_ENABLE_LLVM)
         src/backend/llvm/branch_targets.cpp
         src/backend/llvm/control_flow.cpp
         src/backend/llvm/emitter.cpp
+        src/backend/llvm/native_wrapper.cpp
+        src/backend/llvm/native_abi.cpp
+        src/backend/llvm/abi_stats.cpp
         src/backend/llvm/memory.cpp
         src/backend/llvm/register_state.cpp
         src/backend/llvm/state_controls.cpp
         src/backend/llvm/exits.cpp
+        src/backend/llvm/native_exits.cpp
         src/backend/llvm/instructions.cpp
         src/backend/llvm/runtime.cpp
         src/backend/llvm/floating_point.cpp
@@ -373,10 +377,20 @@ if(DOLRECOMP_ENABLE_LLVM)
              ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.instrumented
              ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.pgo
              ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.o.v2.bc
-             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.fast)
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.fast
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.abi.caller
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.a57)
     set_tests_properties(llvm_ir PROPERTIES DEPENDS llvm_fixture)
     set(DOLRECOMP_TEST_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.o)
     set(DOLRECOMP_TEST_IR ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.ll)
+    set(DOLRECOMP_ABI_CALLER_OBJECT
+        ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.o.abi.caller)
+    set(DOLRECOMP_ABI_CALLEE_OBJECT
+        ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.o.abi.callee)
+    set(DOLRECOMP_ABI_LOOP_CALLER_OBJECT
+        ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.o.abi.loop.caller)
+    set(DOLRECOMP_ABI_LOOP_CALLEE_OBJECT
+        ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.o.abi.loop.callee)
     add_custom_command(
         OUTPUT ${DOLRECOMP_TEST_OBJECT} ${DOLRECOMP_TEST_IR}
         BYPRODUCTS
@@ -387,17 +401,29 @@ if(DOLRECOMP_ENABLE_LLVM)
             ${DOLRECOMP_TEST_OBJECT}.v3
             ${DOLRECOMP_TEST_OBJECT}.arm64
             ${DOLRECOMP_TEST_OBJECT}.a57
+            ${DOLRECOMP_TEST_IR}.a57
             ${DOLRECOMP_TEST_OBJECT}.instrumented
             ${DOLRECOMP_TEST_IR}.instrumented
             ${DOLRECOMP_TEST_OBJECT}.pgo
             ${DOLRECOMP_TEST_IR}.pgo
             ${DOLRECOMP_TEST_OBJECT}.fast
             ${DOLRECOMP_TEST_IR}.fast
+            ${DOLRECOMP_ABI_CALLER_OBJECT}
+            ${DOLRECOMP_ABI_CALLEE_OBJECT}
+            ${DOLRECOMP_ABI_LOOP_CALLER_OBJECT}
+            ${DOLRECOMP_ABI_LOOP_CALLEE_OBJECT}
+            ${DOLRECOMP_TEST_IR}.abi.caller
         COMMAND llvm_fixture ${DOLRECOMP_TEST_OBJECT} ${DOLRECOMP_TEST_IR}
         DEPENDS llvm_fixture
         VERBATIM
     )
     set_source_files_properties(${DOLRECOMP_TEST_OBJECT}
+        PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    set_source_files_properties(
+        ${DOLRECOMP_ABI_CALLER_OBJECT}
+        ${DOLRECOMP_ABI_CALLEE_OBJECT}
+        ${DOLRECOMP_ABI_LOOP_CALLER_OBJECT}
+        ${DOLRECOMP_ABI_LOOP_CALLEE_OBJECT}
         PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
     add_executable(llvm_smoke_test tests/llvm_smoke_test.c ${DOLRECOMP_TEST_OBJECT})
     target_link_libraries(llvm_smoke_test PRIVATE dr_cpu)
@@ -410,12 +436,21 @@ if(DOLRECOMP_ENABLE_LLVM)
         tests/native_interception_test.c ${DOLRECOMP_TEST_OBJECT})
     target_link_libraries(native_interception_test PRIVATE dr_cpu)
     add_test(NAME native_interception COMMAND native_interception_test)
+    add_executable(llvm_abi_execute_test
+        tests/llvm_abi_execute_test.c
+        ${DOLRECOMP_ABI_CALLER_OBJECT}
+        ${DOLRECOMP_ABI_CALLEE_OBJECT})
+    target_link_libraries(llvm_abi_execute_test PRIVATE dr_cpu)
+    add_test(NAME llvm_abi_execute COMMAND llvm_abi_execute_test)
     add_executable(paired_single_test
         tests/paired_single_test.c ${DOLRECOMP_TEST_OBJECT})
     target_link_libraries(paired_single_test PRIVATE dr_cpu)
     add_test(NAME paired_single COMMAND paired_single_test)
     add_executable(llvm_backend_bench
-        benchmarks/llvm_backend_bench.c ${DOLRECOMP_TEST_OBJECT})
+        benchmarks/llvm_backend_bench.c
+        ${DOLRECOMP_TEST_OBJECT}
+        ${DOLRECOMP_ABI_LOOP_CALLER_OBJECT}
+        ${DOLRECOMP_ABI_LOOP_CALLEE_OBJECT})
     target_link_libraries(llvm_backend_bench PRIVATE dr_cpu)
     find_program(DOLRECOMP_LLVM_OBJDUMP
         NAMES llvm-objdump-${LLVM_VERSION_MAJOR} llvm-objdump
