@@ -250,6 +250,14 @@ static u64 hash_file_contents(u64 hash, const char* path) {
 static u64 llvm_job_hash(const LLVMChunkJob* job) {
     u64 hash = 1469598103934665603ull;
     hash = hash_bytes(hash, DOLLLVM_CACHE_VERSION, strlen(DOLLLVM_CACHE_VERSION));
+#ifdef DOLRECOMP_CODEGEN_SOURCE_HASH
+    /* A hand-edited version string cannot invalidate the cache when the code
+       that generates the objects changes -- it only invalidates when somebody
+       remembers to bump it. CMake hashes the emitter sources and passes the
+       digest in, so editing any of them changes every job key automatically. */
+    hash = hash_bytes(hash, DOLRECOMP_CODEGEN_SOURCE_HASH,
+                      strlen(DOLRECOMP_CODEGEN_SOURCE_HASH));
+#endif
     hash = hash_bytes(hash, &job->function_address, sizeof(job->function_address));
     hash = hash_bytes(hash, &job->count, sizeof(job->count));
     u32 state_size = (u32)sizeof(CPUState);
