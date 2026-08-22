@@ -3,7 +3,7 @@
 DolRecomp is a static recompiler for GameCube and Wii.
 
 
-This project is CPU only. You will need to supply your own runtime or use ModernGekko's template: ![ModernGekko-Template!](https://github.com/ExpansionPak/ModernGekko-Template)
+This project is CPU only. You will need to supply your own runtime or use ModernGekko's template: ![ModernGekko-Template](https://github.com/ExpansionPak/ModernGekko-Template)
 
 ## Actual Progress
 
