@@ -82,7 +82,7 @@ int main(int argc, char **argv) {
   CHECK(dolllvm_codegen_fingerprint(&fingerprintOptions, armFingerprint,
                                     sizeof(armFingerprint)));
   CHECK(std::strcmp(x86Fingerprint, armFingerprint) != 0);
-  CHECK(std::strstr(x86Fingerprint, "native-abi=1") != nullptr);
+  CHECK(std::strstr(x86Fingerprint, "native-abi=2") != nullptr);
   DolIRModule module;
   dolir_module_init(&module);
 
@@ -205,9 +205,10 @@ int main(int argc, char **argv) {
   const u32 constant_memory_words[] = {
       0x3C808000u,
       0x80640600u,
+      0x90640604u,
       0x4E800020u,
   };
-  CHECK(add_chunk(&module, constant_memory_words, 3, 0x80003300u));
+  CHECK(add_chunk(&module, constant_memory_words, 4, 0x80003300u));
 
   const u32 icbi_words[] = {
       xform(982, 0, 17, 18),
@@ -366,6 +367,12 @@ int main(int argc, char **argv) {
   };
   CHECK(add_chunk(&module, indirect_fallback_words, 5, 0x80003D00u));
 
+  const u32 mtmsr_words[] = {
+      xform(146, 3, 0, 0),
+      0x4E800020u,
+  };
+  CHECK(add_chunk(&module, mtmsr_words, 2, 0x80003D20u));
+
   CHECK(dolir_verify(&module, stderr));
   DolLLVMOptions options{};
   options.optimization_level = 2;
@@ -375,14 +382,15 @@ int main(int argc, char **argv) {
   options.fixed_memory_layout = 1;
   options.ram_size = GC_MAIN_RAM_SIZE;
   options.mem2_size = WII_MEM2_SIZE;
-  DolLLVMFunctionRange ranges[7]{};
-  const u32 range_bounds[7][2] = {
+  DolLLVMFunctionRange ranges[8]{};
+  const u32 range_bounds[8][2] = {
       {0x80002D00u, 0x80002D04u}, {0x80002E00u, 0x80002E04u},
+      {0x80003300u, 0x80003310u},
       {0x80003500u, 0x80003514u}, {0x80003600u, 0x80003608u},
       {0x80003B00u, 0x80003B08u}, {0x80003B08u, 0x80003B14u},
       {0x80003C00u, 0x80003C08u},
   };
-  for (u32 index = 0; index < 7; index++) {
+  for (u32 index = 0; index < 8; index++) {
     ranges[index].start = range_bounds[index][0];
     ranges[index].end = range_bounds[index][1];
   }
@@ -390,6 +398,15 @@ int main(int argc, char **argv) {
   options.function_range_count = (u32)(sizeof(ranges) / sizeof(ranges[0]));
   CHECK(dolllvm_emit_object(&module, argv[1], &options, stderr));
   CHECK(dolllvm_object_matches_options(argv[1], &options));
+
+  const std::string memoryStateObject = std::string(argv[1]) + ".state-memory";
+  const std::string memoryStateIR = std::string(argv[2]) + ".state-memory";
+  options.state_in_memory = 1;
+  options.ir_path = memoryStateIR.c_str();
+  CHECK(dolllvm_emit_object(&module, memoryStateObject.c_str(), &options,
+                            stderr));
+  options.state_in_memory = 0;
+  options.ir_path = argv[2];
 
   DolIRModule splitCaller;
   DolIRModule splitCallee;
@@ -399,19 +416,40 @@ int main(int argc, char **argv) {
       mfspr(0, 8), 0x38630001u, 0x480000F9u, mtspr(0, 8), 0x4E800020u,
   };
   const u32 split_callee_words[] = {0x38840002u, 0x4E800020u};
+  const u32 split_memory_caller_words[] = {
+      mfspr(0, 8), 0x480000FDu, mtspr(0, 8), 0x38A50001u, 0x4E800020u,
+  };
+  const u32 split_memory_callee_words[] = {
+      0x3C808000u, 0x80640600u, 0x90640604u, 0x4E800020u,
+  };
   CHECK(add_chunk(&splitCaller, split_caller_words, 5, 0x80004000u));
   CHECK(add_chunk(&splitCallee, split_callee_words, 2, 0x80004100u));
-  DolLLVMFunctionRange splitRanges[2]{};
+  CHECK(add_chunk(&splitCaller, split_memory_caller_words, 5, 0x80004500u));
+  CHECK(add_chunk(&splitCallee, split_memory_callee_words, 4, 0x80004600u));
+  DolLLVMFunctionRange splitRanges[4]{};
   splitRanges[0].start = 0x80004000u;
   splitRanges[0].end = 0x80004014u;
   splitRanges[1].start = 0x80004100u;
   splitRanges[1].end = 0x80004108u;
+  splitRanges[2].start = 0x80004500u;
+  splitRanges[2].end = 0x80004514u;
+  splitRanges[3].start = 0x80004600u;
+  splitRanges[3].end = 0x80004610u;
   CHECK(
       dolllvm_analyze_function_abi(&splitCaller.functions[0], &splitRanges[0]));
   CHECK(
       dolllvm_analyze_function_abi(&splitCallee.functions[0], &splitRanges[1]));
-  const DolLLVMCallEdge splitEdge = {0x80004000u, 0x80004100u};
-  CHECK(dolllvm_propagate_function_abis(splitRanges, 2, &splitEdge, 1));
+  CHECK(
+      dolllvm_analyze_function_abi(&splitCaller.functions[1], &splitRanges[2]));
+  CHECK(
+      dolllvm_analyze_function_abi(&splitCallee.functions[1], &splitRanges[3]));
+  CHECK((splitRanges[3].abi_flags &
+         DOLLLVM_FUNCTION_ABI_NATIVE_MEMORY) != 0);
+  const DolLLVMCallEdge splitEdges[] = {
+      {0x80004000u, 0x80004100u},
+      {0x80004500u, 0x80004600u},
+  };
+  CHECK(dolllvm_propagate_function_abis(splitRanges, 4, splitEdges, 2));
   DolLLVMOptions splitOptions{};
   splitOptions.optimization_level = 2;
   splitOptions.verify = 1;
@@ -419,7 +457,7 @@ int main(int argc, char **argv) {
   splitOptions.ram_size = GC_MAIN_RAM_SIZE;
   splitOptions.mem2_size = WII_MEM2_SIZE;
   splitOptions.function_ranges = splitRanges;
-  splitOptions.function_range_count = 2;
+  splitOptions.function_range_count = 4;
   const std::string splitCallerObject = std::string(argv[1]) + ".abi.caller";
   const std::string splitCalleeObject = std::string(argv[1]) + ".abi.callee";
   const std::string splitCallerIR = std::string(argv[2]) + ".abi.caller";

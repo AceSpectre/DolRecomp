@@ -16,6 +16,7 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "  -jN                            Use N worker jobs for split C output (e.g. -j14)\n");
     fprintf(stderr, "  --cpu gekko|broadway|espresso  Select CPU profile (default: broadway)\n");
     fprintf(stderr, "  --backend c|llvm               Select generated-code backend (default: c)\n");
+    fprintf(stderr, "  --state-in-memory              Keep non-native guest state in CPUState\n");
     fprintf(stderr, "  --targets <set>                host, x86-64-v2, x86-64-v3, aarch64, aarch64-a57\n");
     fprintf(stderr, "  --semantics exact|fast         PowerPC floating-point semantics (default: exact)\n");
     fprintf(stderr, "  --instrumentation none|lockstep  Compile release or state-journal objects\n");
@@ -189,6 +190,16 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
 
         if (strcmp(arg, "--gamecube") == 0 || strcmp(arg, "-gc") == 0) {
             opts->gamecube_mode = 1;
+            continue;
+        }
+
+        if (strcmp(arg, "--state-in-memory") == 0) {
+            opts->state_in_memory = 1;
+            continue;
+        }
+
+        if (strcmp(arg, "--no-state-in-memory") == 0) {
+            opts->state_in_memory = 0;
             continue;
         }
 

@@ -10,11 +10,19 @@ namespace dolllvm {
 
 using namespace llvm;
 
+bool FunctionEmitter::slotInMemory(DolIRStateSlot slot) const {
+  if (!state_in_memory_ || native_abi_)
+    return false;
+  return !((slot >= DOLIR_STATE_CR0 && slot <= DOLIR_STATE_CR7) ||
+           (slot >= DOLIR_STATE_XER_CA && slot <= DOLIR_STATE_XER_SO) ||
+           slot == DOLIR_STATE_XER);
+}
+
 void FunctionEmitter::finalizeStateSSA() {
   SmallVector<AllocaInst *, DOLIR_STATE_COUNT + 64> registers;
-  for (AllocaInst *slot : state_)
-    if (slot)
-      registers.push_back(slot);
+  for (Value *slot : state_)
+    if (auto *alloca = dyn_cast_or_null<AllocaInst>(slot))
+      registers.push_back(alloca);
   for (AllocaInst *pair : pair_f32_)
     if (pair)
       registers.push_back(pair);
@@ -58,6 +66,8 @@ void FunctionEmitter::noteStateWrite(DolIRStateSlot slot, Value *value) {
   } else if (slot == DOLIR_STATE_HID2) {
     psq_direct_proven_ = false;
     psq_indexed_proven_ = false;
+  } else if (slot == DOLIR_STATE_MSR) {
+    fp_available_checked_ = false;
   }
 }
 

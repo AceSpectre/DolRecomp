@@ -194,12 +194,7 @@ BasicBlock *FunctionEmitter::externalDestination(const DolIRTerminator &term,
     builder_.CreateRetVoid();
   } else {
     reloadCallCounters();
-    for (u32 state = 0; state < DOLIR_STATE_COUNT; state++) {
-      if (!used_[state])
-        continue;
-      auto stateSlot = static_cast<DolIRStateSlot>(state);
-      builder_.CreateStore(loadContext(stateSlot), state_[state]);
-    }
+    reloadUsedState();
     builder_.CreateBr(blocks_[continuationBlock]);
   }
   builder_.restoreIP(saved);

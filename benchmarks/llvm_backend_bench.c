@@ -10,6 +10,7 @@
 #endif
 
 void func_80003100(CPUState *cpu);
+void func_80003300(CPUState *cpu);
 void func_80003500(CPUState *cpu);
 void func_80003750(CPUState *cpu);
 void func_80003800(CPUState *cpu);
@@ -23,6 +24,7 @@ void func_80003A20(CPUState *cpu);
 void func_80003A60(CPUState *cpu);
 void func_80003AA0(CPUState *cpu);
 void func_80004200(CPUState *cpu);
+void func_80004500(CPUState *cpu);
 
 static u32 interception_address;
 static u64 interception_queries;
@@ -107,6 +109,31 @@ static void bench_memory(CPUState *cpu, u32 iterations) {
     checksum += cpu->gpr[3] + cpu->gpr[5];
   }
   report("fastmem", iterations, begin, checksum);
+}
+
+static void bench_static_memory(CPUState *cpu, u32 iterations) {
+  volatile u64 checksum = 0;
+  mem_write32(cpu, GC_RAM_BASE + 0x600u, 0x12345678u);
+  double begin = seconds();
+  for (u32 i = 0; i < iterations; i++) {
+    prepare(cpu, 0x80003300u);
+    func_80003300(cpu);
+    checksum += cpu->gpr[3];
+  }
+  report("staticmem", iterations, begin, checksum);
+}
+
+static void bench_static_memory_chain(CPUState *cpu, u32 iterations) {
+  volatile u64 checksum = 0;
+  mem_write32(cpu, GC_RAM_BASE + 0x600u, 0x12345678u);
+  double begin = seconds();
+  for (u32 i = 0; i < iterations; i++) {
+    prepare(cpu, 0x80004500u);
+    cpu->gpr[5] = i;
+    func_80004500(cpu);
+    checksum += cpu->gpr[3] + cpu->gpr[5];
+  }
+  report("static_chain", iterations, begin, checksum);
 }
 
 static void bench_direct_call(CPUState *cpu, u32 iterations,
@@ -357,6 +384,10 @@ int main(int argc, char **argv) {
     bench_carry(&cpu, iterations);
   if (!selected || !strcmp(selected, "fastmem"))
     bench_memory(&cpu, iterations);
+  if (!selected || !strcmp(selected, "staticmem"))
+    bench_static_memory(&cpu, iterations);
+  if (!selected || !strcmp(selected, "static_chain"))
+    bench_static_memory_chain(&cpu, iterations);
   if (!selected || !strcmp(selected, "call_nomod"))
     bench_direct_call(&cpu, iterations, "call_nomod");
   if (!selected || !strcmp(selected, "call_loaded"))

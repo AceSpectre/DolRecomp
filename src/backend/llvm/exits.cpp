@@ -39,6 +39,10 @@ void FunctionEmitter::emitEntry() {
     if (!used_[slot])
       continue;
     auto stateSlot = static_cast<DolIRStateSlot>(slot);
+    if (slotInMemory(stateSlot)) {
+      state_[slot] = bytePtr(stateOffset(stateSlot));
+      continue;
+    }
     state_[slot] = builder_.CreateAlloca(type(dolir_state_type(stateSlot)),
                                          nullptr, "state");
   }
@@ -52,6 +56,8 @@ void FunctionEmitter::emitEntry() {
     if (!used_[slot])
       continue;
     auto stateSlot = static_cast<DolIRStateSlot>(slot);
+    if (slotInMemory(stateSlot))
+      continue;
     Value *initial = native_abi_ && native_inputs_[slot]
                          ? static_cast<Value *>(native_inputs_[slot])
                          : loadContext(stateSlot);
@@ -146,6 +152,8 @@ void FunctionEmitter::syncDirtyState() {
     if (!dirty_[slot] || slot == DOLIR_STATE_FPSCR)
       continue;
     auto stateSlot = static_cast<DolIRStateSlot>(slot);
+    if (slotInMemory(stateSlot))
+      continue;
     storeContext(
         stateSlot,
         builder_.CreateLoad(type(dolir_state_type(stateSlot)), state_[slot]));

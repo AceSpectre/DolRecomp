@@ -11,6 +11,28 @@ namespace dolllvm {
 
 using namespace llvm;
 
+void FunctionEmitter::emitStateWrite(const DolIRInstruction &inst) {
+  auto slot = static_cast<DolIRStateSlot>(inst.aux);
+  Value *value = operand(inst, 0);
+  if (slot != DOLIR_STATE_MSR) {
+    builder_.CreateStore(value, state_[inst.aux]);
+    noteStateWrite(slot, value);
+    return;
+  }
+
+  Value *old = builder_.CreateLoad(Type::getInt32Ty(context_), state_[inst.aux]);
+  builder_.CreateStore(value, state_[inst.aux]);
+  noteStateWrite(slot, value);
+  Value *enabled = builder_.CreateAnd(builder_.CreateNot(old), value);
+  enabled = builder_.CreateICmpNE(builder_.CreateAnd(enabled, builder_.getInt32(0x8000)),
+                                  builder_.getInt32(0));
+  BasicBlock *exit = BasicBlock::Create(context_, "msr_ee_exit", function_);
+  BasicBlock *resume = BasicBlock::Create(context_, "msr_ee_resume", function_);
+  builder_.CreateCondBr(enabled, exit, resume);
+  builder_.SetInsertPoint(exit);
+  sideExit(inst.guest_pc + 4u);
+  builder_.SetInsertPoint(resume);
+}
 
 void FunctionEmitter::emitStoreConditional(const DolIRInstruction &inst) {
   materialize(inst.guest_pc);

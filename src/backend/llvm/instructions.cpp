@@ -101,8 +101,7 @@ bool FunctionEmitter::emitInstruction(const DolIRInstruction &inst,
     result = stateValue(static_cast<DolIRStateSlot>(inst.aux));
     break;
   case DOLIR_OP_STATE_WRITE:
-    builder_.CreateStore(operand(inst, 0), state_[inst.aux]);
-    noteStateWrite(static_cast<DolIRStateSlot>(inst.aux), operand(inst, 0));
+    emitStateWrite(inst);
     break;
   case DOLIR_OP_ADD:
     result = builder_.CreateAdd(operand(inst, 0), operand(inst, 1));
@@ -234,11 +233,12 @@ bool FunctionEmitter::emitInstruction(const DolIRInstruction &inst,
          static_cast<int>((inst.aux >> 8) & 0xFFu)});
     break;
   case DOLIR_OP_GUEST_LOAD:
-    result = emitGuestLoad(operand(inst, 0), resultType, inst.aux & 0xffu,
-                           (inst.aux & 0x100u) != 0);
+    result = emitGuestLoad(inst, operand(inst, 0), resultType,
+                           inst.aux & 0xffu, (inst.aux & 0x100u) != 0);
     break;
   case DOLIR_OP_GUEST_STORE:
-    emitGuestStore(operand(inst, 0), operand(inst, 1), inst.aux & 0xffu);
+    emitGuestStore(inst, operand(inst, 0), operand(inst, 1),
+                   inst.aux & 0xffu);
     break;
   case DOLIR_OP_HELPER_CALL:
     if (inst.aux == DOLIR_HELPER_FP_AVAILABLE)

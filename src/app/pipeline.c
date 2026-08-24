@@ -55,7 +55,7 @@ static u32 c_chunk_instructions(void) {
 #define DOLLLVM_DEFAULT_CHUNK_INSTRUCTIONS 128u
 #define DOLLLVM_DEFAULT_WORKER_BATCH 4u
 // SSA regions, ABI v4 variants and ThinLTO summaries.
-#define DOLLLVM_CACHE_VERSION "dolllvm-v22"
+#define DOLLLVM_CACHE_VERSION "dolllvm-v23"
 
 typedef struct {
     const PPCInst* insts;
@@ -73,6 +73,7 @@ typedef struct {
     const char* profile_generate_path;
     const char* profile_use_path;
     u64 partition_seed;
+    int state_in_memory;
     u32 ram_size;
     u32 mem2_size;
     char symbol_suffix[32];
@@ -270,6 +271,8 @@ static u64 llvm_job_hash(const LLVMChunkJob* job) {
                       sizeof(job->instrumentation));
     hash = hash_bytes(hash, &job->partition_seed,
                       sizeof(job->partition_seed));
+    hash = hash_bytes(hash, &job->state_in_memory,
+                      sizeof(job->state_in_memory));
     hash = hash_bytes(hash, &job->ram_size, sizeof(job->ram_size));
     hash = hash_bytes(hash, &job->mem2_size, sizeof(job->mem2_size));
     hash = hash_file_contents(hash, job->profile_use_path);
@@ -578,6 +581,7 @@ static int emit_llvm_chunk_job(const void* data, void* user) {
     options.profile_generate_path = job->profile_generate_path;
     options.profile_use_path = job->profile_use_path;
     options.partition_seed = job->partition_seed;
+    options.state_in_memory = job->state_in_memory;
     options.emit_thinlto = 1;
     options.thinlto_path = job->thinlto_path;
     options.fixed_memory_layout = 1;
@@ -1006,6 +1010,7 @@ static int emit_code_sections_llvm(const LoadedCodeSection* sections,
                     options->profile_generate_path;
                 target_job->profile_use_path = options->profile_use_path;
                 target_job->partition_seed = options->partition_seed;
+                target_job->state_in_memory = options->state_in_memory;
                 target_job->ram_size = GC_MAIN_RAM_SIZE;
                 target_job->mem2_size = cpu == DOLRECOMP_CPU_GEKKO
                                              ? 0u
@@ -1410,9 +1415,21 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
         free(insts);
     }
 
+    {
+        char smc_report_path[1100];
+        if (snprintf(smc_report_path, sizeof(smc_report_path), "%s_smc.txt", stem) >=
+                (int)sizeof(smc_report_path) ||
+            !write_smc_report(&smc, smc_report_path)) {
+            smc_analysis_free(&smc);
+            function_list_free(&funcs);
+            fclose(header);
+            fclose(manifest);
+            return 0;
+        }
+    }
+
     if (smc.possible) {
         u32 display_count = smc.range_count;
-        char smc_report_path[1100];
         if (display_count > SMC_DISPLAY_RANGE_LIMIT)
             display_count = SMC_DISPLAY_RANGE_LIMIT;
 
@@ -1423,24 +1440,8 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
         }
 
         if (smc.range_count > SMC_DISPLAY_RANGE_LIMIT) {
-            if (snprintf(smc_report_path, sizeof(smc_report_path), "%s_smc.txt", stem) >=
-                (int)sizeof(smc_report_path)) {
-                fprintf(stderr, "error: SMC report path is too long\n");
-                smc_analysis_free(&smc);
-                function_list_free(&funcs);
-                fclose(header);
-                fclose(manifest);
-                return 0;
-            }
-            if (!write_smc_report(&smc, smc_report_path)) {
-                smc_analysis_free(&smc);
-                function_list_free(&funcs);
-                fclose(header);
-                fclose(manifest);
-                return 0;
-            }
             printf("    ...\n");
-            printf("  full list: %s\n", smc_report_path);
+            printf("  full list: %s_smc.txt\n", stem);
         }
     }
 

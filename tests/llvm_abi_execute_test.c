@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 void func_80004000(CPUState *cpu);
+void func_80004500(CPUState *cpu);
 
 static bool block_callee(CPUState *cpu, u32 address) {
   if (address != PPC_HOST_CALL_NATIVE_REGION_QUERY)
@@ -34,6 +35,21 @@ int main(void) {
   CHECK(cpu.gpr[4] == 22u);
   CHECK(cpu.pc == 0x81234564u);
   CHECK(cpu.downcount == 992);
+
+  cpu.pc = 0x80004500u;
+  cpu.lr = 0x81234567u;
+  cpu.gpr[5] = 7u;
+  cpu.reserve_addr = GC_RAM_BASE + 0x600u;
+  cpu.reserve_valid = true;
+  cpu.downcount = 1000;
+  mem_write32(&cpu, GC_RAM_BASE + 0x600u, 0x2468ACE0u);
+  func_80004500(&cpu);
+  CHECK(cpu.gpr[3] == 0x2468ACE0u);
+  CHECK(cpu.gpr[4] == GC_RAM_BASE);
+  CHECK(cpu.gpr[5] == 8u);
+  CHECK(mem_read32(&cpu, GC_RAM_BASE + 0x604u) == 0x2468ACE0u);
+  CHECK(!cpu.reserve_valid);
+  CHECK(cpu.pc == 0x81234564u);
 
   cpu.pc = 0x80004000u;
   cpu.lr = 0x81234567u;

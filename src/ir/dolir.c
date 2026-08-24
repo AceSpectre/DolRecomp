@@ -177,6 +177,13 @@ static bool verify_function(const DolIRFunction* function, FILE* diagnostics) {
                 fprintf(diagnostics, "dolir: bad state slot at 0x%08X\n", inst->guest_pc);
                 ok = false;
             }
+            if (inst->address_domain > DOLIR_ADDRESS_FIFO ||
+                (inst->address_domain != DOLIR_ADDRESS_UNKNOWN &&
+                 inst->address_lower > inst->address_upper)) {
+                fprintf(diagnostics, "dolir: bad address provenance at 0x%08X\n",
+                        inst->guest_pc);
+                ok = false;
+            }
         }
         for (u32 n = 0; n < 2; n++) {
             u32 target = block->terminator.targets[n];
@@ -221,6 +228,11 @@ void dolir_dump(const DolIRModule* module, FILE* out) {
                     fprintf(out, " 0x%llX", (unsigned long long)inst->immediate);
                 if (inst->op == DOLIR_OP_STATE_READ || inst->op == DOLIR_OP_STATE_WRITE)
                     fprintf(out, " slot=%u", inst->aux);
+                if (inst->op == DOLIR_OP_GUEST_LOAD ||
+                    inst->op == DOLIR_OP_GUEST_STORE)
+                    fprintf(out, " address=%s[0x%08X,0x%08X]",
+                            dolir_address_domain_name(inst->address_domain),
+                            inst->address_lower, inst->address_upper);
                 fprintf(out, " ; pc=0x%08X\n", inst->guest_pc);
             }
             fprintf(out, "    term.%u\n", block->terminator.kind);

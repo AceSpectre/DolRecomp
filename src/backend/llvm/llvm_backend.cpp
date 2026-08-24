@@ -236,7 +236,8 @@ extern "C" bool dolllvm_codegen_fingerprint(const DolLLVMOptions *options,
       out, size,
       "llvm=%s|triple=%s|cpu=%s|features=%s|native-abi=%u|mask-words=%u|"
       "state-count=%u|calling=fastcc|control=pc32x2|return=i64-lanes|"
-      "escape=sjlj|cycles=return-or-chain|x86-return-registers=3|"
+      "escape=sjlj|memory=proven-mem1-v1|cycles=return-or-chain|"
+      "x86-return-registers=3|"
       "aarch64-return-registers=8|reloc=pic|pipeline=default-per-module",
       LLVM_VERSION_STRING, profile.triple.c_str(), profile.cpu.c_str(),
       profile.features.c_str(), DOLLLVM_NATIVE_ABI_VERSION,

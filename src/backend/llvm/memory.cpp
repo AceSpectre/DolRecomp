@@ -6,6 +6,7 @@
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/MDBuilder.h>
+#include <llvm/Support/Alignment.h>
 
 namespace dolllvm {
 
@@ -13,6 +14,24 @@ using namespace llvm;
 
 Value *FunctionEmitter::normalizeAddress(Value *address) {
   return builder_.CreateAnd(address, builder_.getInt32(~0x40000000u));
+}
+
+Value *FunctionEmitter::provenMemoryPointer(
+    const DolIRInstruction &instruction, Value *address, u32 width,
+    Value **offset) {
+  if (!fixed_memory_layout_ || instruction.address_domain != DOLIR_ADDRESS_MEM1 ||
+      instruction.address_lower != instruction.address_upper)
+    return nullptr;
+  auto *constant = dyn_cast<ConstantInt>(address);
+  if (!constant || constant->getZExtValue() != instruction.address_lower)
+    return nullptr;
+  const u32 normalized = instruction.address_lower & ~0x40000000u;
+  if (expected_ram_size_ < width || normalized < GC_RAM_BASE ||
+      normalized - GC_RAM_BASE > expected_ram_size_ - width)
+    return nullptr;
+  *offset = builder_.getInt32(normalized - GC_RAM_BASE);
+  function_->addFnAttr("dolrecomp-native-memory", "mem1");
+  return builder_.CreateInBoundsGEP(Type::getInt8Ty(context_), ram_, *offset);
 }
 
 Value *FunctionEmitter::rangeCheck(Value *normalized, u32 base, Value *size,
@@ -26,7 +45,9 @@ Value *FunctionEmitter::rangeCheck(Value *normalized, u32 base, Value *size,
 Value *FunctionEmitter::endianLoad(Value *pointer, Type *resultType,
                                    u32 width) {
   Type *integerType = IntegerType::get(context_, width * 8u);
-  Value *loaded = builder_.CreateLoad(integerType, pointer);
+  LoadInst *load = builder_.CreateLoad(integerType, pointer, "native.load");
+  load->setAlignment(Align(1));
+  Value *loaded = load;
   loaded = bswap(loaded);
   if (resultType != integerType)
     loaded = builder_.CreateZExtOrTrunc(loaded, resultType);
@@ -72,8 +93,20 @@ Value *FunctionEmitter::externalRead(Value *address, u32 width) {
   return phi;
 }
 
-Value *FunctionEmitter::emitGuestLoad(Value *address, Type *resultType,
+Value *FunctionEmitter::emitGuestLoad(const DolIRInstruction &instruction,
+                                      Value *address, Type *resultType,
                                       u32 width, bool sign) {
+  Value *directOffset = nullptr;
+  if (Value *pointer =
+          provenMemoryPointer(instruction, address, width, &directOffset)) {
+    Value *loaded = endianLoad(pointer, resultType, width);
+    if (sign && width * 8u < resultType->getIntegerBitWidth()) {
+      Value *narrow = builder_.CreateTrunc(
+          loaded, IntegerType::get(context_, width * 8u));
+      return builder_.CreateSExt(narrow, resultType);
+    }
+    return loaded;
+  }
   materializeFPRF();
   Value *normalized = normalizeAddress(address);
   Value *mem1 = rangeCheck(normalized, GC_RAM_BASE, ram_size_, width);
@@ -170,7 +203,8 @@ void FunctionEmitter::endianStore(Value *pointer, Value *value, u32 width) {
   Value *narrowed = value;
   if (value->getType() != integerType)
     narrowed = builder_.CreateZExtOrTrunc(value, integerType);
-  builder_.CreateStore(bswap(narrowed), pointer);
+  StoreInst *store = builder_.CreateStore(bswap(narrowed), pointer);
+  store->setAlignment(Align(1));
 }
 
 void FunctionEmitter::externalWrite(Value *address, Value *value, u32 width) {
@@ -207,7 +241,16 @@ void FunctionEmitter::externalWrite(Value *address, Value *value, u32 width) {
   builder_.SetInsertPoint(done);
 }
 
-void FunctionEmitter::emitGuestStore(Value *address, Value *value, u32 width) {
+void FunctionEmitter::emitGuestStore(const DolIRInstruction &instruction,
+                                     Value *address, Value *value, u32 width) {
+  Value *directOffset = nullptr;
+  if (Value *pointer =
+          provenMemoryPointer(instruction, address, width, &directOffset)) {
+    clearReservation(address);
+    journal(directOffset, width);
+    endianStore(pointer, value, width);
+    return;
+  }
   materializeFPRF();
   clearReservation(address);
   Value *normalized = normalizeAddress(address);

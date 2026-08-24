@@ -130,6 +130,7 @@ extern "C" void dolllvm_report_abi_stats(const DolLLVMFunctionRange *ranges,
   u32 stackFunctions = 0;
   u32 sretFunctions = 0;
   u32 cycleMemoryFunctions = 0;
+  u32 nativeMemoryFunctions = 0;
   std::map<u32, u32> inputHistogram;
   std::map<u32, u32> outputHistogram;
   for (u32 index = 0; index < rangeCount; index++) {
@@ -154,21 +155,26 @@ extern "C" void dolllvm_report_abi_stats(const DolLLVMFunctionRange *ranges,
     stackFunctions += stackArgs != 0;
     sretFunctions += sret;
     cycleMemoryFunctions += cycleMemory;
+    nativeMemoryFunctions +=
+        (range.abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE_MEMORY) != 0;
     inputHistogram[inputs.integer + inputs.floating]++;
     outputHistogram[outputs.integer + outputs.floating]++;
     if (full)
       fprintf(output,
               "dolllvm abi fn=%08X in=%u/%u out=%u/%u escape=%u/%u stack=%u "
-              "return_lanes=%u sret=%s cycle_memory=%s\n",
+              "return_lanes=%u sret=%s cycle_memory=%s native_memory=%s\n",
               range.start, inputs.integer, inputs.floating, outputs.integer,
               outputs.floating, escapes.integer, escapes.floating, stackArgs,
-              returnLanes, sret ? "yes" : "no", cycleMemory ? "yes" : "no");
+              returnLanes, sret ? "yes" : "no", cycleMemory ? "yes" : "no",
+              (range.abi_flags & DOLLLVM_FUNCTION_ABI_NATIVE_MEMORY) ? "yes"
+                                                                     : "no");
   }
   fprintf(output,
           "dolllvm abi target=%s native=%u compat=%u stack_functions=%u "
-          "sret_functions=%u cycle_memory_functions=%u\n",
+          "sret_functions=%u cycle_memory_functions=%u "
+          "native_memory_functions=%u\n",
           targetTriple, native, rangeCount - native, stackFunctions,
-          sretFunctions, cycleMemoryFunctions);
+          sretFunctions, cycleMemoryFunctions, nativeMemoryFunctions);
   printHistogram(output, "live_ins", inputHistogram);
   printHistogram(output, "live_outs", outputHistogram);
 }

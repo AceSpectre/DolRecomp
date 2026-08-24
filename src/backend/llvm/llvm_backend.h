@@ -9,9 +9,10 @@ extern "C" {
 
 typedef enum {
     DOLLLVM_FUNCTION_ABI_NATIVE = 1u << 0,
+    DOLLLVM_FUNCTION_ABI_NATIVE_MEMORY = 1u << 1,
 } DolLLVMFunctionABIFlag;
 
-#define DOLLLVM_NATIVE_ABI_VERSION 1u
+#define DOLLLVM_NATIVE_ABI_VERSION 2u
 
 typedef struct {
     u32 start;
@@ -63,6 +64,7 @@ typedef struct {
     u32 ram_size;
     u32 mem2_size;
     u64 partition_seed;
+    int state_in_memory;
     const DolLLVMFunctionRange* function_ranges;
     u32 function_range_count;
     const u32* entry_points;

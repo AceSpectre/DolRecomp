@@ -10,6 +10,7 @@ int main(void) {
     char* valid[] = {
         "dolrecomp", "--gamecube", "--backend=llvm",
         "--targets=x86-64-v2,x86-64-v3", "--semantics=fast",
+        "--state-in-memory",
         "--instrumentation=lockstep", "--profile-use=profile.profdata",
         "--partition-instructions", "512", "--partition-seed", "42",
         "input.dol", "output",
@@ -20,6 +21,7 @@ int main(void) {
     CHECK(options.backend == DOLRECOMP_BACKEND_LLVM);
     CHECK(strcmp(options.llvm_targets, "x86-64-v2,x86-64-v3") == 0);
     CHECK(options.fast_semantics && options.lockstep_instrumentation);
+    CHECK(options.state_in_memory);
     CHECK(strcmp(options.profile_use_path, "profile.profdata") == 0);
     CHECK(options.partition_instructions == 512u);
     CHECK(options.partition_seed == 42u);

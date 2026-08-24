@@ -1,6 +1,7 @@
 #include "backend/llvm/native_abi.h"
 
 #include "backend/llvm/emitter.h"
+#include "cpu/cpu.h"
 
 #include <algorithm>
 #include <cstring>
@@ -13,29 +14,45 @@
 
 namespace {
 
-bool nativeABIEligible(const DolIRFunction &function) {
+bool nativeMemoryAccess(const DolIRInstruction &instruction) {
+  if (instruction.address_domain != DOLIR_ADDRESS_MEM1 ||
+      instruction.address_lower != instruction.address_upper)
+    return false;
+  const u32 width = instruction.aux & 0xffu;
+  const u32 address = instruction.address_lower & ~0x40000000u;
+  return width && width <= GC_MAIN_RAM_SIZE && address >= GC_RAM_BASE &&
+         address - GC_RAM_BASE <= GC_MAIN_RAM_SIZE - width;
+}
+
+u32 nativeABIFlags(const DolIRFunction &function) {
+  bool memory = false;
   for (u32 blockIndex = 0; blockIndex < function.block_count; blockIndex++) {
     const DolIRBlock &block = function.blocks[blockIndex];
     if (!block.cycle_cost || block.terminator.kind == DOLIR_TERM_FALLBACK ||
         block.terminator.kind == DOLIR_TERM_SYSTEM_CALL ||
         block.terminator.kind == DOLIR_TERM_RFI)
-      return false;
+      return 0;
     for (u32 index = 0; index < block.instruction_count; index++) {
       const DolIRInstruction &instruction = block.instructions[index];
       if (instruction.op == DOLIR_OP_GUEST_LOAD ||
-          instruction.op == DOLIR_OP_GUEST_STORE)
-        return false;
+          instruction.op == DOLIR_OP_GUEST_STORE) {
+        if (!nativeMemoryAccess(instruction))
+          return 0;
+        memory = true;
+        continue;
+      }
       if (instruction.op != DOLIR_OP_HELPER_CALL)
         continue;
       switch (static_cast<DolIRHelper>(instruction.aux)) {
       case DOLIR_HELPER_MEMORY_FENCE:
         break;
       default:
-        return false;
+        return 0;
       }
     }
   }
-  return true;
+  return static_cast<u32>(DOLLLVM_FUNCTION_ABI_NATIVE) |
+         (memory ? static_cast<u32>(DOLLLVM_FUNCTION_ABI_NATIVE_MEMORY) : 0u);
 }
 
 DolLLVMFunctionRange *exactRange(std::vector<DolLLVMFunctionRange> &ranges,
@@ -192,9 +209,7 @@ extern "C" bool dolllvm_analyze_function_abi(const DolIRFunction *function,
       }
     }
   }
-  range->abi_flags = nativeABIEligible(*function)
-                         ? static_cast<u32>(DOLLLVM_FUNCTION_ABI_NATIVE)
-                         : 0u;
+  range->abi_flags = nativeABIFlags(*function);
   return true;
 }
 

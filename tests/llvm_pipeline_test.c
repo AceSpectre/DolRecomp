@@ -88,6 +88,26 @@ static int run_generator(const char* executable, const char* dol,
 #endif
 }
 
+static int run_c_generator(const char* executable, const char* dol,
+                           const char* output) {
+#if defined(_WIN32)
+    return _spawnl(_P_WAIT, executable, executable, "--gamecube",
+                   "--backend=c", dol, output, NULL) == 0;
+#else
+    pid_t child = fork();
+    if (child < 0)
+        return 0;
+    if (child == 0) {
+        execl(executable, executable, "--gamecube", "--backend=c",
+              dol, output, NULL);
+        _exit(127);
+    }
+    int status = 0;
+    return waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+#endif
+}
+
 static int files_equal(const char* first, const char* second) {
     FILE* a = fopen(first, "rb");
     FILE* b = fopen(second, "rb");
@@ -127,6 +147,8 @@ int main(int argc, char** argv) {
     char bitcode[1200];
     char manifest[1200];
     char cache[1200];
+    char c_output[1200];
+    char c_smc[1200];
     char single_output[1200];
     char output_copy[1200];
     char header_copy[1200];
@@ -147,6 +169,9 @@ int main(int argc, char** argv) {
     snprintf(manifest, sizeof(manifest),
              "%s/out/generated/generated.c", argv[2]);
     snprintf(cache, sizeof(cache), "%s/cache", argv[2]);
+    snprintf(c_output, sizeof(c_output), "%s/out-c", argv[2]);
+    snprintf(c_smc, sizeof(c_smc),
+             "%s/out-c/generated/generated_smc.txt", argv[2]);
     snprintf(single_output, sizeof(single_output), "%s/out-single", argv[2]);
     snprintf(output_copy, sizeof(output_copy), "%s/out-copy", argv[2]);
     snprintf(header_copy, sizeof(header_copy),
@@ -162,7 +187,11 @@ int main(int argc, char** argv) {
                         "--targets=x86-64-v2,x86-64-v3", cache));
     CHECK(run_generator(argv[1], dol, output_copy,
                         "--targets=x86-64-v2,x86-64-v3", cache));
-    FILE* file = fopen(header, "rb");
+    CHECK(run_c_generator(argv[1], dol, c_output));
+    FILE* file = fopen(c_smc, "rb");
+    CHECK(file != NULL);
+    fclose(file);
+    file = fopen(header, "rb");
     CHECK(file != NULL);
     char text[65536];
     size_t length = fread(text, 1, sizeof(text) - 1, file);

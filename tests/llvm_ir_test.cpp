@@ -39,7 +39,7 @@ static void mark_output(DolLLVMFunctionRange &range, DolIRStateSlot slot) {
 }
 
 int main(int argc, char **argv) {
-  CHECK(argc == 8);
+  CHECK(argc == 9);
   llvm::LLVMContext context;
   llvm::SMDiagnostic diagnostic;
   std::unique_ptr<llvm::Module> module =
@@ -105,6 +105,12 @@ int main(int argc, char **argv) {
   for (llvm::Type *element :
        llvm::cast<llvm::StructType>(nativeCaller->getReturnType())->elements())
     CHECK(element->isIntegerTy(64));
+  llvm::Function *mtmsr = module->getFunction("func_80003D20_budget");
+  CHECK(mtmsr != nullptr);
+  bool mtmsrExit = false;
+  for (const llvm::BasicBlock &block : *mtmsr)
+    mtmsrExit |= block.getName() == "msr_ee_exit";
+  CHECK(mtmsrExit);
 
   auto check_paired_function = [](llvm::Function *function,
                                   unsigned minimum_math,
@@ -263,10 +269,19 @@ int main(int argc, char **argv) {
   }
   llvm::Function *constant_memory = module->getFunction("func_80003300_budget");
   CHECK(constant_memory != nullptr);
+  CHECK(constant_memory->getCallingConv() == llvm::CallingConv::Fast);
+  CHECK(!constant_memory->getReturnType()->isVoidTy());
+  CHECK(constant_memory->getFnAttribute("dolrecomp-native-memory")
+            .getValueAsString() == "mem1");
   for (llvm::BasicBlock &block : *constant_memory)
-    for (llvm::Instruction &instruction : block)
+    for (llvm::Instruction &instruction : block) {
+      CHECK(!block.getName().starts_with("load_slow") &&
+            !block.getName().starts_with("store_slow") &&
+            !block.getName().starts_with("load_check_mem2") &&
+            !block.getName().starts_with("store_check_mem2"));
       if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
         CHECK(call->getCalledFunction() != nullptr);
+    }
   std::unique_ptr<llvm::Module> instrumented =
       llvm::parseIRFile(argv[2], diagnostic, context);
   CHECK(instrumented != nullptr);
@@ -307,6 +322,20 @@ int main(int argc, char **argv) {
   CHECK(!llvm::isa<llvm::LoadInst>(splitCall->getArgOperand(3)));
   for (unsigned index = 4; index < splitCall->arg_size(); index++)
     CHECK(!llvm::isa<llvm::LoadInst>(splitCall->getArgOperand(index)));
+  llvm::Function *splitMemoryCaller =
+      split->getFunction("func_80004500_budget");
+  CHECK(splitMemoryCaller != nullptr);
+  CHECK(splitMemoryCaller->getCallingConv() == llvm::CallingConv::Fast);
+  llvm::CallBase *splitMemoryCall = nullptr;
+  for (llvm::BasicBlock &block : *splitMemoryCaller)
+    for (llvm::Instruction &instruction : block)
+      if (auto *call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+        if (call->getCalledFunction() &&
+            call->getCalledFunction()->getName() == "func_80004600_budget")
+          splitMemoryCall = call;
+  CHECK(splitMemoryCall != nullptr);
+  CHECK(splitMemoryCall->getCallingConv() == llvm::CallingConv::Fast);
+  CHECK(!splitMemoryCall->getType()->isVoidTy());
   auto contextDerived = [](llvm::Value *pointer, llvm::Value *context) {
     llvm::Value *value = pointer;
     for (;;) {
@@ -318,14 +347,42 @@ int main(int argc, char **argv) {
     }
     return value == context;
   };
-  for (llvm::Instruction &instruction : *splitCall->getParent()) {
-    if (&instruction == splitCall)
-      break;
-    if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction))
-      CHECK(
-          !contextDerived(store->getPointerOperand(), splitCaller->getArg(0)) &&
-          !contextDerived(store->getPointerOperand(), splitCaller->getArg(1)));
+  auto noStateStoresBefore = [&](llvm::CallBase *call,
+                                 llvm::Function *caller) {
+    for (llvm::Instruction &instruction : *call->getParent()) {
+      if (&instruction == call)
+        break;
+      if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction))
+        if (contextDerived(store->getPointerOperand(), caller->getArg(0)) ||
+            contextDerived(store->getPointerOperand(), caller->getArg(1)))
+          return false;
+    }
+    return true;
+  };
+  CHECK(noStateStoresBefore(splitCall, splitCaller));
+  CHECK(noStateStoresBefore(splitMemoryCall, splitMemoryCaller));
+
+  std::unique_ptr<llvm::Module> stateMemory =
+      llvm::parseIRFile(argv[8], diagnostic, context);
+  CHECK(stateMemory != nullptr);
+  llvm::Function *stateMemoryFunction =
+      stateMemory->getFunction("func_80003100_budget");
+  CHECK(stateMemoryFunction != nullptr);
+  bool contextStateLoad = false;
+  for (llvm::BasicBlock &block : *stateMemoryFunction) {
+    for (llvm::Instruction &instruction : block) {
+      if (auto *alloca = llvm::dyn_cast<llvm::AllocaInst>(&instruction))
+        CHECK(!alloca->getName().starts_with("state"));
+      auto *load = llvm::dyn_cast<llvm::LoadInst>(&instruction);
+      if (!load)
+        continue;
+      llvm::Value *pointer = load->getPointerOperand()->stripPointerCasts();
+      while (auto *gep = llvm::dyn_cast<llvm::GEPOperator>(pointer))
+        pointer = gep->getPointerOperand()->stripPointerCasts();
+      contextStateLoad |= pointer == stateMemoryFunction->getArg(0);
+    }
   }
+  CHECK(contextStateLoad);
 
   std::unique_ptr<llvm::Module> arm =
       llvm::parseIRFile(argv[7], diagnostic, context);

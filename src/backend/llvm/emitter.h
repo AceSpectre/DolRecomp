@@ -75,6 +75,7 @@ private:
   void scanLoopHeaders();
   void scanRegionLeaders();
   void finalizeStateSSA();
+  bool slotInMemory(DolIRStateSlot slot) const;
 
   void emitEntry();
   bool emitWrapper(llvm::raw_ostream &diagnostics);
@@ -111,6 +112,7 @@ private:
   llvm::Value *bswap(llvm::Value *value);
   bool emitInstruction(const DolIRInstruction &instruction,
                        llvm::raw_ostream &diagnostics);
+  void emitStateWrite(const DolIRInstruction &instruction);
 
   llvm::AllocaInst *temporary(llvm::Type *value_type, llvm::StringRef name);
   llvm::Value *stateValue(DolIRStateSlot slot);
@@ -168,17 +170,25 @@ private:
   llvm::Value *emitFPAvailable(u32 pc);
 
   llvm::Value *normalizeAddress(llvm::Value *address);
+  llvm::Value *provenMemoryPointer(const DolIRInstruction &instruction,
+                                   llvm::Value *address, u32 width,
+                                   llvm::Value **offset);
   llvm::Value *rangeCheck(llvm::Value *normalized, u32 base, llvm::Value *size,
                           u32 width);
   llvm::Value *endianLoad(llvm::Value *pointer, llvm::Type *result_type,
                           u32 width);
   llvm::Value *externalRead(llvm::Value *address, u32 width);
+  llvm::Value *emitGuestLoad(const DolIRInstruction &instruction,
+                             llvm::Value *address, llvm::Type *result_type,
+                             u32 width, bool sign);
   llvm::Value *emitGuestLoad(llvm::Value *address, llvm::Type *result_type,
                              u32 width, bool sign);
   void clearReservation(llvm::Value *address);
   void journal(llvm::Value *offset, u32 width);
   void endianStore(llvm::Value *pointer, llvm::Value *value, u32 width);
   void externalWrite(llvm::Value *address, llvm::Value *value, u32 width);
+  void emitGuestStore(const DolIRInstruction &instruction,
+                      llvm::Value *address, llvm::Value *value, u32 width);
   void emitGuestStore(llvm::Value *address, llvm::Value *value, u32 width);
 
   llvm::BasicBlock *directDestination(const DolIRTerminator &terminator,
@@ -220,7 +230,7 @@ private:
   llvm::Value *mem2_size_ = nullptr;
   llvm::BasicBlock *fallback_block_ = nullptr;
   llvm::PHINode *fallback_pc_ = nullptr;
-  std::array<llvm::AllocaInst *, DOLIR_STATE_COUNT> state_{};
+  std::array<llvm::Value *, DOLIR_STATE_COUNT> state_{};
   std::array<llvm::AllocaInst *, 32> pair_f32_{};
   std::array<llvm::AllocaInst *, 32> pair_f64_{};
   std::array<FPRepresentation, 32> fp_rep_{};
@@ -261,6 +271,7 @@ private:
   DolLLVMSemantics semantics_ = DOLLLVM_SEMANTICS_EXACT;
   std::string symbol_suffix_;
   bool fixed_memory_layout_ = false;
+  bool state_in_memory_ = false;
   u32 expected_ram_size_ = 0;
   u32 expected_mem2_size_ = 0;
   u32 current_pc_ = 0;

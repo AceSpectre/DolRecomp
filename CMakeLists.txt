@@ -89,6 +89,7 @@ endif()
 
 add_library(dr_ir STATIC
     src/ir/dolir.c
+    src/ir/dolir_address.c
     src/ir/dolir_effects.c
     src/ir/dolir_builder.c
 )
@@ -107,6 +108,7 @@ if(DOLRECOMP_ENABLE_LLVM)
         src/backend/llvm/native_abi.cpp
         src/backend/llvm/abi_stats.cpp
         src/backend/llvm/memory.cpp
+        src/backend/llvm/memory_fallback.cpp
         src/backend/llvm/register_state.cpp
         src/backend/llvm/state_controls.cpp
         src/backend/llvm/exits.cpp
@@ -379,7 +381,8 @@ if(DOLRECOMP_ENABLE_LLVM)
              ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.o.v2.bc
              ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.fast
              ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.abi.caller
-             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.a57)
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.a57
+             ${CMAKE_CURRENT_BINARY_DIR}/dolir_test.ll.state-memory)
     set_tests_properties(llvm_ir PROPERTIES DEPENDS llvm_fixture)
     set(DOLRECOMP_TEST_OBJECT ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.o)
     set(DOLRECOMP_TEST_IR ${CMAKE_CURRENT_BINARY_DIR}/dolir_execute.ll)
@@ -413,6 +416,8 @@ if(DOLRECOMP_ENABLE_LLVM)
             ${DOLRECOMP_ABI_LOOP_CALLER_OBJECT}
             ${DOLRECOMP_ABI_LOOP_CALLEE_OBJECT}
             ${DOLRECOMP_TEST_IR}.abi.caller
+            ${DOLRECOMP_TEST_OBJECT}.state-memory
+            ${DOLRECOMP_TEST_IR}.state-memory
         COMMAND llvm_fixture ${DOLRECOMP_TEST_OBJECT} ${DOLRECOMP_TEST_IR}
         DEPENDS llvm_fixture
         VERBATIM
@@ -449,6 +454,8 @@ if(DOLRECOMP_ENABLE_LLVM)
     add_executable(llvm_backend_bench
         benchmarks/llvm_backend_bench.c
         ${DOLRECOMP_TEST_OBJECT}
+        ${DOLRECOMP_ABI_CALLER_OBJECT}
+        ${DOLRECOMP_ABI_CALLEE_OBJECT}
         ${DOLRECOMP_ABI_LOOP_CALLER_OBJECT}
         ${DOLRECOMP_ABI_LOOP_CALLEE_OBJECT})
     target_link_libraries(llvm_backend_bench PRIVATE dr_cpu)

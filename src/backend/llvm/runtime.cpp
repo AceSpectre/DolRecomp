@@ -32,6 +32,8 @@ void FunctionEmitter::reloadState(DolIRStateSlot slot) {
   known_state_[slot] = nullptr;
   if (slot == DOLIR_STATE_FPSCR)
     pending_fprf_ = nullptr;
+  if (slotInMemory(slot))
+    return;
   builder_.CreateStore(loadContext(slot), state_[slot]);
 }
 

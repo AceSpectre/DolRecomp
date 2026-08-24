@@ -206,6 +206,16 @@ typedef enum {
     DOLIR_EFFECT_BARRIER = 1u << 6,
 } DolIREffect;
 
+typedef enum {
+    DOLIR_ADDRESS_UNKNOWN,
+    DOLIR_ADDRESS_GUEST_DATA,
+    DOLIR_ADDRESS_MEM1,
+    DOLIR_ADDRESS_MEM2,
+    DOLIR_ADDRESS_PHYSICAL,
+    DOLIR_ADDRESS_MMIO,
+    DOLIR_ADDRESS_FIFO,
+} DolIRAddressDomain;
+
 typedef struct {
     DolIROp op;
     DolIRType type;
@@ -218,6 +228,9 @@ typedef struct {
     u32 effects;
     u64 state_uses[DOLIR_STATE_MASK_WORDS];
     u64 state_defs[DOLIR_STATE_MASK_WORDS];
+    DolIRAddressDomain address_domain;
+    u32 address_lower;
+    u32 address_upper;
     bool exact_fp;
 } DolIRInstruction;
 
@@ -295,6 +308,8 @@ bool dolir_verify(const DolIRModule* module, FILE* diagnostics);
 void dolir_dump(const DolIRModule* module, FILE* out);
 void dolir_populate_effects(DolIRInstruction* instruction);
 bool dolir_state_mask_test(const u64* mask, DolIRStateSlot slot);
+void dolir_analyze_addresses(DolIRFunction* function);
+const char* dolir_address_domain_name(DolIRAddressDomain domain);
 
 #ifdef __cplusplus
 }

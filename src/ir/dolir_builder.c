@@ -1462,5 +1462,6 @@ bool dolir_build_chunk(DolIRModule* module, const PPCInst* insts, u32 count,
             b.block->terminator.raw = b.inst->raw;
         }
     }
+    dolir_analyze_addresses(function);
     return true;
 }

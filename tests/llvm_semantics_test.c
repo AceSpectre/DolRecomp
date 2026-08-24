@@ -9,6 +9,7 @@ void func_80002900(CPUState* cpu);
 void func_80003000(CPUState* cpu);
 void func_80003100(CPUState* cpu);
 void func_80003200(CPUState* cpu);
+void func_80003300(CPUState* cpu);
 void func_80003400(CPUState* cpu);
 void func_80003500(CPUState* cpu);
 void func_80003700(CPUState* cpu);
@@ -18,6 +19,7 @@ void func_80003740(CPUState* cpu);
 void func_80003750(CPUState* cpu);
 void func_80003760(CPUState* cpu);
 void func_80003800(CPUState* cpu);
+void func_80003D20(CPUState* cpu);
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "check failed: %s:%d: %s\n", \
     __FILE__, __LINE__, #x); return 1; } } while (0)
@@ -226,6 +228,16 @@ int main(void) {
     CHECK((cpu.exception & PPC_EXC_DSI) && cpu.pc == PPC_VECTOR_DSI);
     CHECK(cpu.dar == 0x70000000u && cpu.gpr[5] == 40);
 
+    prepare(&cpu, 0x80003300u);
+    cpu.reserve_addr = GC_RAM_BASE + 0x600u;
+    cpu.reserve_valid = true;
+    mem_write32(&cpu, GC_RAM_BASE + 0x600u, 0x13579BDFu);
+    func_80003300(&cpu);
+    CHECK(cpu.gpr[3] == 0x13579BDFu);
+    CHECK(cpu.gpr[4] == GC_RAM_BASE);
+    CHECK(mem_read32(&cpu, GC_RAM_BASE + 0x604u) == 0x13579BDFu);
+    CHECK(!cpu.reserve_valid);
+
     prepare(&cpu, 0x80003200u);
     cpu.gpr[4] = GC_RAM_BASE + 0x500u;
     cpu.gpr[5] = GC_RAM_BASE + 0x510u;
@@ -296,6 +308,18 @@ int main(void) {
     while (cpu.pc != 0x81234564u)
         func_80003800(&cpu);
     CHECK(cpu.gpr[3] == 100u && (cpu.cr >> 28) == 2u);
+
+    prepare(&cpu, 0x80003D20u);
+    cpu.msr = 0;
+    cpu.gpr[3] = 0x8000u;
+    func_80003D20(&cpu);
+    CHECK(cpu.msr == 0x8000u && cpu.pc == 0x80003D24u);
+
+    prepare(&cpu, 0x80003D20u);
+    cpu.msr = 0x8000u;
+    cpu.gpr[3] = 0x8000u;
+    func_80003D20(&cpu);
+    CHECK(cpu.msr == 0x8000u && cpu.pc == 0x81234564u);
 
     cpu_free(&reference);
     cpu_free(&cpu);
