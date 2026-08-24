@@ -1267,18 +1267,45 @@ static f64 force_25_bit(f64 value) {
     return f64_value(bits);
 }
 
+/* The CRT's fma() is a library call that does not become an FMA3 instruction
+ * under MSVC; on a paired-single matrix concat it measured 40% of the whole
+ * function (515ns -> 310ns per PSMTXConcat with the fusion removed). Both
+ * forms are correctly-rounded fused multiply-adds, so using the instruction
+ * where the CPU has it is bit-identical -- determinism, goldens and the
+ * savestate proof see the same values either way. */
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <immintrin.h>
+static int fma3_supported(void) {
+    static int have = -1;
+    if (have < 0) {
+        int regs[4];
+        __cpuid(regs, 1);
+        have = (regs[2] >> 12) & 1; /* CPUID.1:ECX.FMA */
+    }
+    return have;
+}
+static inline f64 dr_fma(f64 a, f64 b, f64 c) {
+    if (fma3_supported())
+        return _mm_cvtsd_f64(
+            _mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(b), _mm_set_sd(c)));
+    return fma(a, b, c);
+}
+#else
+#define dr_fma fma
+#endif
+
 /* Fused multiply-add for results that are subsequently rounded to single
  * precision. The double fma result is nudged to odd when it lands exactly on
  * the double-rounding boundary so the final f64->f32 conversion rounds the
  * way one direct infinite-precision->single rounding would (Gekko behavior).
  * c must already be rounded to 25 bits. */
 static f64 fma_single(f64 a, f64 c, f64 addend) {
-    f64 result = fma(a, c, addend);
+    f64 result = dr_fma(a, c, addend);
     u64 bits = f64_bits(result);
     if ((bits & 0x000000001FFFFFFFull) == 0x0000000010000000ull) {
         f64 a_prime = addend - result;
         f64 b_prime = result + a_prime;
-        f64 error = fma(a, c, a_prime) + (addend - b_prime);
+        f64 error = dr_fma(a, c, a_prime) + (addend - b_prime);
         if (error != 0.0) {
             if ((error > 0.0) == (result > 0.0)) bits++;
             else bits--;
@@ -1294,7 +1321,7 @@ bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
     f64 result;
 
     if (!single) {
-        result = fma(a, c, addend);
+        result = dr_fma(a, c, addend);
     } else {
         result = (f64)(f32)fma_single(a, force_25_bit(c), addend);
     }
