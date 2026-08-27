@@ -401,8 +401,45 @@ void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia) {
     ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
 }
 
+/* Optional fast gate for host_call: a two-level bitmap of the guest addresses
+ * that actually have a host-call target. Kept in file scope rather than on
+ * CPUState so installing it does not change the struct layout every generated
+ * chunk is compiled against. g_hc_l1 == NULL disables the gate (every entry
+ * calls, the original behaviour). The runtime owns the bitmaps and sets them
+ * through ppc_set_host_call_filter. */
+static const u32* g_hc_filter;
+static const u32* g_hc_l1;
+static u32 g_hc_base;
+static u32 g_hc_span;
+
+void ppc_set_host_call_filter(const u32* filter, const u32* l1, u32 base,
+                              u32 span) {
+    g_hc_filter = filter;
+    g_hc_base = base;
+    g_hc_span = span;
+    g_hc_l1 = l1; /* published last: a reader that sees l1 sees the rest */
+}
+
 bool ppc_host_call(CPUState* cpu, u32 address) {
-    return cpu->host_call ? cpu->host_call(cpu, address) : false;
+    if (!cpu->host_call)
+        return false;
+    /* Skip the indirect call when this address is known to have no host-call
+     * target. Mirrors the runtime's own filter exactly, so an in-window miss
+     * is a definite no-target; an out-of-window address falls through and
+     * calls (the runtime handles those). */
+    const u32* l1 = g_hc_l1;
+    if (l1) {
+        u32 off = address - g_hc_base;
+        if (off < g_hc_span) {
+            u32 page = off >> 12;
+            if (!((l1[page >> 5] >> (page & 31u)) & 1u))
+                return false;
+            u32 slot = off >> 2;
+            if (!((g_hc_filter[slot >> 5] >> (slot & 31u)) & 1u))
+                return false;
+        }
+    }
+    return cpu->host_call(cpu, address);
 }
 
 void ppc_system_call_exception(CPUState* cpu, u32 cia) {
