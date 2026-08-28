@@ -6,6 +6,7 @@ void func_80004020(CPUState* ctx);
 void func_80004040(CPUState* ctx);
 void func_80004060(CPUState* ctx); /* bl 0x80004070; mtlr r4; blr */
 void func_80004070(CPUState* ctx); /* addi r3,r3,1; blr */
+void func_800040C0(CPUState* ctx); /* addi r3,r3,1 x4; blr */
 
 int main(void) {
     CPUState cpu;
@@ -100,7 +101,41 @@ int main(void) {
                 cpu.gpr[3]);
     }
 
+    /* Mid-block entry. 0x800040C8 is index 2 of a five-instruction chunk whose
+     * only leader is index 0, so no entry switch has a reason to carry a case
+     * for it -- it is exactly the address that must reach the cold resume
+     * companion once the hot switch is thinned. These values are the reference:
+     * they were produced while the hot function still had a case per
+     * instruction, and must not move when that case goes away.
+     *   two addi run (r3 += 2), the blr returns through lr, and no leader is
+     *   crossed so downcount is untouched. */
+    cpu.pc = 0x800040C8u;
+    cpu.lr = 0x81234564u;
+    cpu.gpr[3] = 10;
+    cpu.downcount = 100;
+    func_800040C0(&cpu);
+    int midblock_ok = cpu.pc == 0x81234564u && cpu.gpr[3] == 12 &&
+                      cpu.downcount == 100;
+    if (!midblock_ok) {
+        fprintf(stderr, "midblock pc=%08X r3=%u downcount=%lld\n", cpu.pc,
+                cpu.gpr[3], (long long)cpu.downcount);
+    }
+
+    /* Same chunk entered at its leader: all four addi run and the block's
+     * cycles are charged once. */
+    cpu.pc = 0x800040C0u;
+    cpu.lr = 0x81234564u;
+    cpu.gpr[3] = 10;
+    cpu.downcount = 100;
+    func_800040C0(&cpu);
+    int leader_entry_ok = cpu.pc == 0x81234564u && cpu.gpr[3] == 14 &&
+                          cpu.downcount == 95;
+    if (!leader_entry_ok) {
+        fprintf(stderr, "leader entry pc=%08X r3=%u downcount=%lld\n", cpu.pc,
+                cpu.gpr[3], (long long)cpu.downcount);
+    }
+
     cpu_free(&cpu);
     return !(integer_ok && memory_ok && direct_call_ok && depth_bound_ok &&
-             parked_ok);
+             parked_ok && midblock_ok && leader_entry_ok);
 }

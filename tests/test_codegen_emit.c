@@ -9,36 +9,35 @@
 
 #define BASE 0x80003000u
 
-/* Emits one function to a scratch file and checks the text for expected and
- * forbidden fragments. Used for shape assertions that executing the code
- * cannot make (which helper a call routes through, whether a label exists). */
-static int emit_shape_check(const char* what, const PPCInst* insts, u32 count,
-                            u32 addr, const char* const* expect, int expect_n,
-                            const char* const* reject, int reject_n) {
+/* Emits one function to a scratch file and returns its text, or NULL. Used for
+ * shape assertions that executing the code cannot make (which helper a call
+ * routes through, whether a label exists). Caller frees. */
+static char* emit_to_text(const PPCInst* insts, u32 count, u32 addr) {
     const char* path = "codegen_emit_check.tmp";
     FILE* f = fopen(path, "wb+");
     if (!f) {
         perror(path);
-        return 0;
+        return NULL;
     }
     if (!emit_function(f, insts, count, addr)) {
         fclose(f);
         remove(path);
-        return 0;
+        return NULL;
     }
     long size = ftell(f);
     char* text = (char*)malloc((size_t)size + 1u);
-    if (!text) {
-        fclose(f);
-        remove(path);
-        return 0;
+    if (text) {
+        rewind(f);
+        text[fread(text, 1, (size_t)size, f)] = '\0';
     }
-    rewind(f);
-    size_t got = fread(text, 1, (size_t)size, f);
-    text[got] = '\0';
     fclose(f);
     remove(path);
+    return text;
+}
 
+static int text_check(const char* what, const char* text,
+                      const char* const* expect, int expect_n,
+                      const char* const* reject, int reject_n) {
     int ok = 1;
     for (int i = 0; i < expect_n; i++) {
         if (!strstr(text, expect[i])) {
@@ -54,8 +53,51 @@ static int emit_shape_check(const char* what, const PPCInst* insts, u32 count,
             ok = 0;
         }
     }
-    if (!ok)
+    return ok;
+}
+
+/* Copy the run of text starting at `begin` and stopping before `end` (or at
+ * the end of the text when `end` is NULL). Returns NULL if either marker is
+ * missing. Assertions have to be per-function: the hot function legitimately
+ * uses gotos and direct calls, and the cold one legitimately uses the shape
+ * the hot one no longer does. */
+static char* text_slice(const char* text, const char* begin, const char* end) {
+    const char* from = strstr(text, begin);
+    if (!from)
+        return NULL;
+    const char* to = end ? strstr(from, end) : from + strlen(from);
+    if (!to)
+        return NULL;
+    size_t span = (size_t)(to - from);
+    char* out = (char*)malloc(span + 1u);
+    if (!out)
+        return NULL;
+    memcpy(out, from, span);
+    out[span] = '\0';
+    return out;
+}
+
+/* Emits one function, slices out the named part of the output, and checks it.
+ * Pass begin/end as for text_slice. */
+static int emit_shape_check(const char* what, const PPCInst* insts, u32 count,
+                            u32 addr, const char* begin, const char* end,
+                            const char* const* expect, int expect_n,
+                            const char* const* reject, int reject_n) {
+    char* text = emit_to_text(insts, count, addr);
+    if (!text)
+        return 0;
+    char* part = text_slice(text, begin, end);
+    if (!part) {
+        fprintf(stderr, "%s: could not find '%s' in the emitted output\n", what,
+                begin);
         fputs(text, stderr);
+        free(text);
+        return 0;
+    }
+    int ok = text_check(what, part, expect, expect_n, reject, reject_n);
+    if (!ok)
+        fputs(part, stderr);
+    free(part);
     free(text);
     return ok;
 }
@@ -90,10 +132,55 @@ static int check_direct_call_shape(void) {
     };
 
     int ok = emit_shape_check("cross-chunk bl", cross_call, 3, BASE + 0x1060,
-                              expect_uncond, 3, reject_uncond, 1);
+                              "\nvoid func_80004060(", NULL, expect_uncond, 3,
+                              reject_uncond, 1);
     ok &= emit_shape_check("cross-chunk conditional bl", cond_call, 2,
-                           BASE + 0x1080, expect_cond, 3, NULL, 0);
+                           BASE + 0x1080, "\nvoid func_80004080(", NULL,
+                           expect_cond, 3, NULL, 0);
     return ok;
+}
+
+/* Every chunk gets a cold resume companion carrying a case per instruction,
+ * including instructions the hot entry switch has no reason to cover. Inside
+ * it, control transfers all leave through ctx->pc -- no gotos, no direct
+ * calls, no counted-loop helper calls. */
+static int check_cold_companion_shape(void) {
+    /* A local backward branch (which the hot path keeps native) and a call
+     * whose return address is inside the range (which the hot path turns into
+     * a direct call), so the cold lowering of both can be told apart. */
+    PPCInst body[6];
+    body[0] = ppc_decode(0x38630001u, BASE + 0x10A0); /* addi r3,r3,1   */
+    body[1] = ppc_decode(0x38630001u, BASE + 0x10A4); /* addi r3,r3,1   */
+    body[2] = ppc_decode(0x2C030000u, BASE + 0x10A8); /* cmpwi r3,0     */
+    body[3] = ppc_decode(0x4082FFF8u, BASE + 0x10AC); /* bne -8 (local) */
+    body[4] = ppc_decode(0x48001001u, BASE + 0x10B0); /* bl +0x1000     */
+    body[5] = ppc_decode(0x4E800020u, BASE + 0x10B4); /* blr            */
+
+    static const char* const expect[] = {
+        /* index 2 is pure fall-through -- not a leader, not a return target --
+         * yet the cold switch still covers it */
+        "    case 0x800040A8u: goto cold_800040A8;\n",
+        "cold_800040A8:\n    ctx->pc = 0x800040A8u;\n",
+        /* index 1 is the backward branch's target, so it is a leader and gets
+         * the same downcount charge the hot path makes */
+        "cold_800040A4:\n    ctx->pc = 0x800040A4u;\n    ctx->downcount -= ",
+        /* the local backward branch leaves through pc instead of looping */
+        "            ctx->pc = 0x800040A4u;\n            return;\n",
+        /* the cross-chunk call leaves through pc instead of calling in place */
+        "            ctx->lr = 0x800040B4u;\n"
+        "            ctx->pc = 0x800050B0u;\n"
+        "            return;\n",
+    };
+    static const char* const reject[] = {
+        "goto label_",
+        "dolrecomp_direct_call",
+        "loop_800040A4(",
+        "return_dispatch_",
+    };
+
+    return emit_shape_check("cold companion", body, 6, BASE + 0x10A0,
+                            "static void func_800040A0_cold(CPUState* ctx) {",
+                            "\nvoid func_800040A0(", expect, 5, reject, 4);
 }
 
 static const u32 opcode_raws[] = {
@@ -195,7 +282,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!check_direct_call_shape()) {
+    if (!check_direct_call_shape() || !check_cold_companion_shape()) {
         free(insts);
         if (out != stdout) fclose(out);
         return 1;
@@ -213,7 +300,8 @@ int main(int argc, char** argv) {
         !function_list_add(&funcs, BASE + 0x1030, BASE + 0x1040) ||
         !function_list_add(&funcs, BASE + 0x1040, BASE + 0x1058) ||
         !function_list_add(&funcs, BASE + 0x1060, BASE + 0x106C) ||
-        !function_list_add(&funcs, BASE + 0x1070, BASE + 0x1078)) {
+        !function_list_add(&funcs, BASE + 0x1070, BASE + 0x1078) ||
+        !function_list_add(&funcs, BASE + 0x10C0, BASE + 0x10D4)) {
         function_list_free(&funcs);
         free(insts);
         if (out != stdout) fclose(out);
@@ -286,6 +374,16 @@ int main(int argc, char** argv) {
     cross_callee[0] = ppc_decode(0x38630001u, BASE + 0x1070); /* addi r3,r3,1 */
     cross_callee[1] = ppc_decode(0x4E800020u, BASE + 0x1074); /* blr          */
     if (!emit_function(out, cross_callee, 2, BASE + 0x1070))
+        return 1;
+
+    /* Straight-line body with exactly one leader (index 0), so entering at
+     * index 2 is a mid-block entry no hot entry switch has a reason to cover.
+     * test_c_execute enters it there and pins the result. */
+    PPCInst midblock[5];
+    for (u32 i = 0; i < 4; i++)
+        midblock[i] = ppc_decode(0x38630001u, BASE + 0x10C0 + i * 4u);
+    midblock[4] = ppc_decode(0x4E800020u, BASE + 0x10D0); /* blr */
+    if (!emit_function(out, midblock, 5, BASE + 0x10C0))
         return 1;
 
     emit_footer(out);

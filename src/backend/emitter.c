@@ -309,7 +309,7 @@ static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
 
 static void emit_direct_branch(FILE* out, const PPCInst* inst,
                                bool local_target, bool direct_backedge,
-                               u32 func_start, u32 func_end) {
+                               u32 func_start, u32 func_end, bool cold) {
     bool local_backward = local_target && inst->branch_target <= inst->address;
 
     if (inst->lk) {
@@ -323,7 +323,7 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst,
                 fprintf(out, "            }\n");
             }
             fprintf(out, "            goto label_%08X;\n", inst->branch_target);
-        } else if (continuation >= func_start && continuation < func_end) {
+        } else if (!cold && continuation >= func_start && continuation < func_end) {
             /* Cross-chunk call: run the callee here rather than returning the
              * target to the dispatcher, then resume at the return address in
              * place. The guard repeats, and only repeats, what the dispatcher
@@ -544,11 +544,15 @@ void emit_footer(FILE* out) {
     fprintf(out, "\n#endif /* RECOMP_GENERATED_H */\n\n// end\n");
 }
 
+/* `cold` selects the lowering used by the cold resume companion (see
+ * emit_function_cold): no local gotos, no counted-loop helpers and no direct
+ * cross-chunk calls, so every control transfer leaves through ctx->pc. */
 static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
                                         u32 func_start, u32 func_end,
                                         bool direct_backedge,
                                         bool route_local_returns,
-                                        bool emit_fp_guard) {
+                                        bool emit_fp_guard,
+                                        bool cold) {
     char disasm[64];
     ppc_disasm(disasm, sizeof(disasm), inst);
     fprintf(out, "    // %08X: %s\n", inst->address, disasm);
@@ -1636,8 +1640,9 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_B:
         fprintf(out, "    {\n");
         emit_direct_branch(out, inst,
-                           branch_target_is_local(func_start, func_end, inst->branch_target),
-                           direct_backedge, func_start, func_end);
+                           !cold && branch_target_is_local(func_start, func_end,
+                                                           inst->branch_target),
+                           direct_backedge, func_start, func_end, cold);
         fprintf(out, "    }\n");
         break;
 
@@ -1646,8 +1651,9 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         emit_branch_condition(out, inst->bo, inst->bi);
         fprintf(out, "        if (ctr_ok && cr_ok) {\n");
         emit_direct_branch(out, inst,
-                           branch_target_is_local(func_start, func_end, inst->branch_target),
-                           direct_backedge, func_start, func_end);
+                           !cold && branch_target_is_local(func_start, func_end,
+                                                           inst->branch_target),
+                           direct_backedge, func_start, func_end, cold);
         fprintf(out, "        }\n");
         fprintf(out, "    }\n");
         break;
@@ -1871,7 +1877,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 
 void emit_instruction(FILE* out, const PPCInst* inst) {
     /* No block context here (standalone emit, used by tests): always guard. */
-    emit_instruction_with_range(out, inst, 0, (u32)-1, false, false, true);
+    emit_instruction_with_range(out, inst, 0, (u32)-1, false, false, true, false);
 }
 
 static void emit_counted_loop(FILE* out, const PPCInst* insts,
@@ -1896,9 +1902,51 @@ static void emit_counted_loop(FILE* out, const PPCInst* insts,
         /* Counted-loop bodies are outlinable-only (no FP ops), so the guard
          * flag is inert here; pass true for safety. */
         emit_instruction_with_range(out, &insts[i], function_address,
-                                    function_end, i == last, false, true);
+                                    function_end, i == last, false, true,
+                                    false);
     }
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", continuation);
+    fprintf(out, "}\n\n");
+}
+
+/* Cold resume companion. The dispatcher can enter a chunk at an address the
+ * hot function has no case for: an `rfi` back into the middle of a block, a
+ * `bctr` jump-table target, a saved lr resumed from somewhere else. Those
+ * entries are far too rare to shape the hot function around, so they land
+ * here instead. This function keeps the case-per-instruction switch the hot
+ * one used to carry, runs straight-line from the requested pc to the next
+ * control transfer, and returns; the following dispatch then arrives at a
+ * leader, which the hot function does have a case for.
+ *
+ * It must be bit-exact with the hot path, so it charges the same downcount at
+ * the same leaders, and it takes none of the hot path's shortcuts: every FP
+ * op is guarded (every cold case is dispatcher-enterable, so no guard can be
+ * hoisted into a predecessor), ctx->pc is materialized before every
+ * instruction, and every branch -- local or not, backward or not -- lowers to
+ * `ctx->pc = target; return;`. No gotos, no counted-loop helper calls, no
+ * direct cross-chunk calls. */
+static void emit_function_cold(FILE* out, const PPCInst* insts,
+                               const CFunctionCFG* cfg, u32 count,
+                               u32 func_addr, u32 func_end) {
+    fprintf(out, "static void func_%08X_cold(CPUState* ctx) {\n", func_addr);
+    fprintf(out, "    switch (ctx->pc) {\n");
+    for (u32 i = 0; i < count; i++) {
+        fprintf(out, "    case 0x%08Xu: goto cold_%08X;\n",
+                insts[i].address, insts[i].address);
+    }
+    fprintf(out, "    default: return;\n");
+    fprintf(out, "    }\n");
+
+    for (u32 i = 0; i < count; i++) {
+        fprintf(out, "cold_%08X:\n", insts[i].address);
+        fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
+        if (cfg->leaders[i] && cfg->block_cycles[i] != 0)
+            fprintf(out, "    ctx->downcount -= %u;\n", cfg->block_cycles[i]);
+        emit_instruction_with_range(out, &insts[i], func_addr, func_end, false,
+                                    false, true, true);
+    }
+
+    fprintf(out, "    ctx->pc = 0x%08Xu;\n", func_end);
     fprintf(out, "}\n\n");
 }
 
@@ -1919,6 +1967,8 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
             emit_counted_loop(out, insts, &cfg, func_addr, func_end, i,
                               cfg.loop_ends[i]);
     }
+
+    emit_function_cold(out, insts, &cfg, count, func_addr, func_end);
 
     fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
     fprintf(out, "    switch (ctx->pc) {\n");
@@ -1961,7 +2011,7 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
         emit_instruction_with_range(
             out, &insts[i], func_addr, func_end,
             c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
-            has_local_returns, emit_fp_guard);
+            has_local_returns, emit_fp_guard, false);
         prev_fpu = !insts[i].embedded_data && ppc_op_uses_fpu(insts[i].op);
     }
 
