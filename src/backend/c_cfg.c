@@ -244,6 +244,74 @@ static bool instruction_is_outlinable(const PPCInst* inst) {
     }
 }
 
+/* Static branch targets across the whole program -- see c_cfg.h. */
+static u32* g_global_targets;
+static u32 g_global_target_count;
+static u32 g_global_target_capacity;
+
+void c_global_targets_reset(void) {
+    free(g_global_targets);
+    g_global_targets = NULL;
+    g_global_target_count = 0;
+    g_global_target_capacity = 0;
+}
+
+bool c_global_targets_add(const PPCInst* insts, u32 count) {
+    for (u32 i = 0; i < count; ++i) {
+        const PPCInst* inst = &insts[i];
+        if (inst->embedded_data)
+            continue;
+        if (inst->op != PPC_OP_B && inst->op != PPC_OP_BC)
+            continue;
+        if (g_global_target_count == g_global_target_capacity) {
+            u32 capacity =
+                g_global_target_capacity ? g_global_target_capacity * 2u : 1024u;
+            u32* grown = (u32*)realloc(g_global_targets,
+                                       capacity * sizeof(*g_global_targets));
+            if (!grown)
+                return false;
+            g_global_targets = grown;
+            g_global_target_capacity = capacity;
+        }
+        g_global_targets[g_global_target_count++] = inst->branch_target;
+    }
+    return true;
+}
+
+static int compare_u32(const void* a, const void* b) {
+    u32 x = *(const u32*)a;
+    u32 y = *(const u32*)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+void c_global_targets_finalize(void) {
+    if (g_global_target_count < 2u)
+        return;
+    qsort(g_global_targets, g_global_target_count, sizeof(*g_global_targets),
+          compare_u32);
+    u32 unique = 1;
+    for (u32 i = 1; i < g_global_target_count; ++i) {
+        if (g_global_targets[i] != g_global_targets[unique - 1u])
+            g_global_targets[unique++] = g_global_targets[i];
+    }
+    g_global_target_count = unique;
+}
+
+bool c_global_target_contains(u32 address) {
+    u32 low = 0;
+    u32 high = g_global_target_count;
+    while (low < high) {
+        u32 mid = low + (high - low) / 2u;
+        if (g_global_targets[mid] == address)
+            return true;
+        if (g_global_targets[mid] < address)
+            low = mid + 1u;
+        else
+            high = mid;
+    }
+    return false;
+}
+
 bool c_function_cfg_contains(const CFunctionCFG* cfg, u32 function_address,
                              u32 address) {
     u32 end = function_address + cfg->count * 4u;
@@ -264,8 +332,10 @@ bool c_function_cfg_build(CFunctionCFG* cfg, const PPCInst* insts, u32 count,
         (u8*)calloc(count ? count : 1u, sizeof(*cfg->return_targets));
     cfg->loop_ends =
         (u32*)malloc((count ? count : 1u) * sizeof(*cfg->loop_ends));
+    cfg->entry_points =
+        (u8*)calloc(count ? count : 1u, sizeof(*cfg->entry_points));
     if (!cfg->leaders || !cfg->block_cycles || !cfg->materialize_pc ||
-        !cfg->return_targets || !cfg->loop_ends) {
+        !cfg->return_targets || !cfg->loop_ends || !cfg->entry_points) {
         c_function_cfg_destroy(cfg);
         return false;
     }
@@ -324,6 +394,18 @@ bool c_function_cfg_build(CFunctionCFG* cfg, const PPCInst* insts, u32 count,
         if (straight_line && outlinable && first < last)
             cfg->loop_ends[first] = last;
     }
+
+    /* Everything the dispatcher may enter this chunk at through a *static*
+     * path. Dynamic entries (bctr jump tables, an rfi to an arbitrary pc, a
+     * longjmp'd lr) are deliberately not here -- they go through the cold
+     * resume companion, which handles any pc. */
+    for (u32 i = 0; i < count; ++i) {
+        cfg->entry_points[i] =
+            (i == 0u || cfg->leaders[i] || cfg->return_targets[i] ||
+             c_global_target_contains(function_address + i * 4u))
+                ? 1u
+                : 0u;
+    }
     return true;
 }
 
@@ -333,6 +415,7 @@ void c_function_cfg_destroy(CFunctionCFG* cfg) {
     free(cfg->materialize_pc);
     free(cfg->return_targets);
     free(cfg->loop_ends);
+    free(cfg->entry_points);
     memset(cfg, 0, sizeof(*cfg));
 }
 

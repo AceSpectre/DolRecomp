@@ -8,6 +8,7 @@
 #include "frontend/container/rel.h"
 #include "frontend/container/rpx.h"
 #include "backend/emitter.h"
+#include "backend/c_cfg.h"
 #include "backend/dispatch.h"
 #include "backend/codegen.h"
 #include "backend/symbols.h"
@@ -867,6 +868,44 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
         remove(symbol_header_path);
     }
     fprintf(header, "\n// Function entry points\n");
+
+    /* Pass one: collect every static branch target in the program. Chunks are
+     * cut at a fixed stride, so a chunk cannot tell from its own instructions
+     * which of its addresses the rest of the program branches into; the set
+     * has to be complete before any chunk is emitted, and immutable while the
+     * chunk jobs run in parallel. See c_cfg.h. */
+    c_global_targets_reset();
+    for (u32 s = 0; s < section_count; s++) {
+        const LoadedCodeSection* section = &sections[s];
+        if (section->size == 0 || !section->data) continue;
+
+        u32 num_insts = section->size / 4;
+        PPCInst* scan = (PPCInst*)malloc(num_insts * sizeof(PPCInst));
+        if (!scan) {
+            fprintf(stderr, "error: out of memory\n");
+            fclose(header);
+            fclose(manifest);
+            return 0;
+        }
+        for (u32 i = 0; i < num_insts; i++) {
+            u32 raw = read_be32(section->data + i * 4u);
+            scan[i] = ppc_decode(raw, section->address + i * 4u);
+            if (scan[i].op == PPC_OP_UNKNOWN &&
+                embedded_data_word(section->embedded_data_mode, raw)) {
+                scan[i].embedded_data = true;
+            }
+        }
+        bool collected = c_global_targets_add(scan, num_insts);
+        free(scan);
+        if (!collected) {
+            fprintf(stderr, "error: out of memory\n");
+            c_global_targets_reset();
+            fclose(header);
+            fclose(manifest);
+            return 0;
+        }
+    }
+    c_global_targets_finalize();
 
     u32 file_count = 0;
     const u32 chunk_instructions = c_chunk_instructions();
