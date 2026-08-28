@@ -527,7 +527,8 @@ void emit_footer(FILE* out) {
 static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
                                         u32 func_start, u32 func_end,
                                         bool direct_backedge,
-                                        bool route_local_returns) {
+                                        bool route_local_returns,
+                                        bool emit_fp_guard) {
     char disasm[64];
     ppc_disasm(disasm, sizeof(disasm), inst);
     fprintf(out, "    // %08X: %s\n", inst->address, disasm);
@@ -537,7 +538,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         return;
     }
 
-    if (ppc_op_uses_fpu(inst->op))
+    if (emit_fp_guard && ppc_op_uses_fpu(inst->op))
         fprintf(out, "    if (!ppc_fp_available(ctx, 0x%08Xu)) return;\n", inst->address);
 
     switch (inst->op) {
@@ -1849,7 +1850,8 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
 }
 
 void emit_instruction(FILE* out, const PPCInst* inst) {
-    emit_instruction_with_range(out, inst, 0, (u32)-1, false, false);
+    /* No block context here (standalone emit, used by tests): always guard. */
+    emit_instruction_with_range(out, inst, 0, (u32)-1, false, false, true);
 }
 
 static void emit_counted_loop(FILE* out, const PPCInst* insts,
@@ -1871,8 +1873,10 @@ static void emit_counted_loop(FILE* out, const PPCInst* insts,
     for (u32 i = first; i <= last; ++i) {
         if (cfg->materialize_pc[i])
             fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
+        /* Counted-loop bodies are outlinable-only (no FP ops), so the guard
+         * flag is inert here; pass true for safety. */
         emit_instruction_with_range(out, &insts[i], function_address,
-                                    function_end, i == last, false);
+                                    function_end, i == last, false, true);
     }
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", continuation);
     fprintf(out, "}\n\n");
@@ -1905,6 +1909,16 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     fprintf(out, "    default: return;\n");
     fprintf(out, "    }\n");
 
+    /* FP-availability guard hoist: ppc_fp_available is emitted before every FP
+     * op. Within a straight-line run of FP ops it is redundant -- MSR[FP] is
+     * unchanged by any FP op, so if the run's first guard passed, later ops in
+     * the run see FP available. We may drop op i's guard only if it cannot be
+     * entered except by falling through the (guarded) FP op before it: not a
+     * block leader (branch target) and not a return target (post-bl re-entry).
+     * The dispatcher can still re-enter here after an FP-unavailable / DSI
+     * exception, but rfi restores the interrupted MSR[FP]=1, so the drop stays
+     * correct. See ppc_fp_available in cpu.h. */
+    bool prev_fpu = false;
     for (u32 i = 0; i < count; i++) {
         fprintf(out, "label_%08X:\n", insts[i].address);
         if (cfg.loop_ends[i] != UINT32_MAX) {
@@ -1915,16 +1929,20 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
                         continuation, continuation);
             }
             fprintf(out, "    return;\n");
+            prev_fpu = false;
             continue;
         }
         if (cfg.materialize_pc[i])
             fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
         if (cfg.leaders[i] && cfg.block_cycles[i] != 0)
             fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[i]);
+        bool emit_fp_guard =
+            !(prev_fpu && !cfg.leaders[i] && !cfg.return_targets[i]);
         emit_instruction_with_range(
             out, &insts[i], func_addr, func_end,
             c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
-            has_local_returns);
+            has_local_returns, emit_fp_guard);
+        prev_fpu = !insts[i].embedded_data && ppc_op_uses_fpu(insts[i].op);
     }
 
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", func_end);
