@@ -134,6 +134,10 @@ u64 dolrecomp_resolve_mem2 = 0;
 u64 dolrecomp_resolve_lc = 0;
 u64 dolrecomp_resolve_other = 0;
 
+/* WGPIPE store fast-path hook (see cpu.h). NULL until the GX bridge installs
+ * its handler, so non-GX hosts and unit tests keep the plain slow path. */
+bool (*dolrecomp_wgpipe_write)(CPUState* cpu, u32 ea, u64 value, u8 size) = NULL;
+
 /* dolrecomp_call direct-mapped translation cache hit/miss counters --
  * see backend/dispatch.c, filled in the generated dolrecomp_call(). */
 u64 dolrecomp_call_hits = 0;

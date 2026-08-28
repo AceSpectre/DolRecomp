@@ -183,6 +183,19 @@ void mem_write16_slow(CPUState* cpu, u32 addr, u16 value);
 u8   mem_read8_slow(CPUState* cpu, u32 addr);
 void mem_write8_slow(CPUState* cpu, u32 addr, u8 value);
 
+/* Write-gather-pipe fast path. The guest streams vertex data to the WGPIPE
+ * (0xCC008000, a 32-byte window) with ~158k tiny stores per frame; each one
+ * otherwise takes the full store slow path (mem_writeN_slow -> resolve_addr
+ * returns NULL -> external_write -> os_hle MMIO router -> gx bridge). The
+ * WGPIPE is never RAM, so it never participates in reservations or the write
+ * journal -- route it straight to the bridge handler and skip the chain. Set
+ * by the GX bridge at init; NULL leaves the old slow path in force (tests). */
+#define DOLRECOMP_WGPIPE_BASE 0xCC008000u
+#define DOLRECOMP_WGPIPE_SIZE 0x20u
+extern bool (*dolrecomp_wgpipe_write)(CPUState* cpu, u32 ea, u64 value, u8 size);
+#define DOLRECOMP_WGPIPE_HIT(addr) \
+    ((u32)((addr) - DOLRECOMP_WGPIPE_BASE) < DOLRECOMP_WGPIPE_SIZE)
+
 /* Recompiled code issues one of these per guest load/store, so they are the
  * hottest path in the runtime. The overwhelming majority target cached MEM1
  * (0x80000000 + ram_size), which needs nothing but a range check: the rest —
@@ -218,6 +231,10 @@ static inline void mem_write32(CPUState* cpu, u32 addr, u32 value) {
         write_be32(cpu->ram + (addr - GC_RAM_BASE), value);
         return;
     }
+    if (dolrecomp_wgpipe_write && DOLRECOMP_WGPIPE_HIT(addr)) {
+        dolrecomp_wgpipe_write(cpu, addr, value, 4u);
+        return;
+    }
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 4u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be32(cpu->mem2 + (addr - WII_MEM2_BASE), value);
@@ -238,6 +255,10 @@ static inline void mem_write16(CPUState* cpu, u32 addr, u16 value) {
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 2u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be16(cpu->ram + (addr - GC_RAM_BASE), value);
+        return;
+    }
+    if (dolrecomp_wgpipe_write && DOLRECOMP_WGPIPE_HIT(addr)) {
+        dolrecomp_wgpipe_write(cpu, addr, value, 2u);
         return;
     }
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 2u) && !cpu->journal_active &&
@@ -262,6 +283,10 @@ static inline void mem_write8(CPUState* cpu, u32 addr, u8 value) {
         cpu->ram[addr - GC_RAM_BASE] = value;
         return;
     }
+    if (dolrecomp_wgpipe_write && DOLRECOMP_WGPIPE_HIT(addr)) {
+        dolrecomp_wgpipe_write(cpu, addr, value, 1u);
+        return;
+    }
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 1u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         cpu->mem2[addr - WII_MEM2_BASE] = value;
@@ -282,6 +307,10 @@ static inline void mem_write64(CPUState* cpu, u32 addr, u64 value) {
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 8u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be64(cpu->ram + (addr - GC_RAM_BASE), value);
+        return;
+    }
+    if (dolrecomp_wgpipe_write && DOLRECOMP_WGPIPE_HIT(addr)) {
+        dolrecomp_wgpipe_write(cpu, addr, value, 8u);
         return;
     }
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 8u) && !cpu->journal_active &&
