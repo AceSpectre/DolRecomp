@@ -1971,12 +1971,28 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     emit_function_cold(out, insts, &cfg, count, func_addr, func_end);
 
     fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
+    /* Entry switch, cases only for addresses control can arrive at from
+     * outside this function: the chunk start, block leaders, return addresses,
+     * and addresses some other chunk branches to (cfg->entry_points). Every
+     * other instruction is reachable only by falling through the one before
+     * it, so it carries no case and no label -- one predecessor, which is what
+     * lets the compiler keep guest state in host registers across it instead
+     * of spilling to ctx at every instruction boundary.
+     *
+     * Entries this set does not cover -- an `rfi` into the middle of a block,
+     * a `bctr` jump-table target, an lr resumed from elsewhere -- go to the
+     * cold companion, which handles any pc in the chunk. */
     fprintf(out, "    switch (ctx->pc) {\n");
     for (u32 i = 0; i < count; i++) {
+        if (!cfg.entry_points[i])
+            continue;
         fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
                 insts[i].address, insts[i].address);
     }
-    fprintf(out, "    default: return;\n");
+    fprintf(out, "    default:\n");
+    fprintf(out, "        DOLRECOMP_COUNT(dolrecomp_cold_entries);\n");
+    fprintf(out, "        func_%08X_cold(ctx);\n", func_addr);
+    fprintf(out, "        return;\n");
     fprintf(out, "    }\n");
 
     /* FP-availability guard hoist: ppc_fp_available is emitted before every FP
@@ -1984,13 +2000,15 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
      * unchanged by any FP op, so if the run's first guard passed, later ops in
      * the run see FP available. We may drop op i's guard only if it cannot be
      * entered except by falling through the (guarded) FP op before it: not a
-     * block leader (branch target) and not a return target (post-bl re-entry).
+     * an entry point, i.e. the entry switch has no case for it. (Entry points
+     * are a superset of the leaders and return targets this used to test.)
      * The dispatcher can still re-enter here after an FP-unavailable / DSI
-     * exception, but rfi restores the interrupted MSR[FP]=1, so the drop stays
-     * correct. See ppc_fp_available in cpu.h. */
+     * exception, but that arrives through the cold companion, which guards
+     * every FP op. See ppc_fp_available in cpu.h. */
     bool prev_fpu = false;
     for (u32 i = 0; i < count; i++) {
-        fprintf(out, "label_%08X:\n", insts[i].address);
+        if (cfg.entry_points[i])
+            fprintf(out, "label_%08X:\n", insts[i].address);
         if (cfg.loop_ends[i] != UINT32_MAX) {
             u32 continuation = insts[cfg.loop_ends[i]].address + 4u;
             fprintf(out, "    loop_%08X(ctx);\n", insts[i].address);
@@ -2006,8 +2024,7 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
             fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
         if (cfg.leaders[i] && cfg.block_cycles[i] != 0)
             fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[i]);
-        bool emit_fp_guard =
-            !(prev_fpu && !cfg.leaders[i] && !cfg.return_targets[i]);
+        bool emit_fp_guard = !(prev_fpu && !cfg.entry_points[i]);
         emit_instruction_with_range(
             out, &insts[i], func_addr, func_end,
             c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),

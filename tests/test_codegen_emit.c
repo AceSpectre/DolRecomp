@@ -183,6 +183,40 @@ static int check_cold_companion_shape(void) {
                             "\nvoid func_800040A0(", expect, 5, reject, 4);
 }
 
+/* The hot entry switch carries cases only for addresses control can actually
+ * arrive at from outside -- chunk start, block leaders, return addresses, and
+ * targets other chunks branch to. Everything else falls through with no label
+ * and one predecessor, which is the point: it is what lets the compiler keep
+ * values in registers across the instruction. Anything not covered goes to the
+ * cold companion. */
+static int check_hot_switch_thinning(void) {
+    PPCInst body[4];
+    body[0] = ppc_decode(0x48001001u, BASE + 0x10E0); /* bl +0x1000   */
+    body[1] = ppc_decode(0x38630001u, BASE + 0x10E4); /* addi r3,r3,1 */
+    body[2] = ppc_decode(0x38630001u, BASE + 0x10E8); /* addi r3,r3,1 */
+    body[3] = ppc_decode(0x4E800020u, BASE + 0x10EC); /* blr          */
+
+    static const char* const expect[] = {
+        /* chunk start */
+        "    case 0x800040E0u: goto label_800040E0;\n",
+        /* the `bl`'s return address: the callee's blr dispatches here */
+        "    case 0x800040E4u: goto label_800040E4;\n",
+        /* anything else lands in the cold companion */
+        "    default:\n",
+        "        func_800040E0_cold(ctx);\n",
+    };
+    static const char* const reject[] = {
+        /* index 2 and 3 are reachable only by falling through index 1 */
+        "case 0x800040E8u:",
+        "label_800040E8:",
+        "case 0x800040ECu:",
+        "label_800040EC:",
+    };
+
+    return emit_shape_check("hot switch", body, 4, BASE + 0x10E0,
+                            "\nvoid func_800040E0(", NULL, expect, 4, reject, 4);
+}
+
 static const u32 opcode_raws[] = {
     0x1C64FFF9, 0x20850001, 0x38610010, 0x3084FFFF,
     0x34A5FFFF, 0x3CA01234, 0x2C03FFFF, 0x28038000,
@@ -282,7 +316,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!check_direct_call_shape() || !check_cold_companion_shape()) {
+    if (!check_direct_call_shape() || !check_cold_companion_shape() ||
+        !check_hot_switch_thinning()) {
         free(insts);
         if (out != stdout) fclose(out);
         return 1;

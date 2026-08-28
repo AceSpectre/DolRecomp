@@ -143,6 +143,12 @@ bool (*dolrecomp_wgpipe_write)(CPUState* cpu, u32 ea, u64 value, u8 size) = NULL
 u64 dolrecomp_call_hits = 0;
 u64 dolrecomp_call_misses = 0;
 
+/* Dispatches that entered a chunk at an address its hot entry switch has no
+ * case for and had to go through the cold resume companion -- see
+ * emit_function in backend/emitter.c. Expected to track the interrupt rate;
+ * millions of these would mean the entry-point set is missing something hot. */
+u64 dolrecomp_cold_entries = 0;
+
 /* Slow-path bucket counters cost a global RMW per resolve (resolve_lc alone
  * ran 6.6M times per 3D repro), so they are compiled out unless a stats
  * build defines DOLRECOMP_DISPATCH_STATS. */

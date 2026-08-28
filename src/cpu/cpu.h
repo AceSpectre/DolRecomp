@@ -170,6 +170,8 @@ extern u64 dolrecomp_resolve_other;
 /* dolrecomp_call direct-mapped translation cache -- see backend/dispatch.c. */
 extern u64 dolrecomp_call_hits;
 extern u64 dolrecomp_call_misses;
+/* Cold-companion entries -- see cpu.c. */
+extern u64 dolrecomp_cold_entries;
 /* Installs the process-global write journal and keeps cpu->journal_active
  * (the per-CPU fast-path mirror) coherent. Pass the CPUState whose stores
  * must observe the journal; with multiple CPUStates, call once per state. */
