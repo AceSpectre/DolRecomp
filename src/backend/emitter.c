@@ -469,6 +469,47 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "    return dolrecomp_f32_to_bits((f32)value);\n"
         "}\n"
         "\n"
+        /* Gekko paired-single rounding, inlined so ps ops need no out-of-line
+         * call. Byte-identical to cpu.c force_25_bit / fma_single. */
+        "#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))\n"
+        "#include <immintrin.h>\n"
+        "static inline f64 dolrecomp_dr_fma(f64 a, f64 b, f64 c) {\n"
+        "    return _mm_cvtsd_f64(_mm_fmadd_sd(_mm_set_sd(a), _mm_set_sd(b), _mm_set_sd(c)));\n"
+        "}\n"
+        "#else\n"
+        "static inline f64 dolrecomp_dr_fma(f64 a, f64 b, f64 c) { return fma(a, b, c); }\n"
+        "#endif\n"
+        "static inline f64 dolrecomp_ps_force25(f64 value) {\n"
+        "    u64 bits = dolrecomp_f64_to_bits(value);\n"
+        "    u64 fraction = bits & 0x000FFFFFFFFFFFFFull;\n"
+        "    u64 keep_mask = 0xFFFFFFFFF8000000ull;\n"
+        "    u64 round = 0x0000000008000000ull;\n"
+        "    if ((bits & 0x7FF0000000000000ull) == 0 && fraction != 0) {\n"
+        "        unsigned lz = 0; u64 f = fraction;\n"
+        "        while ((f & 0x8000000000000000ull) == 0) { f <<= 1; lz++; }\n"
+        "        unsigned shift = lz - 11u;\n"
+        "        if (shift < 28u) { keep_mask = ~((1ull << (27u - shift)) - 1ull); round >>= shift; }\n"
+        "        else { keep_mask = ~0ull; round = 0; }\n"
+        "    }\n"
+        "    bits = (bits & keep_mask) + (bits & round);\n"
+        "    return dolrecomp_f64_from_bits(bits);\n"
+        "}\n"
+        "static inline f64 dolrecomp_ps_fmasingle(f64 a, f64 c, f64 addend) {\n"
+        "    f64 result = dolrecomp_dr_fma(a, c, addend);\n"
+        "    u64 bits = dolrecomp_f64_to_bits(result);\n"
+        "    if ((bits & 0x000000001FFFFFFFull) == 0x0000000010000000ull) {\n"
+        "        f64 a_prime = addend - result;\n"
+        "        f64 b_prime = result + a_prime;\n"
+        "        f64 error = dolrecomp_dr_fma(a, c, a_prime) + (addend - b_prime);\n"
+        "        if (error != 0.0) {\n"
+        "            if ((error > 0.0) == (result > 0.0)) bits++;\n"
+        "            else bits--;\n"
+        "            result = dolrecomp_f64_from_bits(bits);\n"
+        "        }\n"
+        "    }\n"
+        "    return result;\n"
+        "}\n"
+        "\n"
         ,
         emit_cpu_label(cpu),
         emit_cpu_macro(cpu),
@@ -1241,27 +1282,41 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
+    /* Inlined (see the ps helpers in the header): the scalar is forced to 25
+     * bits once, then each lane is multiplied / fused-multiply-added and
+     * rounded to single. The scalar is captured in a local before any write so
+     * an rD that aliases a source stays correct. Matches ppc_ps_muls0/madds
+     * in cpu.c byte-for-byte, minus the FPRF update the inlined scalar ops
+     * also omit. */
     case PPC_OP_PS_MULS0:
-        fprintf(out, "    ppc_ps_muls0(ctx, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rC);
+        fprintf(out, "    { f64 s = dolrecomp_ps_force25(ctx->fpr[%u]); "
+                     "ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * s); "
+                     "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] * s); }\n",
+                inst->rC, inst->rD, inst->rA, inst->rD, inst->rA);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MULS1:
-        fprintf(out, "    ppc_ps_muls1(ctx, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rC);
+        fprintf(out, "    { f64 s = dolrecomp_ps_force25(ctx->ps1[%u]); "
+                     "ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * s); "
+                     "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] * s); }\n",
+                inst->rC, inst->rD, inst->rA, inst->rD, inst->rA);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MADDS0:
-        fprintf(out, "    ppc_ps_madds0(ctx, %u, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rC, inst->rB);
+        fprintf(out, "    { f64 s = dolrecomp_ps_force25(ctx->fpr[%u]); "
+                     "ctx->fpr[%u] = (f64)(f32)dolrecomp_ps_fmasingle(ctx->fpr[%u], s, ctx->fpr[%u]); "
+                     "ctx->ps1[%u] = (f64)(f32)dolrecomp_ps_fmasingle(ctx->ps1[%u], s, ctx->ps1[%u]); }\n",
+                inst->rC, inst->rD, inst->rA, inst->rB, inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MADDS1:
-        fprintf(out, "    ppc_ps_madds1(ctx, %u, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rC, inst->rB);
+        fprintf(out, "    { f64 s = dolrecomp_ps_force25(ctx->ps1[%u]); "
+                     "ctx->fpr[%u] = (f64)(f32)dolrecomp_ps_fmasingle(ctx->fpr[%u], s, ctx->fpr[%u]); "
+                     "ctx->ps1[%u] = (f64)(f32)dolrecomp_ps_fmasingle(ctx->ps1[%u], s, ctx->ps1[%u]); }\n",
+                inst->rC, inst->rD, inst->rA, inst->rB, inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
