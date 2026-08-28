@@ -1191,27 +1191,35 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
      * the full f64 register values, round the C multiplicand to 25 bits, fuse
      * multiply-adds, and round once to single precision. The cpu.c helpers
      * implement those semantics; naive inline f32 expressions do not. */
+    /* Inlined; see ppc_ps_*_op in cpu.c. Two separate stores are aliasing-safe
+     * because the ps0 and ps1 lanes live in different arrays, so a store to
+     * ctx->fpr[rD] cannot disturb a ctx->ps1[] source (and vice versa) and the
+     * RHS is evaluated before the store within each statement. */
     case PPC_OP_PS_ADD:
-        fprintf(out, "    ppc_ps_add_op(ctx, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] + ctx->fpr[%u]); "
+                     "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] + ctx->ps1[%u]);\n",
+                inst->rD, inst->rA, inst->rB, inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_SUB:
-        fprintf(out, "    ppc_ps_sub_op(ctx, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] - ctx->fpr[%u]); "
+                     "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] - ctx->ps1[%u]);\n",
+                inst->rD, inst->rA, inst->rB, inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_MUL:
-        fprintf(out, "    ppc_ps_mul_op(ctx, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rC);
+        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * dolrecomp_ps_force25(ctx->fpr[%u])); "
+                     "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] * dolrecomp_ps_force25(ctx->ps1[%u]));\n",
+                inst->rD, inst->rA, inst->rC, inst->rD, inst->rA, inst->rC);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_DIV:
-        fprintf(out, "    ppc_ps_div_op(ctx, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] / ctx->fpr[%u]); "
+                     "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] / ctx->ps1[%u]);\n",
+                inst->rD, inst->rA, inst->rB, inst->rD, inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
@@ -1230,15 +1238,24 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     case PPC_OP_PS_MADD:
     case PPC_OP_PS_MSUB:
     case PPC_OP_PS_NMADD:
-    case PPC_OP_PS_NMSUB:
-        fprintf(out, "    ppc_ps_madd_op(ctx, %u, %u, %u, %u, %s, %s);\n",
-                inst->rD, inst->rA, inst->rC, inst->rB,
-                (inst->op == PPC_OP_PS_MSUB || inst->op == PPC_OP_PS_NMSUB)
-                    ? "true" : "false",
-                (inst->op == PPC_OP_PS_NMADD || inst->op == PPC_OP_PS_NMSUB)
-                    ? "true" : "false");
+    case PPC_OP_PS_NMSUB: {
+        /* Inlined ppc_ps_madd_op: force the C multiplicand to 25 bits, fuse,
+         * round to single. Negated forms flip the sign unless the result is
+         * NaN. Locals hold both lanes so any rD/source aliasing is safe. */
+        int sub = (inst->op == PPC_OP_PS_MSUB || inst->op == PPC_OP_PS_NMSUB);
+        int neg = (inst->op == PPC_OP_PS_NMADD || inst->op == PPC_OP_PS_NMSUB);
+        fprintf(out,
+                "    { f64 p0 = dolrecomp_ps_fmasingle(ctx->fpr[%u], dolrecomp_ps_force25(ctx->fpr[%u]), %sctx->fpr[%u]); "
+                "f64 p1 = dolrecomp_ps_fmasingle(ctx->ps1[%u], dolrecomp_ps_force25(ctx->ps1[%u]), %sctx->ps1[%u]); ",
+                inst->rA, inst->rC, sub ? "-" : "", inst->rB,
+                inst->rA, inst->rC, sub ? "-" : "", inst->rB);
+        if (neg)
+            fprintf(out, "if (!isnan(p0)) p0 = -p0; if (!isnan(p1)) p1 = -p1; ");
+        fprintf(out, "ctx->fpr[%u] = (f64)(f32)p0; ctx->ps1[%u] = (f64)(f32)p1; }\n",
+                inst->rD, inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
+    }
 
     case PPC_OP_PS_NEG:
         fprintf(out, "    ctx->fpr[%u] = dolrecomp_ps_from_bits(dolrecomp_ps_to_bits(ctx->fpr[%u]) ^ 0x80000000u);\n",
@@ -1271,14 +1288,18 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_PS_SUM0:
-        fprintf(out, "    ppc_ps_sum0(ctx, %u, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rC, inst->rB);
+        /* ps0 = fpr[a] + ps1[b], ps1 = ps1[c]; locals for aliasing safety. */
+        fprintf(out, "    { f64 p0 = ctx->fpr[%u] + ctx->ps1[%u]; f64 p1 = ctx->ps1[%u]; "
+                     "ctx->fpr[%u] = (f64)(f32)p0; ctx->ps1[%u] = (f64)(f32)p1; }\n",
+                inst->rA, inst->rB, inst->rC, inst->rD, inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
     case PPC_OP_PS_SUM1:
-        fprintf(out, "    ppc_ps_sum1(ctx, %u, %u, %u, %u);\n",
-                inst->rD, inst->rA, inst->rC, inst->rB);
+        /* ps0 = fpr[c], ps1 = fpr[a] + ps1[b]; locals for aliasing safety. */
+        fprintf(out, "    { f64 p0 = ctx->fpr[%u]; f64 p1 = ctx->fpr[%u] + ctx->ps1[%u]; "
+                     "ctx->fpr[%u] = (f64)(f32)p0; ctx->ps1[%u] = (f64)(f32)p1; }\n",
+                inst->rC, inst->rA, inst->rB, inst->rD, inst->rD);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
