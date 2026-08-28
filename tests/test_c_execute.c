@@ -4,6 +4,8 @@
 
 void func_80004020(CPUState* ctx);
 void func_80004040(CPUState* ctx);
+void func_80004060(CPUState* ctx); /* bl 0x80004070; mtlr r4; blr */
+void func_80004070(CPUState* ctx); /* addi r3,r3,1; blr */
 
 int main(void) {
     CPUState cpu;
@@ -47,6 +49,58 @@ int main(void) {
                 cpu.pc, cpu.gpr[3], cpu.gpr[4], cpu.gpr[5], calls);
     }
 
+    /* Cross-chunk call: one host call into the caller chunk must run the
+     * callee and resume at the return address in place, so the caller's own
+     * `blr` is reached without a dispatcher round trip. */
+    cpu.pc = 0x80004060u;
+    cpu.lr = 0;
+    cpu.gpr[3] = 5;
+    cpu.gpr[4] = 0x81234564u; /* the caller's own return address (mtlr r4) */
+    cpu.downcount = 0;
+    cpu.direct_depth = 0;
+    func_80004060(&cpu);
+    int direct_call_ok = cpu.pc == 0x81234564u && cpu.gpr[3] == 6 &&
+                         cpu.direct_depth == 0;
+    if (!direct_call_ok) {
+        fprintf(stderr, "direct call pc=%08X r3=%u depth=%u\n", cpu.pc,
+                cpu.gpr[3], cpu.direct_depth);
+    }
+
+    /* Past the depth bound the call must fall back to the pre-change shape:
+     * return with the target in pc and the return address in lr, leaving the
+     * dispatcher to run the callee. */
+    cpu.pc = 0x80004060u;
+    cpu.lr = 0;
+    cpu.gpr[3] = 5;
+    cpu.gpr[4] = 0x81234564u;
+    cpu.downcount = 0;
+    cpu.direct_depth = 1000;
+    func_80004060(&cpu);
+    int depth_bound_ok = cpu.pc == 0x80004070u && cpu.lr == 0x80004064u &&
+                         cpu.gpr[3] == 5 && cpu.direct_depth == 1000;
+    if (!depth_bound_ok) {
+        fprintf(stderr, "depth bound pc=%08X lr=%08X r3=%u depth=%u\n", cpu.pc,
+                cpu.lr, cpu.gpr[3], cpu.direct_depth);
+    }
+    cpu.direct_depth = 0;
+
+    /* Parked in the idle loop the direct call must also stand down:
+     * dolrecomp_run_blocks tests the park threshold before every dispatch, so
+     * the callee must not run a block earlier than it used to. */
+    cpu.pc = 0x80004060u;
+    cpu.lr = 0;
+    cpu.gpr[3] = 5;
+    cpu.gpr[4] = 0x81234564u;
+    cpu.downcount = DOLRECOMP_IDLE_PARK_DOWNCOUNT;
+    func_80004060(&cpu);
+    int parked_ok = cpu.pc == 0x80004070u && cpu.lr == 0x80004064u &&
+                    cpu.gpr[3] == 5;
+    if (!parked_ok) {
+        fprintf(stderr, "parked pc=%08X lr=%08X r3=%u\n", cpu.pc, cpu.lr,
+                cpu.gpr[3]);
+    }
+
     cpu_free(&cpu);
-    return !(integer_ok && memory_ok);
+    return !(integer_ok && memory_ok && direct_call_ok && depth_bound_ok &&
+             parked_ok);
 }

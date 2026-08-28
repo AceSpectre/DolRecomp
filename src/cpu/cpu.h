@@ -131,6 +131,12 @@ struct CPUState {
     s64 downcount;
     PPCIdleHook idle_hook;   /* see the idle-park protocol above */
     u32 idle_hook_pc;
+    /* Nesting depth of dolrecomp_direct_call (a generated chunk calling the
+     * callee chunk of a cross-chunk `bl` in place instead of returning to the
+     * dispatcher). Host-side only: it bounds host stack use, is always zero
+     * between dispatcher round trips, and is therefore not serialized. It
+     * lands in idle_hook_pc's tail padding, so the struct does not grow. */
+    u32 direct_depth;
     PPCHostCall host_call;
 
     u32 locked_cache_tag[512];

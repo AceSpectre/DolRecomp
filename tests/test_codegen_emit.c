@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "../src/backend/dispatch.h"
 #include "../src/backend/emitter.h"
@@ -7,6 +8,93 @@
 #include "../src/frontend/decoder.h"
 
 #define BASE 0x80003000u
+
+/* Emits one function to a scratch file and checks the text for expected and
+ * forbidden fragments. Used for shape assertions that executing the code
+ * cannot make (which helper a call routes through, whether a label exists). */
+static int emit_shape_check(const char* what, const PPCInst* insts, u32 count,
+                            u32 addr, const char* const* expect, int expect_n,
+                            const char* const* reject, int reject_n) {
+    const char* path = "codegen_emit_check.tmp";
+    FILE* f = fopen(path, "wb+");
+    if (!f) {
+        perror(path);
+        return 0;
+    }
+    if (!emit_function(f, insts, count, addr)) {
+        fclose(f);
+        remove(path);
+        return 0;
+    }
+    long size = ftell(f);
+    char* text = (char*)malloc((size_t)size + 1u);
+    if (!text) {
+        fclose(f);
+        remove(path);
+        return 0;
+    }
+    rewind(f);
+    size_t got = fread(text, 1, (size_t)size, f);
+    text[got] = '\0';
+    fclose(f);
+    remove(path);
+
+    int ok = 1;
+    for (int i = 0; i < expect_n; i++) {
+        if (!strstr(text, expect[i])) {
+            fprintf(stderr, "%s: missing expected fragment: %s\n", what,
+                    expect[i]);
+            ok = 0;
+        }
+    }
+    for (int i = 0; i < reject_n; i++) {
+        if (strstr(text, reject[i])) {
+            fprintf(stderr, "%s: unexpected fragment present: %s\n", what,
+                    reject[i]);
+            ok = 0;
+        }
+    }
+    if (!ok)
+        fputs(text, stderr);
+    free(text);
+    return ok;
+}
+
+/* Cross-chunk `bl` must call the target through dolrecomp_direct_call and
+ * resume inline at the return address instead of returning to the dispatcher.
+ * Unconditional form at BASE+0x1060, conditional form at BASE+0x1080; both
+ * target the leaf at BASE+0x1070. */
+static int check_direct_call_shape(void) {
+    PPCInst cross_call[3];
+    cross_call[0] = ppc_decode(0x48000011u, BASE + 0x1060); /* bl  +0x10 */
+    cross_call[1] = ppc_decode(0x7C8803A6u, BASE + 0x1064); /* mtlr r4   */
+    cross_call[2] = ppc_decode(0x4E800020u, BASE + 0x1068); /* blr       */
+
+    PPCInst cond_call[2];
+    cond_call[0] = ppc_decode(0x4182FFF1u, BASE + 0x1080); /* beql -0x10 */
+    cond_call[1] = ppc_decode(0x4E800020u, BASE + 0x1084); /* blr        */
+
+    static const char* const expect_uncond[] = {
+        "ctx->lr = 0x80004064u;",
+        "dolrecomp_direct_call(ctx, 0x80004070u)",
+        "goto label_80004064;",
+    };
+    static const char* const reject_uncond[] = {
+        /* the old shape: hand the target back to the dispatcher */
+        "ctx->pc = 0x80004070u;\n            return;",
+    };
+    static const char* const expect_cond[] = {
+        "ctx->lr = 0x80004084u;",
+        "dolrecomp_direct_call(ctx, 0x80004070u)",
+        "goto label_80004084;",
+    };
+
+    int ok = emit_shape_check("cross-chunk bl", cross_call, 3, BASE + 0x1060,
+                              expect_uncond, 3, reject_uncond, 1);
+    ok &= emit_shape_check("cross-chunk conditional bl", cond_call, 2,
+                           BASE + 0x1080, expect_cond, 3, NULL, 0);
+    return ok;
+}
 
 static const u32 opcode_raws[] = {
     0x1C64FFF9, 0x20850001, 0x38610010, 0x3084FFFF,
@@ -107,7 +195,37 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (!check_direct_call_shape()) {
+        free(insts);
+        if (out != stdout) fclose(out);
+        return 1;
+    }
+
+    /* Chunk prototypes and the dispatch helpers come first, as they do in a
+     * real run: the generator puts both in the shared header that every chunk
+     * includes, so a chunk body may call dolrecomp_direct_call. */
+    FunctionList funcs = {0};
+    if (!function_list_add(&funcs, BASE, BASE + (u32)count * 4u) ||
+        !function_list_add(&funcs, BASE + 0x1000, BASE + 0x100C) ||
+        !function_list_add(&funcs, BASE + 0x100C, BASE + 0x1018) ||
+        !function_list_add(&funcs, BASE + 0x1018, BASE + 0x101C) ||
+        !function_list_add(&funcs, BASE + 0x1020, BASE + 0x1030) ||
+        !function_list_add(&funcs, BASE + 0x1030, BASE + 0x1040) ||
+        !function_list_add(&funcs, BASE + 0x1040, BASE + 0x1058) ||
+        !function_list_add(&funcs, BASE + 0x1060, BASE + 0x106C) ||
+        !function_list_add(&funcs, BASE + 0x1070, BASE + 0x1078)) {
+        function_list_free(&funcs);
+        free(insts);
+        if (out != stdout) fclose(out);
+        return 1;
+    }
+
     emit_header(out);
+    for (u32 i = 0; i < funcs.count; i++)
+        emit_chunk_prototype(out, funcs.ranges[i].start);
+    emit_dispatch_helpers(out, &funcs, BASE);
+    function_list_free(&funcs);
+
     if (!emit_function(out, insts, (u32)count, BASE))
         return 1;
 
@@ -155,21 +273,20 @@ int main(int argc, char** argv) {
     if (!emit_function(out, memory_loop, 6, BASE + 0x1040))
         return 1;
 
-    FunctionList funcs = {0};
-    if (!function_list_add(&funcs, BASE, BASE + (u32)count * 4u) ||
-        !function_list_add(&funcs, BASE + 0x1000, BASE + 0x100C) ||
-        !function_list_add(&funcs, BASE + 0x100C, BASE + 0x1018) ||
-        !function_list_add(&funcs, BASE + 0x1018, BASE + 0x101C) ||
-        !function_list_add(&funcs, BASE + 0x1020, BASE + 0x1030) ||
-        !function_list_add(&funcs, BASE + 0x1030, BASE + 0x1040) ||
-        !function_list_add(&funcs, BASE + 0x1040, BASE + 0x1058)) {
-        function_list_free(&funcs);
-        free(insts);
-        if (out != stdout) fclose(out);
+    /* Cross-chunk call pair: the caller's `bl` leaves its own range, so it
+     * exercises the direct-call path; the callee returns with `blr`. */
+    PPCInst cross_call[3];
+    cross_call[0] = ppc_decode(0x48000011u, BASE + 0x1060); /* bl +0x10  */
+    cross_call[1] = ppc_decode(0x7C8803A6u, BASE + 0x1064); /* mtlr r4   */
+    cross_call[2] = ppc_decode(0x4E800020u, BASE + 0x1068); /* blr       */
+    if (!emit_function(out, cross_call, 3, BASE + 0x1060))
         return 1;
-    }
-    emit_dispatch_helpers(out, &funcs, BASE);
-    function_list_free(&funcs);
+
+    PPCInst cross_callee[2];
+    cross_callee[0] = ppc_decode(0x38630001u, BASE + 0x1070); /* addi r3,r3,1 */
+    cross_callee[1] = ppc_decode(0x4E800020u, BASE + 0x1074); /* blr          */
+    if (!emit_function(out, cross_callee, 2, BASE + 0x1070))
+        return 1;
 
     emit_footer(out);
 

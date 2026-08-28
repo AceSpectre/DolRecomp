@@ -308,11 +308,13 @@ static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
 }
 
 static void emit_direct_branch(FILE* out, const PPCInst* inst,
-                               bool local_target, bool direct_backedge) {
+                               bool local_target, bool direct_backedge,
+                               u32 func_start, u32 func_end) {
     bool local_backward = local_target && inst->branch_target <= inst->address;
 
     if (inst->lk) {
-        fprintf(out, "            ctx->lr = 0x%08Xu;\n", inst->address + 4);
+        u32 continuation = inst->address + 4u;
+        fprintf(out, "            ctx->lr = 0x%08Xu;\n", continuation);
         if (local_target) {
             if (local_backward) {
                 fprintf(out, "            if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) {\n");
@@ -321,6 +323,24 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst,
                 fprintf(out, "            }\n");
             }
             fprintf(out, "            goto label_%08X;\n", inst->branch_target);
+        } else if (continuation >= func_start && continuation < func_end) {
+            /* Cross-chunk call: run the callee here rather than returning the
+             * target to the dispatcher, then resume at the return address in
+             * place. The guard repeats, and only repeats, what the dispatcher
+             * checks between blocks: the call resolved, no exception is
+             * pending, control really came back to this call's continuation
+             * (an HLE'd target leaves pc at lr, a `blr` in the callee sets it),
+             * and the guest is not parked in its idle loop. Any other outcome
+             * returns with ctx->pc already holding the right address, exactly
+             * as the old `ctx->pc = target; return;` shape did. */
+            fprintf(out, "            if (dolrecomp_direct_call(ctx, 0x%08Xu) &&\n",
+                    inst->branch_target);
+            fprintf(out, "                !ctx->exception &&\n");
+            fprintf(out, "                ctx->pc == 0x%08Xu &&\n", continuation);
+            fprintf(out, "                ctx->downcount > DOLRECOMP_IDLE_PARK_THRESHOLD) {\n");
+            fprintf(out, "                goto label_%08X;\n", continuation);
+            fprintf(out, "            }\n");
+            fprintf(out, "            return;\n");
         } else {
             fprintf(out, "            ctx->pc = 0x%08Xu;\n", inst->branch_target);
             fprintf(out, "            return;\n");
@@ -1617,7 +1637,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, "    {\n");
         emit_direct_branch(out, inst,
                            branch_target_is_local(func_start, func_end, inst->branch_target),
-                           direct_backedge);
+                           direct_backedge, func_start, func_end);
         fprintf(out, "    }\n");
         break;
 
@@ -1627,7 +1647,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         fprintf(out, "        if (ctr_ok && cr_ok) {\n");
         emit_direct_branch(out, inst,
                            branch_target_is_local(func_start, func_end, inst->branch_target),
-                           direct_backedge);
+                           direct_backedge, func_start, func_end);
         fprintf(out, "        }\n");
         fprintf(out, "    }\n");
         break;
