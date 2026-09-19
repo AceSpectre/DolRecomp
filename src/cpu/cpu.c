@@ -8,6 +8,129 @@
 #include <math.h>
 #include <fenv.h>
 
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#define DOLRECOMP_FLAT_SIZE ((SIZE_T)0x100000000ull)
+
+typedef PVOID (WINAPI *DolRecompVirtualAlloc2)(HANDLE, PVOID, SIZE_T,
+                                               ULONG, ULONG, void*, ULONG);
+typedef PVOID (WINAPI *DolRecompMapViewOfFile3)(HANDLE, HANDLE, PVOID,
+                                                ULONG64, SIZE_T, ULONG,
+                                                ULONG, void*, ULONG);
+typedef BOOL (WINAPI *DolRecompUnmapViewOfFile2)(HANDLE, PVOID, ULONG);
+
+static const u32 flat_alias_addresses[] = {
+    0x00000000u, 0x10000000u, GC_RAM_BASE, WII_MEM2_BASE,
+    GC_RAM_UNCACHED, WII_MEM2_UNCACHED,
+};
+
+static const u32 flat_alias_sizes[] = {
+    GC_MAIN_RAM_SIZE, WII_MEM2_SIZE, GC_MAIN_RAM_SIZE, WII_MEM2_SIZE,
+    GC_MAIN_RAM_SIZE, WII_MEM2_SIZE,
+};
+
+static DolRecompUnmapViewOfFile2 flat_unmap_api(void) {
+    HMODULE kernel = GetModuleHandleW(L"KernelBase.dll");
+    return kernel ? (DolRecompUnmapViewOfFile2)GetProcAddress(
+                        kernel, "UnmapViewOfFile2") : NULL;
+}
+
+static void flat_memory_release(u8* base, const bool* mapped) {
+    if (!base)
+        return;
+
+    DolRecompUnmapViewOfFile2 unmap2 = flat_unmap_api();
+    if (unmap2) {
+        for (u32 i = 0; i < sizeof(flat_alias_addresses) /
+                                sizeof(flat_alias_addresses[0]); i++) {
+            if (mapped == NULL || mapped[i])
+                unmap2(GetCurrentProcess(), base + flat_alias_addresses[i],
+                       MEM_PRESERVE_PLACEHOLDER);
+        }
+        VirtualFree(base, DOLRECOMP_FLAT_SIZE,
+                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+        VirtualFree(base, 0, MEM_RELEASE);
+    }
+}
+
+static bool flat_memory_init(CPUState* cpu) {
+    HMODULE kernel = GetModuleHandleW(L"KernelBase.dll");
+    DolRecompVirtualAlloc2 alloc2 = kernel ?
+        (DolRecompVirtualAlloc2)GetProcAddress(kernel, "VirtualAlloc2") : NULL;
+    DolRecompMapViewOfFile3 map3 = kernel ?
+        (DolRecompMapViewOfFile3)GetProcAddress(kernel, "MapViewOfFile3") : NULL;
+    DolRecompUnmapViewOfFile2 unmap2 = flat_unmap_api();
+    if (!alloc2 || !map3 || !unmap2) {
+        fprintf(stderr, "error: guarded flat memory requires Windows placeholder APIs\n");
+        return false;
+    }
+
+    u8* base = (u8*)alloc2(GetCurrentProcess(), NULL, DOLRECOMP_FLAT_SIZE,
+                           MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                           PAGE_NOACCESS, NULL, 0);
+    if (!base) {
+        fprintf(stderr, "error: failed to reserve guarded 4 GiB guest range (%lu)\n",
+                GetLastError());
+        return false;
+    }
+
+    HANDLE backing[2] = {
+        CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+                           PAGE_READWRITE | SEC_RESERVE, 0,
+                           GC_MAIN_RAM_SIZE, NULL),
+        CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+                           PAGE_READWRITE | SEC_RESERVE, 0,
+                           WII_MEM2_SIZE, NULL),
+    };
+    bool mapped[sizeof(flat_alias_addresses) / sizeof(flat_alias_addresses[0])] = {0};
+    bool ok = backing[0] != NULL && backing[1] != NULL;
+    u64 previous = 0;
+
+    for (u32 i = 0; ok && i < sizeof(flat_alias_addresses) /
+                                   sizeof(flat_alias_addresses[0]); i++) {
+        u32 address = flat_alias_addresses[i];
+        u32 size = flat_alias_sizes[i];
+        if ((u64)address > previous &&
+            !VirtualFree(base + (SIZE_T)previous,
+                         (SIZE_T)((u64)address - previous),
+                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            ok = false;
+            break;
+        }
+        if (!VirtualFree(base + address, size,
+                         MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) ||
+            !map3(backing[i & 1u], GetCurrentProcess(), base + address, 0,
+                  size, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0)) {
+            ok = false;
+            break;
+        }
+        mapped[i] = true;
+        if (!VirtualAlloc(base + address, size, MEM_COMMIT, PAGE_READWRITE)) {
+            ok = false;
+            break;
+        }
+        previous = (u64)address + size;
+    }
+
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (backing[0]) CloseHandle(backing[0]);
+    if (backing[1]) CloseHandle(backing[1]);
+    if (!ok) {
+        flat_memory_release(base, mapped);
+        fprintf(stderr, "error: failed to map guarded guest RAM aliases (%lu)\n",
+                error);
+        return false;
+    }
+
+    cpu->flat_base = base;
+    cpu->ram = base + GC_RAM_BASE;
+    cpu->ram_size = GC_MAIN_RAM_SIZE;
+    return true;
+}
+#endif
+
 PPCMemWriteJournal g_mem_write_journal = NULL;
 void* g_mem_write_journal_user = NULL;
 
@@ -48,12 +171,17 @@ static void journal_write(CPUState* cpu, const u8* host, u32 size) {
 bool cpu_init(CPUState* cpu) {
     memset(cpu, 0, sizeof(*cpu));
 
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (!flat_memory_init(cpu))
+        return false;
+#else
     cpu->ram_size = GC_MAIN_RAM_SIZE;
     cpu->ram = (u8*)calloc(1, cpu->ram_size);
     if (!cpu->ram) {
         fprintf(stderr, "error: failed to allocate %u bytes for RAM\n", cpu->ram_size);
         return false;
     }
+#endif
 
     cpu->spr[287] = PPC_GEKKO_PVR;
 
@@ -61,6 +189,20 @@ bool cpu_init(CPUState* cpu) {
 }
 
 bool cpu_alloc_mem2(CPUState* cpu, u32 size) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    cpu->mem2 = NULL;
+    cpu->mem2_size = 0;
+    if (size == 0)
+        return true;
+    if (!cpu->flat_base || size > WII_MEM2_SIZE) {
+        fprintf(stderr, "error: invalid flat MEM2 allocation of %u bytes\n", size);
+        return false;
+    }
+    cpu->mem2 = cpu->flat_base + WII_MEM2_BASE;
+    memset(cpu->mem2, 0, size);
+    cpu->mem2_size = size;
+    return true;
+#else
     free(cpu->mem2);
     cpu->mem2 = NULL;
     cpu->mem2_size = 0;
@@ -76,9 +218,20 @@ bool cpu_alloc_mem2(CPUState* cpu, u32 size) {
 
     cpu->mem2_size = size;
     return true;
+#endif
 }
 
 void cpu_free(CPUState* cpu) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (cpu->flat_base) {
+        flat_memory_release(cpu->flat_base, NULL);
+        cpu->flat_base = NULL;
+        cpu->ram = NULL;
+        cpu->ram_size = 0;
+        cpu->mem2 = NULL;
+        cpu->mem2_size = 0;
+    }
+#else
     if (cpu->ram) {
         free(cpu->ram);
         cpu->ram = NULL;
@@ -88,11 +241,15 @@ void cpu_free(CPUState* cpu) {
         cpu->mem2 = NULL;
         cpu->mem2_size = 0;
     }
+#endif
 }
 
 void cpu_reset(CPUState* cpu) {
     u8* ram = cpu->ram;
     u32 ram_size = cpu->ram_size;
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    u8* flat_base = cpu->flat_base;
+#endif
     u8* mem2 = cpu->mem2;
     u32 mem2_size = cpu->mem2_size;
     PPCExternalRead external_read = cpu->external_read;
@@ -107,6 +264,9 @@ void cpu_reset(CPUState* cpu) {
     memset(cpu, 0, sizeof(*cpu));
     cpu->ram = ram;
     cpu->ram_size = ram_size;
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    cpu->flat_base = flat_base;
+#endif
     cpu->mem2 = mem2;
     cpu->mem2_size = mem2_size;
     cpu->external_read = external_read;

@@ -336,7 +336,8 @@ int main(int argc, char** argv) {
         !function_list_add(&funcs, BASE + 0x1040, BASE + 0x1058) ||
         !function_list_add(&funcs, BASE + 0x1060, BASE + 0x106C) ||
         !function_list_add(&funcs, BASE + 0x1070, BASE + 0x1078) ||
-        !function_list_add(&funcs, BASE + 0x10C0, BASE + 0x10D4)) {
+        !function_list_add(&funcs, BASE + 0x10C0, BASE + 0x10D4) ||
+        !function_list_add(&funcs, BASE + 0x1100, BASE + 0x112C)) {
         function_list_free(&funcs);
         free(insts);
         if (out != stdout) fclose(out);
@@ -419,6 +420,27 @@ int main(int argc, char** argv) {
         midblock[i] = ppc_decode(0x38630001u, BASE + 0x10C0 + i * 4u);
     midblock[4] = ppc_decode(0x4E800020u, BASE + 0x10D0); /* blr */
     if (!emit_function(out, midblock, 5, BASE + 0x10C0))
+        return 1;
+
+    /* Each scalar-single operation overwrites BOTH paired lanes. Consume the
+     * second lane immediately, as the game's matrix builders do. */
+    const u32 singles[] = {
+        0xEC21102Au, /* fadds f1,f1,f2 */
+        0x10610CE0u, /* ps_merge11 f3,f1,f1 */
+        0xEC211028u, /* fsubs f1,f1,f2 */
+        0x10810CE0u, /* ps_merge11 f4,f1,f1 */
+        0xEC2100B2u, /* fmuls f1,f1,f2 */
+        0x10A10CE0u, /* ps_merge11 f5,f1,f1 */
+        0xEC211024u, /* fdivs f1,f1,f2 */
+        0x10C10CE0u, /* ps_merge11 f6,f1,f1 */
+        0xFC203818u, /* frsp f1,f7 */
+        0x11010CE0u, /* ps_merge11 f8,f1,f1 */
+        0x4E800020u
+    };
+    PPCInst scalar_pair[sizeof(singles) / sizeof(singles[0])];
+    for (u32 i = 0; i < sizeof(singles) / sizeof(singles[0]); ++i)
+        scalar_pair[i] = ppc_decode(singles[i], BASE + 0x1100 + i * 4);
+    if (!emit_function(out, scalar_pair, 11, BASE + 0x1100))
         return 1;
 
     emit_footer(out);

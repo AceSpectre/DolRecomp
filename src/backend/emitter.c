@@ -1035,23 +1035,25 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_FADDS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] + ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
+        /* Scalar single-precision results fill both paired lanes. Matrix
+         * code can consume PS1 without an intervening paired load. */
+        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] + ctx->fpr[%u]);\n",
+                inst->rD, inst->rD, inst->rA, inst->rB);
         break;
 
     case PPC_OP_FSUBS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] - ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] - ctx->fpr[%u]);\n",
+                inst->rD, inst->rD, inst->rA, inst->rB);
         break;
 
     case PPC_OP_FMULS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rC);
+        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] * dolrecomp_ps_force25(ctx->fpr[%u]));\n",
+                inst->rD, inst->rD, inst->rA, inst->rC);
         break;
 
     case PPC_OP_FDIVS:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] / ctx->fpr[%u]);\n",
-                inst->rD, inst->rA, inst->rB);
+        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] / ctx->fpr[%u]);\n",
+                inst->rD, inst->rD, inst->rA, inst->rB);
         break;
 
     case PPC_OP_FRES:
@@ -1145,7 +1147,7 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         break;
 
     case PPC_OP_FRSP:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)ctx->fpr[%u];\n", inst->rD, inst->rB);
+        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)ctx->fpr[%u];\n", inst->rD, inst->rD, inst->rB);
         break;
 
     case PPC_OP_FSEL:

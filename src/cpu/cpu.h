@@ -120,6 +120,12 @@ struct CPUState {
      * from the register file. */
     u8* ram;
     u32 ram_size;
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    /* Base of a guarded 4 GiB host reservation whose offsets are guest
+     * effective addresses. Only actual RAM aliases are mapped into it; gaps
+     * stay PAGE_NOACCESS and all non-RAM accesses retain the slow path. */
+    u8* flat_base;
+#endif
     union {
         u8* exram;
         u8* mem2;
@@ -137,6 +143,14 @@ struct CPUState {
      * between dispatcher round trips, and is therefore not serialized. It
      * lands in idle_hook_pc's tail padding, so the struct does not grow. */
     u32 direct_depth;
+#ifdef DOLRECOMP_NATIVE_SUBTREE_BLOCK_ACCOUNTING
+    /* Experimental coarse replacements complete several dispatcher-visible
+     * guest blocks in one host call. run_blocks publishes its remaining
+     * budget here; a replacement reports the exact original block charge so
+     * host pump/checkpoint boundaries do not move. Host-only, like depth. */
+    u32 dispatch_budget;
+    u32 dispatch_charge;
+#endif
     PPCHostCall host_call;
 
     u32 locked_cache_tag[512];
@@ -225,107 +239,173 @@ extern bool (*dolrecomp_wgpipe_write)(CPUState* cpu, u32 ea, u64 value, u8 size)
     ((cpu)->mem2 && \
      (u32)((addr) - WII_MEM2_BASE) <= (cpu)->mem2_size - (size))
 
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+#define DOLRECOMP_FLAT_FAST_HIT(cpu, addr, size) \
+    (DOLRECOMP_MEM_FAST_HIT((cpu), (addr), (size)) || \
+     DOLRECOMP_MEM2_FAST_HIT((cpu), (addr), (size)))
+#endif
+
 static inline u32 mem_read32(CPUState* cpu, u32 addr) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (DOLRECOMP_FLAT_FAST_HIT(cpu, addr, 4u))
+        return read_be32(cpu->flat_base + addr);
+#else
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 4u))
         return read_be32(cpu->ram + (addr - GC_RAM_BASE));
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 4u))
         return read_be32(cpu->mem2 + (addr - WII_MEM2_BASE));
+#endif
     return mem_read32_slow(cpu, addr);
 }
 
 static inline void mem_write32(CPUState* cpu, u32 addr, u32 value) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (DOLRECOMP_FLAT_FAST_HIT(cpu, addr, 4u) && !cpu->journal_active &&
+        !cpu->reserve_valid) {
+        write_be32(cpu->flat_base + addr, value);
+        return;
+    }
+#else
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 4u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be32(cpu->ram + (addr - GC_RAM_BASE), value);
         return;
     }
+#endif
     if (dolrecomp_wgpipe_write && DOLRECOMP_WGPIPE_HIT(addr)) {
         dolrecomp_wgpipe_write(cpu, addr, value, 4u);
         return;
     }
+#ifndef DOLRECOMP_FLAT_GUEST_MEMORY
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 4u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be32(cpu->mem2 + (addr - WII_MEM2_BASE), value);
         return;
     }
+#endif
     mem_write32_slow(cpu, addr, value);
 }
 
 static inline u16 mem_read16(CPUState* cpu, u32 addr) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (DOLRECOMP_FLAT_FAST_HIT(cpu, addr, 2u))
+        return read_be16(cpu->flat_base + addr);
+#else
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 2u))
         return read_be16(cpu->ram + (addr - GC_RAM_BASE));
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 2u))
         return read_be16(cpu->mem2 + (addr - WII_MEM2_BASE));
+#endif
     return mem_read16_slow(cpu, addr);
 }
 
 static inline void mem_write16(CPUState* cpu, u32 addr, u16 value) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (DOLRECOMP_FLAT_FAST_HIT(cpu, addr, 2u) && !cpu->journal_active &&
+        !cpu->reserve_valid) {
+        write_be16(cpu->flat_base + addr, value);
+        return;
+    }
+#else
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 2u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be16(cpu->ram + (addr - GC_RAM_BASE), value);
         return;
     }
+#endif
     if (dolrecomp_wgpipe_write && DOLRECOMP_WGPIPE_HIT(addr)) {
         dolrecomp_wgpipe_write(cpu, addr, value, 2u);
         return;
     }
+#ifndef DOLRECOMP_FLAT_GUEST_MEMORY
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 2u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be16(cpu->mem2 + (addr - WII_MEM2_BASE), value);
         return;
     }
+#endif
     mem_write16_slow(cpu, addr, value);
 }
 
 static inline u8 mem_read8(CPUState* cpu, u32 addr) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (DOLRECOMP_FLAT_FAST_HIT(cpu, addr, 1u))
+        return cpu->flat_base[addr];
+#else
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 1u))
         return cpu->ram[addr - GC_RAM_BASE];
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 1u))
         return cpu->mem2[addr - WII_MEM2_BASE];
+#endif
     return mem_read8_slow(cpu, addr);
 }
 
 static inline void mem_write8(CPUState* cpu, u32 addr, u8 value) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (DOLRECOMP_FLAT_FAST_HIT(cpu, addr, 1u) && !cpu->journal_active &&
+        !cpu->reserve_valid) {
+        cpu->flat_base[addr] = value;
+        return;
+    }
+#else
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 1u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         cpu->ram[addr - GC_RAM_BASE] = value;
         return;
     }
+#endif
     if (dolrecomp_wgpipe_write && DOLRECOMP_WGPIPE_HIT(addr)) {
         dolrecomp_wgpipe_write(cpu, addr, value, 1u);
         return;
     }
+#ifndef DOLRECOMP_FLAT_GUEST_MEMORY
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 1u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         cpu->mem2[addr - WII_MEM2_BASE] = value;
         return;
     }
+#endif
     mem_write8_slow(cpu, addr, value);
 }
 
 static inline u64 mem_read64(CPUState* cpu, u32 addr) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (DOLRECOMP_FLAT_FAST_HIT(cpu, addr, 8u))
+        return read_be64(cpu->flat_base + addr);
+#else
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 8u))
         return read_be64(cpu->ram + (addr - GC_RAM_BASE));
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 8u))
         return read_be64(cpu->mem2 + (addr - WII_MEM2_BASE));
+#endif
     return mem_read64_slow(cpu, addr);
 }
 
 static inline void mem_write64(CPUState* cpu, u32 addr, u64 value) {
+#ifdef DOLRECOMP_FLAT_GUEST_MEMORY
+    if (DOLRECOMP_FLAT_FAST_HIT(cpu, addr, 8u) && !cpu->journal_active &&
+        !cpu->reserve_valid) {
+        write_be64(cpu->flat_base + addr, value);
+        return;
+    }
+#else
     if (DOLRECOMP_MEM_FAST_HIT(cpu, addr, 8u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be64(cpu->ram + (addr - GC_RAM_BASE), value);
         return;
     }
+#endif
     if (dolrecomp_wgpipe_write && DOLRECOMP_WGPIPE_HIT(addr)) {
         dolrecomp_wgpipe_write(cpu, addr, value, 8u);
         return;
     }
+#ifndef DOLRECOMP_FLAT_GUEST_MEMORY
     if (DOLRECOMP_MEM2_FAST_HIT(cpu, addr, 8u) && !cpu->journal_active &&
         !cpu->reserve_valid) {
         write_be64(cpu->mem2 + (addr - WII_MEM2_BASE), value);
         return;
     }
+#endif
     mem_write64_slow(cpu, addr, value);
 }
 

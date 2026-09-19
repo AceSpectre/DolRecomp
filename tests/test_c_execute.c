@@ -7,6 +7,7 @@ void func_80004040(CPUState* ctx);
 void func_80004060(CPUState* ctx); /* bl 0x80004070; mtlr r4; blr */
 void func_80004070(CPUState* ctx); /* addi r3,r3,1; blr */
 void func_800040C0(CPUState* ctx); /* addi r3,r3,1 x4; blr */
+void func_80004100(CPUState* ctx); /* scalar-single -> paired consumers */
 
 int main(void) {
     CPUState cpu;
@@ -135,7 +136,23 @@ int main(void) {
                 cpu.gpr[3], (long long)cpu.downcount);
     }
 
+    cpu.pc = 0x80004100u;
+    cpu.msr = 0x2000;
+    cpu.downcount = 100;
+    cpu.fpr[1] = 6.0;
+    cpu.ps1[1] = -999.0; /* Must never reach a paired consumer. */
+    cpu.fpr[2] = 2.0;
+    cpu.fpr[7] = 1.0 + 0x1p-25;
+    func_80004100(&cpu);
+    const double expected[] = {8.0, 6.0, 12.0, 6.0};
+    int scalar_pair_ok = cpu.pc == cpu.lr;
+    for (int i = 0; i < 4; ++i)
+        scalar_pair_ok &= cpu.fpr[3+i] == expected[i] && cpu.ps1[3+i] == expected[i];
+    scalar_pair_ok &= cpu.fpr[8] == 1.0 && cpu.ps1[8] == 1.0;
+    if (!scalar_pair_ok)
+        fprintf(stderr, "scalar-single paired consumers: %g %g %g %g %g\n",
+                cpu.fpr[3], cpu.fpr[4], cpu.fpr[5], cpu.fpr[6], cpu.fpr[8]);
     cpu_free(&cpu);
     return !(integer_ok && memory_ok && direct_call_ok && depth_bound_ok &&
-             parked_ok && midblock_ok && leader_entry_ok);
+             parked_ok && midblock_ok && leader_entry_ok && scalar_pair_ok);
 }
