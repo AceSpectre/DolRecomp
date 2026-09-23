@@ -158,12 +158,12 @@ static void journal_write(CPUState* cpu, const u8* host, u32 size) {
                             g_mem_write_journal_user);
 }
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
 #include <xmmintrin.h>
 #else
 #include <stdatomic.h>
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
 #endif
 #endif
@@ -1569,11 +1569,9 @@ bool ppc_fma(CPUState* cpu, f64 a, f64 c, f64 b, bool single,
 }
 
 void ppc_memory_fence(void) {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     _ReadWriteBarrier();
-#if defined(_M_IX86) || defined(_M_X64)
     _mm_mfence();
-#endif
     _ReadWriteBarrier();
 #else
     atomic_thread_fence(memory_order_seq_cst);
