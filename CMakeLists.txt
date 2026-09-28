@@ -128,6 +128,7 @@ target_link_libraries(dr_analysis PUBLIC dr_frontend)
 
 add_library(dr_backend STATIC
     src/backend/c_cfg.c
+    src/backend/fn_rewrite.c
     src/backend/emitter.c
     src/backend/dispatch.c
     src/backend/codegen.c
@@ -202,6 +203,10 @@ add_test(NAME jumptables COMMAND test_jumptables)
 add_executable(test_dispatch tests/test_dispatch.c)
 target_link_libraries(test_dispatch PRIVATE dr_backend)
 add_test(NAME dispatch COMMAND test_dispatch)
+
+add_executable(test_fn_rewrite tests/test_fn_rewrite.c)
+target_link_libraries(test_fn_rewrite PRIVATE dr_backend)
+add_test(NAME fn_rewrite COMMAND test_fn_rewrite)
 
 add_executable(test_c_cfg tests/test_c_cfg.c)
 target_link_libraries(test_c_cfg PRIVATE dr_backend)
