@@ -23,6 +23,13 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr);
 // emit a single instruction as C code
 void emit_instruction(FILE* out, const PPCInst* inst);
 
+// emit one instruction with explicit block context (function-mode codegen):
+// branches to [func_start, func_end) are local; bclr routes through
+// return_dispatch_<func_start> when route_local_returns is set
+void emit_instruction_ex(FILE* out, const PPCInst* inst, u32 func_start,
+                         u32 func_end, bool direct_backedge,
+                         bool route_local_returns, bool emit_fp_guard);
+
 // emit the boilerplate footer
 void emit_footer(FILE* out);
 

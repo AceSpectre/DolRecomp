@@ -1877,6 +1877,14 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
     fprintf(out, "\n");
 }
 
+void emit_instruction_ex(FILE* out, const PPCInst* inst, u32 func_start,
+                         u32 func_end, bool direct_backedge,
+                         bool route_local_returns, bool emit_fp_guard) {
+    emit_instruction_with_range(out, inst, func_start, func_end,
+                                direct_backedge, route_local_returns,
+                                emit_fp_guard, false);
+}
+
 void emit_instruction(FILE* out, const PPCInst* inst) {
     /* No block context here (standalone emit, used by tests): always guard. */
     emit_instruction_with_range(out, inst, 0, (u32)-1, false, false, true, false);

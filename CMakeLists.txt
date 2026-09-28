@@ -130,6 +130,7 @@ add_library(dr_backend STATIC
     src/backend/c_cfg.c
     src/backend/fn_rewrite.c
     src/backend/fn_select.c
+    src/backend/fn_emitter.c
     src/backend/emitter.c
     src/backend/dispatch.c
     src/backend/codegen.c
@@ -250,6 +251,22 @@ add_executable(test_c_execute
 )
 target_link_libraries(test_c_execute PRIVATE dr_cpu)
 add_test(NAME c_execute COMMAND test_c_execute)
+
+add_executable(test_fn_codegen_emit tests/test_fn_codegen_emit.c)
+target_link_libraries(test_fn_codegen_emit PRIVATE dr_backend)
+set(DOLRECOMP_FN_TEST_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/fn_execute_generated.c)
+add_custom_command(
+    OUTPUT ${DOLRECOMP_FN_TEST_SOURCE}
+    COMMAND test_fn_codegen_emit ${DOLRECOMP_FN_TEST_SOURCE}
+    DEPENDS test_fn_codegen_emit
+    VERBATIM
+)
+add_executable(test_fn_execute
+    tests/test_fn_execute.c
+    ${DOLRECOMP_FN_TEST_SOURCE}
+)
+target_link_libraries(test_fn_execute PRIVATE dr_cpu)
+add_test(NAME fn_execute COMMAND test_fn_execute)
 
 add_executable(test_dolir tests/test_dolir.c)
 target_link_libraries(test_dolir PRIVATE dr_ir)
