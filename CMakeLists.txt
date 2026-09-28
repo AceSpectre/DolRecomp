@@ -148,6 +148,7 @@ add_library(dr_app STATIC
     src/app/setup.c
     src/app/paths.c
     src/app/pipeline.c
+    src/app/fn_mode.c
 )
 target_include_directories(dr_app PUBLIC ${DOLRECOMP_SRC})
 target_link_libraries(dr_app PUBLIC dr_backend dr_analysis dr_frontend dr_platform dr_ir)

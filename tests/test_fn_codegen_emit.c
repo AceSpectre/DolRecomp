@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "../src/backend/c_cfg.h"
 #include "../src/backend/dispatch.h"
 #include "../src/backend/emitter.h"
 #include "../src/backend/fn_emitter.h"
@@ -27,6 +28,9 @@ int main(int argc, char** argv) {
         if (!function_list_add(&funcs, fn_programs[p].addr,
                                fn_programs[p].addr + fn_programs[p].count * 4u))
             return 1;
+    if (!function_list_add(&funcs, FN_PAIR_PLAIN, FN_PAIR_PLAIN + FN_PAIR_COUNT * 4u) ||
+        !function_list_add(&funcs, FN_PAIR_FN, FN_PAIR_FN + FN_PAIR_COUNT * 4u))
+        return 1;
 
     emit_header(out);
     for (u32 i = 0; i < funcs.count; i++)
@@ -37,6 +41,7 @@ int main(int argc, char** argv) {
                  "    return dolrecomp_find_original(address);\n}\n\n");
     for (u32 p = 0; p < FN_PROGRAM_COUNT; p++)
         emit_fn_prototype(out, fn_programs[p].addr);
+    emit_fn_prototype(out, FN_PAIR_FN + FN_PAIR_LEAF_OFFSET);
 
     for (u32 p = 0; p < FN_PROGRAM_COUNT; p++) {
         const FnProgram* prog = &fn_programs[p];
@@ -53,6 +58,39 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    /* Same-chunk call: caller and leaf share one chunk. The plain copy at
+     * FN_PAIR_PLAIN is today's code; the copy at FN_PAIR_FN is emitted with
+     * the leaf converted, so its bl calls fn_<leaf>_direct. */
+    for (u32 copy = 0; copy < 2; copy++) {
+        u32 base = copy ? FN_PAIR_FN : FN_PAIR_PLAIN;
+        PPCInst pair[FN_PAIR_COUNT];
+        for (u32 i = 0; i < FN_PAIR_COUNT; i++)
+            pair[i] = ppc_decode(fn_pair_words[i], base + 4u * i);
+        u32 leaf = base + FN_PAIR_LEAF_OFFSET;
+        if (copy)
+            emitter_set_fn_set(&leaf, 1);
+        bool emitted = emit_function(out, pair, FN_PAIR_COUNT, base);
+        emitter_set_fn_set(NULL, 0);
+        if (!emitted)
+            return 1;
+        if (!copy)
+            continue;
+        CFunctionCFG cfg;
+        if (!c_function_cfg_build(&cfg, pair, FN_PAIR_COUNT, base))
+            return 1;
+        u32 targets[FN_PAIR_COUNT];
+        u32 target_count = 0;
+        for (u32 i = 0; i < FN_PAIR_COUNT; i++)
+            if (cfg.return_targets[i])
+                targets[target_count++] = pair[i].address;
+        c_function_cfg_destroy(&cfg);
+        FnChunkContext chunk = {base, targets, target_count};
+        u32 leaf_index = FN_PAIR_LEAF_OFFSET / 4u;
+        if (!emit_fn_function(out, pair + leaf_index, FN_PAIR_COUNT - leaf_index,
+                              leaf, &chunk))
+            return 1;
+    }
+
     emit_footer(out);
     fclose(out);
     return 0;

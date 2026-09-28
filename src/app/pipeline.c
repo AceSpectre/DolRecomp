@@ -15,6 +15,7 @@
 #include "analysis/code_section.h"
 #include "analysis/embedded_data.h"
 #include "analysis/smc.h"
+#include "app/fn_mode.h"
 #ifdef DOLRECOMP_ENABLE_LLVM
 #include "ir/dolir_builder.h"
 #include "backend/llvm/llvm_backend.h"
@@ -1056,6 +1057,18 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
             file_count++;
         }
 
+        if (fn_mode_active() &&
+            !fn_mode_section(insts, num_insts, base_addr, chunk_instructions, &smc,
+                             chunks_dir, chunks_label, include_name, header, manifest)) {
+            smc_analysis_free(&smc);
+            function_list_free(&funcs);
+            free(chunk_jobs);
+            free(insts);
+            fclose(header);
+            fclose(manifest);
+            return 0;
+        }
+
         u32 active_jobs = effective_chunk_jobs(section_job_count, jobs);
         printf("  writing %u chunks with %u job%s\n",
                section_job_count, active_jobs, active_jobs == 1 ? "" : "s");
@@ -1107,7 +1120,8 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
         }
     }
 
-    emit_dispatch_helpers(header, &funcs, entry_point);
+    emit_dispatch_helpers_fn(header, &funcs, entry_point, fn_mode_ranges());
+    fn_mode_end();
     emit_footer(header);
     smc_analysis_free(&smc);
     function_list_free(&funcs);

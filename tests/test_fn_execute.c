@@ -14,6 +14,17 @@ typedef void (*Entry)(CPUState*);
 DECL(80004000) DECL(80004100) DECL(80004200) DECL(80004300) DECL(80004400)
 DECL(80004500)
 
+void func_80005000(CPUState*); void func_80006000(CPUState*);
+void fn_80006014(CPUState*);
+
+/* The fn copy's dispatcher: converted range -> fn, rest -> chunk. */
+static void dispatch_pair_fn(CPUState* c) {
+    if (c->pc >= FN_PAIR_FN + FN_PAIR_LEAF_OFFSET && c->pc < FN_PAIR_FN + FN_PAIR_COUNT * 4u)
+        fn_80006014(c);
+    else
+        func_80006000(c);
+}
+
 static const struct {
     Entry chunk, fn;
 } entries[] = {
@@ -97,6 +108,33 @@ static int check(u32 prog, const char* what, const Scenario* s) {
     return same(label, &a, &b, ta, tb);
 }
 
+/* Caller + converted leaf in one chunk vs the same pair as plain chunk code.
+ * The copies sit at different addresses, so lr-derived values (lr, r10) are
+ * not compared. */
+static int check_pair(const char* what, u32 n, s64 per_trip) {
+    static CPUState a, b;
+    if (!a.ram && (!cpu_init(&a) || !cpu_init(&b)))
+        return 0;
+    cpu_reset(&a);
+    cpu_reset(&b);
+    a.pc = FN_PAIR_PLAIN;
+    b.pc = FN_PAIR_FN;
+    a.lr = b.lr = LR_SENTINEL;
+    a.gpr[3] = b.gpr[3] = 1;
+    a.gpr[4] = b.gpr[4] = n;
+    a.msr = b.msr = 0x2000u;
+    u32 ta = run(&a, func_80005000, per_trip);
+    u32 tb = run(&b, dispatch_pair_fn, per_trip);
+    int ok = a.gpr[3] == b.gpr[3] && a.ctr == b.ctr && a.cr == b.cr &&
+             a.xer == b.xer && a.downcount == b.downcount && a.pc == b.pc &&
+             a.exception == b.exception && ta == tb && a.gpr[3] == 1u + 2u * n + 1u;
+    if (!ok)
+        fprintf(stderr, "%s: r3 %u/%u ctr %u/%u downcount %lld/%lld pc %08X/%08X trips %u/%u\n",
+                what, a.gpr[3], b.gpr[3], a.ctr, b.ctr, (long long)a.downcount,
+                (long long)b.downcount, a.pc, b.pc, ta, tb);
+    return ok;
+}
+
 int main(void) {
     int ok = 1;
     const Scenario plain = {7, 10, DATA, DATA + 0x80, 5, 1.5, -2.25, true, 100000, 0};
@@ -122,6 +160,9 @@ int main(void) {
     const Scenario mid = {7, 10, DATA, DATA + 0x80, 5, 1.5, -2.25, true, 100000,
                           0x80004208u};
     ok &= check(2, "odd_entry_falls_back", &mid);
+
+    ok &= check_pair("same_chunk_call", 3, 100000);
+    ok &= check_pair("same_chunk_call_budget", 3000, 64);
 
     if (!ok)
         fprintf(stderr, "fn differential execution FAILED\n");

@@ -15,6 +15,8 @@ typedef struct {
     const char* title_id_arg;
     const char* output_arg;
     const char* map_path;
+    const char* fn_list_path;
+    const char* fn_exclude_path;
     DolRecompCPU cpu;
     DolRecompBackend backend;
     u32 jobs;

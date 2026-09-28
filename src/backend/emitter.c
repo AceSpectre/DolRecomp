@@ -4,6 +4,9 @@
 #include "emitter.h"
 #include "backend/c_cfg.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 static u32 cr_field_shift(u8 crf) {
     return 4u * (7u - (u32)crf);
 }
@@ -303,6 +306,35 @@ static void emit_branch_condition(FILE* out, u8 bo, u8 bi) {
     }
 }
 
+/* Start addresses of guest functions emitted in function mode (fn_X). Set
+ * before chunk jobs run and read-only while they run in parallel. */
+static u32* g_fn_starts;
+static u32 g_fn_count;
+
+static int compare_u32(const void* a, const void* b) {
+    u32 x = *(const u32*)a, y = *(const u32*)b;
+    return x < y ? -1 : x > y;
+}
+
+void emitter_set_fn_set(const u32* starts, u32 count) {
+    free(g_fn_starts);
+    g_fn_starts = NULL;
+    g_fn_count = 0;
+    if (!starts || !count)
+        return;
+    g_fn_starts = (u32*)malloc(count * sizeof(u32));
+    if (!g_fn_starts)
+        return;
+    memcpy(g_fn_starts, starts, count * sizeof(u32));
+    qsort(g_fn_starts, count, sizeof(u32), compare_u32);
+    g_fn_count = count;
+}
+
+bool emitter_fn_contains_start(u32 address) {
+    return g_fn_count &&
+           bsearch(&address, g_fn_starts, g_fn_count, sizeof(u32), compare_u32) != NULL;
+}
+
 static bool branch_target_is_local(u32 func_start, u32 func_end, u32 target) {
     return target >= func_start && target < func_end && ((target - func_start) & 3u) == 0;
 }
@@ -322,7 +354,16 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst,
                 fprintf(out, "                return;\n");
                 fprintf(out, "            }\n");
             }
-            fprintf(out, "            goto label_%08X;\n", inst->branch_target);
+            if (emitter_fn_contains_start(inst->branch_target)) {
+                /* Same-chunk call to a converted function: run it natively
+                 * and come back exactly as its blr would have in chunk code,
+                 * through this chunk's return_dispatch (the continuation is
+                 * one of its local return targets). */
+                fprintf(out, "            fn_%08X_direct(ctx);\n", inst->branch_target);
+                fprintf(out, "            goto return_dispatch_%08X;\n", func_start);
+            } else {
+                fprintf(out, "            goto label_%08X;\n", inst->branch_target);
+            }
         } else if (!cold && continuation >= func_start && continuation < func_end) {
             /* Cross-chunk call: run the callee here rather than returning the
              * target to the dispatcher, then resume at the return address in

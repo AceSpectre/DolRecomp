@@ -2,6 +2,7 @@
 #include "app/setup.h"
 #include "app/database.h"
 #include "app/paths.h"
+#include "app/fn_mode.h"
 #include "app/pipeline.h"
 #include "platform/fs.h"
 #include "platform/strutil.h"
@@ -233,6 +234,12 @@ int main(int argc, char** argv) {
 
     printf("\nwriting output to: %s\n", output_path);
     if (opts.map_path && !symbol_map_load(&symbols, opts.map_path)) {
+        dol_free(&dol);
+        return 1;
+    }
+    if (!fn_mode_begin(opts.fn_list_path, opts.fn_exclude_path,
+                       opts.map_path ? &symbols : NULL)) {
+        symbol_map_free(&symbols);
         dol_free(&dol);
         return 1;
     }

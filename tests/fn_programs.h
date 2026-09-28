@@ -43,6 +43,24 @@ static const FnProgram fn_programs[] = {
       0x38600001u /* li r3,1 */, 0x4E800020u /* blr */,
       0x38600002u /* li r3,2 */, 0x4E800020u /* blr */}},
 };
+/* Caller and leaf in one chunk: r3 += 2 * r4 in the leaf's bdnz loop, then
+ * the caller adds 1 and returns through its saved lr. */
+#define FN_PAIR_PLAIN 0x80005000u
+#define FN_PAIR_FN 0x80006000u
+#define FN_PAIR_LEAF_OFFSET 0x14u
+#define FN_PAIR_COUNT 9u
+static const unsigned fn_pair_words[FN_PAIR_COUNT] = {
+    0x7D4802A6u, /* mflr r10 */
+    0x48000011u, /* bl +0x10 (leaf) */
+    0x38630001u, /* addi r3,r3,1 */
+    0x7D4803A6u, /* mtlr r10 */
+    0x4E800020u, /* blr */
+    0x7C8903A6u, /* leaf: mtctr r4 */
+    0x38630002u, /* addi r3,r3,2 */
+    0x4200FFFCu, /* bdnz -4 */
+    0x4E800020u, /* blr */
+};
+
 #define FN_PROGRAM_COUNT ((unsigned)(sizeof(fn_programs) / sizeof(fn_programs[0])))
 
 #endif

@@ -97,7 +97,53 @@ static void emit_lookup_run(FILE* out, const FunctionList* funcs,
     fprintf(out, "    }\n");
 }
 
+static int compare_range(const void* a, const void* b) {
+    u32 x = ((const FunctionRange*)a)->start, y = ((const FunctionRange*)b)->start;
+    return x < y ? -1 : x > y;
+}
+
+/* Function-mode table: converted functions take their whole address range
+ * ahead of the chunk that also holds a copy of their code. Resuming anywhere
+ * inside one lands in fn_X, whose entry switch handles the addresses it can
+ * resume at and hands the rest to dolrecomp_find_chunk. */
+static void emit_fn_lookup(FILE* out, const FunctionList* fns) {
+    FunctionRange* sorted = (FunctionRange*)malloc(fns->count * sizeof(FunctionRange));
+    if (!sorted)
+        return;
+    memcpy(sorted, fns->ranges, fns->count * sizeof(FunctionRange));
+    qsort(sorted, fns->count, sizeof(FunctionRange), compare_range);
+    fprintf(out, "\n#define DOLRECOMP_FN_COUNT %uu\n", fns->count);
+    fprintf(out, "static const u32 dolrecomp_fn_starts[%u] = {\n", fns->count);
+    for (u32 i = 0; i < fns->count; i++)
+        fprintf(out, "    0x%08Xu,\n", sorted[i].start);
+    fprintf(out, "};\nstatic const u32 dolrecomp_fn_ends[%u] = {\n", fns->count);
+    for (u32 i = 0; i < fns->count; i++)
+        fprintf(out, "    0x%08Xu,\n", sorted[i].end);
+    fprintf(out, "};\nstatic const DolRecompFunction dolrecomp_fn_entries[%u] = {\n",
+            fns->count);
+    for (u32 i = 0; i < fns->count; i++)
+        fprintf(out, "    fn_%08X,\n", sorted[i].start);
+    fprintf(out, "};\n");
+    fprintf(out, "\nstatic inline DolRecompFunction dolrecomp_find_original(u32 address) {\n");
+    fprintf(out, "    u32 lo = 0, hi = DOLRECOMP_FN_COUNT;\n");
+    fprintf(out, "    while (lo < hi) {\n");
+    fprintf(out, "        u32 mid = (lo + hi) >> 1;\n");
+    fprintf(out, "        if (dolrecomp_fn_starts[mid] <= address) lo = mid + 1u; else hi = mid;\n");
+    fprintf(out, "    }\n");
+    fprintf(out, "    if (lo && address < dolrecomp_fn_ends[lo - 1u] && (address & 3u) == 0u)\n");
+    fprintf(out, "        return dolrecomp_fn_entries[lo - 1u];\n");
+    fprintf(out, "    return dolrecomp_find_chunk(address);\n");
+    fprintf(out, "}\n");
+    free(sorted);
+}
+
 void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point) {
+    emit_dispatch_helpers_fn(out, funcs, entry_point, NULL);
+}
+
+void emit_dispatch_helpers_fn(FILE* out, const FunctionList* funcs, u32 entry_point,
+                              const FunctionList* fns) {
+    const bool fn_mode = fns && fns->count;
     fprintf(out, "\n#define DOLRECOMP_ENTRY_POINT 0x%08Xu\n", entry_point);
     fprintf(out, "\ntypedef void (*DolRecompFunction)(CPUState* ctx);\n");
     fprintf(out, "\n#if defined(__GNUC__) || defined(__clang__)\n");
@@ -114,7 +160,8 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     fprintf(out, "    return 0;\n");
     fprintf(out, "}\n");
     fprintf(out, "#endif\n");
-    fprintf(out, "\nstatic inline DolRecompFunction dolrecomp_find_original(u32 address) {\n");
+    fprintf(out, "\nstatic inline DolRecompFunction %s(u32 address) {\n",
+            fn_mode ? "dolrecomp_find_chunk" : "dolrecomp_find_original");
     for (u32 first = 0; first < funcs->count;) {
         u32 end = uniform_run_end(funcs, first);
         emit_lookup_run(out, funcs, first, end);
@@ -122,6 +169,8 @@ void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point
     }
     fprintf(out, "    return NULL;\n");
     fprintf(out, "}\n");
+    if (fn_mode)
+        emit_fn_lookup(out, fns);
     fprintf(out, "\n#define DOLRECOMP_CALL_CACHE_SIZE 4096u\n");
     fprintf(out, "typedef struct { u32 addr; DolRecompFunction fn; } DolRecompCallCacheEntry;\n");
     fprintf(out, "static DolRecompCallCacheEntry g_dolrecomp_call_cache[DOLRECOMP_CALL_CACHE_SIZE];\n");

@@ -19,6 +19,8 @@ void print_usage(const char* argv0) {
     fprintf(stderr, "  --gamecube                     GameCube mode (no title ID required)\n");
     fprintf(stderr, "  --rel-base <addr>              Override first virtual load address for REL codegen\n");
     fprintf(stderr, "  --map <path>                   Load optional function names from a linker MAP\n");
+    fprintf(stderr, "  --fn-list <path>               Emit these functions (hex, one per line) as fn_X (needs --map)\n");
+    fprintf(stderr, "  --fn-exclude <path>            Addresses that must stay in chunk code (hooks)\n");
     fprintf(stderr, "  --setup                        Download titles database and optionally install wit\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
@@ -260,6 +262,18 @@ int parse_cli(int argc, char** argv, CliOptions* opts) {
             if (!parse_u32_arg(arg + 11, "--rel-base", &opts->rel_base))
                 return 0;
             opts->rel_base_set = 1;
+            continue;
+        }
+
+        if (strcmp(arg, "--fn-list") == 0 || strcmp(arg, "--fn-exclude") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: %s needs a path\n", arg);
+                return 0;
+            }
+            if (arg[5] == 'l')
+                opts->fn_list_path = argv[++i];
+            else
+                opts->fn_exclude_path = argv[++i];
             continue;
         }
 
