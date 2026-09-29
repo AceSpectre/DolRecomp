@@ -137,7 +137,7 @@ static bool open_next_file(const char* chunks_dir, const char* chunks_label,
 bool fn_mode_section(const PPCInst* insts, u32 num_insts, u32 base_addr,
                      u32 chunk_instructions, const SMCAnalysis* smc,
                      const char* chunks_dir, const char* chunks_label,
-                     const char* include_name, FILE* header, FILE* manifest) {
+                     const char* include_name, FILE* manifest) {
     g.smc = smc;
     const u32 section_end = base_addr + num_insts * 4u;
     for (u32 li = 0; li < g.list.n; li++) {
@@ -189,6 +189,7 @@ bool fn_mode_section(const PPCInst* insts, u32 num_insts, u32 base_addr,
             free(targets.v);
             return false;
         }
+        emit_fn_prototype(g.file, addr);
         bool ok = emit_fn_function(g.file, insts + first, count, addr, &chunk);
         free(targets.v);
         if (!ok) {
@@ -198,7 +199,6 @@ bool fn_mode_section(const PPCInst* insts, u32 num_insts, u32 base_addr,
         }
         g.in_file++;
         g.verdicts[FN_OK]++;
-        emit_fn_prototype(header, addr);
         if (!function_list_add(&g.ranges, addr, addr + count * 4u) ||
             !vec_push(&g.accepted, addr))
             return false;

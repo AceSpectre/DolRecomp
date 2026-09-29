@@ -21,6 +21,10 @@ int function_list_add(FunctionList* list, u32 start, u32 end);
 void emit_dispatch_helpers(FILE* out, const FunctionList* funcs, u32 entry_point);
 /* As above, plus function-mode ranges (fn_X) that take precedence over the
  * chunks; with fns NULL or empty the output is identical to the above. */
+/* Writes the function-mode dispatch C file (tables and dolrecomp_find_original)
+ * that a header from emit_dispatch_helpers_fn with a non-empty fns declares. */
+bool emit_fn_dispatch_unit(FILE* out, const FunctionList* fns, const char* include_name);
+
 void emit_dispatch_helpers_fn(FILE* out, const FunctionList* funcs, u32 entry_point,
                               const FunctionList* fns);
 

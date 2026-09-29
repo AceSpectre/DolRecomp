@@ -25,7 +25,7 @@ bool fn_mode_active(void);
 bool fn_mode_section(const PPCInst* insts, u32 num_insts, u32 base_addr,
                      u32 chunk_instructions, const SMCAnalysis* smc,
                      const char* chunks_dir, const char* chunks_label,
-                     const char* include_name, FILE* header, FILE* manifest);
+                     const char* include_name, FILE* manifest);
 
 /* Accepted ranges, for the dispatch table (NULL when inactive). */
 const FunctionList* fn_mode_ranges(void);

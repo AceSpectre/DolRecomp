@@ -1059,7 +1059,7 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
 
         if (fn_mode_active() &&
             !fn_mode_section(insts, num_insts, base_addr, chunk_instructions, &smc,
-                             chunks_dir, chunks_label, include_name, header, manifest)) {
+                             chunks_dir, chunks_label, include_name, manifest)) {
             smc_analysis_free(&smc);
             function_list_free(&funcs);
             free(chunk_jobs);
@@ -1121,6 +1121,28 @@ int emit_code_sections_split(const LoadedCodeSection* sections,
     }
 
     emit_dispatch_helpers_fn(header, &funcs, entry_point, fn_mode_ranges());
+    if (fn_mode_ranges() && fn_mode_ranges()->count) {
+        char fn_dispatch_path[1200];
+        FILE* fn_dispatch = NULL;
+        if (snprintf(fn_dispatch_path, sizeof(fn_dispatch_path), "%s/fn_dispatch.c",
+                     chunks_dir) < (int)sizeof(fn_dispatch_path))
+            fn_dispatch = fopen(fn_dispatch_path, "w");
+        bool ok = fn_dispatch &&
+                  emit_fn_dispatch_unit(fn_dispatch, fn_mode_ranges(), include_name);
+        if (fn_dispatch)
+            fclose(fn_dispatch);
+        if (!ok) {
+            fprintf(stderr, "error: can't write '%s'\n", fn_dispatch_path);
+            fn_mode_end();
+            smc_analysis_free(&smc);
+            function_list_free(&funcs);
+            fclose(header);
+            fclose(manifest);
+            return 0;
+        }
+        fprintf(manifest, "// %s/fn_dispatch.c\n", chunks_label);
+        file_count++;
+    }
     fn_mode_end();
     emit_footer(header);
     smc_analysis_free(&smc);

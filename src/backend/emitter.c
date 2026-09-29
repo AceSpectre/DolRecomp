@@ -359,7 +359,8 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst,
                  * and come back exactly as its blr would have in chunk code,
                  * through this chunk's return_dispatch (the continuation is
                  * one of its local return targets). */
-                fprintf(out, "            fn_%08X_direct(ctx);\n", inst->branch_target);
+                fprintf(out, "            { void fn_%08X_direct(CPUState* ctx); fn_%08X_direct(ctx); }\n",
+                        inst->branch_target, inst->branch_target);
                 fprintf(out, "            goto return_dispatch_%08X;\n", func_start);
             } else {
                 fprintf(out, "            goto label_%08X;\n", inst->branch_target);
