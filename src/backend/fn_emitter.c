@@ -276,8 +276,28 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
         fprintf(out, "    default: dolrecomp_find_chunk(ctx->pc)(ctx); return 0;\n");
         fprintf(out, "    }\n");
 
+        u32 region_first = UINT32_MAX, region_last = UINT32_MAX;
         for (u32 i = 0; i < count; i++) {
+            if (cfg.loop_ends[o + i] != UINT32_MAX && cfg.loop_ends[o + i] - o < count) {
+                region_first = i;
+                region_last = cfg.loop_ends[o + i] - o;
+            }
+            /* The chunk outlines a counted loop into a helper that charges
+             * only the header block per iteration; a leader inside the loop
+             * is charged only by the chunk's straight-line copy, i.e. when
+             * control enters it from outside. Falling through inside the
+             * loop therefore skips the charge. */
+            const bool inner_charge = region_first != UINT32_MAX && i > region_first &&
+                i <= region_last && cfg.leaders[o + i] && cfg.block_cycles[o + i] != 0;
+            if (inner_charge)
+                fprintf(out, "    goto loopi_%08X;\n", insts[i].address);
             fprintf(out, "label_%08X:\n", insts[i].address);
+            if (inner_charge) {
+                fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[o + i]);
+                fprintf(out, "loopi_%08X:\n", insts[i].address);
+            }
+            if (i == region_last)
+                region_first = region_last = UINT32_MAX;
             if (cfg.loop_ends[o + i] != UINT32_MAX) {
                 u32 a = insts[i].address;
                 fprintf(out, "    if (ctx->idle_hook_pc == 0x%08Xu) {\n", a);
@@ -289,7 +309,7 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
             }
             if (cfg.materialize_pc[o + i])
                 fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
-            if (cfg.leaders[o + i] && cfg.block_cycles[o + i] != 0)
+            if (!inner_charge && cfg.leaders[o + i] && cfg.block_cycles[o + i] != 0)
                 fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[o + i]);
             switch (kinds[i]) {
             case FN_INST_CALL_LOCAL: {

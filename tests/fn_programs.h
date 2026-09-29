@@ -42,6 +42,13 @@ static const FnProgram fn_programs[] = {
      {0xFC811000u /* fcmpu cr1,f1,f2 */, 0x4184000Cu /* blt cr1,+12 */,
       0x38600001u /* li r3,1 */, 0x4E800020u /* blr */,
       0x38600002u /* li r3,2 */, 0x4E800020u /* blr */}},
+    /* while loop entered at its condition block: the chunk outlines the loop
+     * and charges only the header block per iteration, while the condition
+     * block (an inner leader) is charged only when entered from outside */
+    {"while_loop", 0x80004700u, 6,
+     {0x38600000u /* li r3,0 */, 0x48000008u /* b +8 (cond) */,
+      0x38630003u /* body: addi r3,r3,3 */, 0x7C032000u /* cond: cmpw r3,r4 */,
+      0x4180FFF8u /* blt -8 (body) */, 0x4E800020u /* blr */}},
 };
 /* Caller and leaf in one chunk: r3 += 2 * r4 in the leaf's bdnz loop, then
  * the caller adds 1 and returns through its saved lr. */

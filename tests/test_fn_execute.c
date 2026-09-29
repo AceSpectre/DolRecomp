@@ -12,7 +12,7 @@ typedef void (*Entry)(CPUState*);
 
 #define DECL(addr) void func_##addr(CPUState*); void fn_##addr(CPUState*);
 DECL(80004000) DECL(80004100) DECL(80004200) DECL(80004300) DECL(80004400)
-DECL(80004500)
+DECL(80004500) DECL(80004700)
 
 void func_80005000(CPUState*); void func_80006000(CPUState*);
 void fn_80006014(CPUState*);
@@ -40,6 +40,7 @@ static const struct {
     {func_80004000, fn_80004000}, {func_80004100, fn_80004100},
     {func_80004200, fn_80004200}, {func_80004300, fn_80004300},
     {func_80004400, fn_80004400}, {func_80004500, fn_80004500},
+    {func_80004700, fn_80004700},
 };
 
 #define LR_SENTINEL 0x81234564u
@@ -249,6 +250,7 @@ int main(void) {
     const Scenario budget = {0, 5000, DATA, DATA + 0x80, 20, 1.0, 2.0, true, 64, 0};
     ok &= check(0, "budget_exit_resume", &budget);
     ok &= check(1, "budget_exit_resume", &budget);
+    ok &= check(6, "budget_exit_resume", &budget);
 
     /* fp_unavailable_exit: MSR[FP] clear, the first FP op raises the
      * exception; locals must be flushed and the vector pc left alone. */
