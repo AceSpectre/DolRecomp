@@ -38,6 +38,15 @@ int main(void) {
                    "        if (ctx->exception) return;\n",
                    "        ppc_psq_load(ctx, 1u, ea, false, 0u, false, 0x80001004u);\n"
                    "        if (ctx->exception) goto fn_exit_raw;\n", true);
+    /* stmw/lmw index the register file with a loop variable: the locals
+     * cannot stand in for it, so the text runs on ctx (flush before, reload
+     * after) */
+    expect_rewrite("        for (u32 r = 24; r < 32; r++, ea += 4) mem_write32(ctx, ea, ctx->gpr[r]);\n",
+                   "        for (u32 r = 24; r < 32; r++, ea += 4) mem_write32(ctx, ea, ctx->gpr[r]);\n",
+                   true);
+    expect_rewrite("        for (u32 r = 24; r < 32; r++, ea += 4) ctx->gpr[r] = mem_read32(ctx, ea);\n",
+                   "        for (u32 r = 24; r < 32; r++, ea += 4) ctx->gpr[r] = mem_read32(ctx, ea);\n",
+                   true);
     /* ppc_fcmp writes ctx->cr: impure even though it takes values */
     expect_rewrite("    ppc_fcmp(ctx, 1u, ctx->fpr[1], ctx->fpr[2], false);\n",
                    "    ppc_fcmp(ctx, 1u, ctx->fpr[1], ctx->fpr[2], false);\n", true);

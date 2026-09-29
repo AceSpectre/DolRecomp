@@ -42,8 +42,24 @@ static const char* const k_pure_ctx_calls[] = {
     "ppc_fp_available(ctx", "ppc_mftb(ctx",
 };
 
-/* True when a bare `ctx` is passed to anything outside the whitelist. */
+/* True when a register file is indexed by anything but a literal (stmw/lmw
+ * loop over ctx->gpr[r]): no local can stand in for that access. */
+static bool has_variable_register_index(const char* t) {
+    static const char* const files[] = {"ctx->gpr[", "ctx->fpr[", "ctx->ps1["};
+    for (size_t f = 0; f < sizeof(files) / sizeof(*files); f++) {
+        size_t n = strlen(files[f]);
+        for (const char* s = t; (s = strstr(s, files[f])) != NULL; s += n)
+            if (!isdigit((unsigned char)s[n]))
+                return true;
+    }
+    return false;
+}
+
+/* True when a bare `ctx` is passed to anything outside the whitelist, or a
+ * register file is indexed by a variable. */
 static bool text_is_impure(const char* t) {
+    if (has_variable_register_index(t))
+        return true;
     for (const char* s = t; (s = strstr(s, "ctx")) != NULL; s += 3) {
         if ((s > t && ident_char(s[-1])) || ident_char(s[3]) || starts(s, "ctx->"))
             continue;
