@@ -355,11 +355,13 @@ static void emit_direct_branch(FILE* out, const PPCInst* inst,
                 fprintf(out, "            }\n");
             }
             if (emitter_fn_contains_start(inst->branch_target)) {
-                /* Same-chunk call to a converted function: run it natively
-                 * and come back exactly as its blr would have in chunk code,
-                 * through this chunk's return_dispatch (the continuation is
-                 * one of its local return targets). */
-                fprintf(out, "            { void fn_%08X_direct(CPUState* ctx); fn_%08X_direct(ctx); }\n",
+                /* Same-chunk call to a converted function: run it natively.
+                 * Status 0 means the chunk code would have returned here; 1
+                 * that control reached the callee's bclr, after which this
+                 * chunk's return_dispatch runs exactly as the old blr did
+                 * (the continuation is one of its local return targets). */
+                fprintf(out, "            { int fn_%08X_direct(CPUState* ctx); "
+                             "if (!fn_%08X_direct(ctx)) return; }\n",
                         inst->branch_target, inst->branch_target);
                 fprintf(out, "            goto return_dispatch_%08X;\n", func_start);
             } else {

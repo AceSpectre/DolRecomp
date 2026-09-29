@@ -14,8 +14,13 @@
  *   fn_XXXXXXXX(ctx)        -- from the dispatcher; resumes at ctx->pc, and a
  *                              bclr continues into the containing chunk when
  *                              that chunk's return_dispatch would have;
- *   fn_XXXXXXXX_direct(ctx) -- from a chunk call site; starts at the entry
- *                              and returns to the caller on bclr. */
+ *   fn_XXXXXXXX_direct(ctx) -- from a call site; starts at the entry. Returns
+ *                              1 when control reached the function's return
+ *                              dispatch (ctx->pc = return address; the caller
+ *                              runs its own return dispatch next) and 0 when
+ *                              the chunk code would have returned to the
+ *                              dispatcher (ctx->pc = resume point; the caller
+ *                              must return too). */
 
 typedef struct {
     u32 chunk_start;            /* containing chunk: func_<chunk_start> */

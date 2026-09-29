@@ -110,7 +110,7 @@ static void replace_same_length(char* text, const char* from, const char* to) {
 
 void emit_fn_prototype(FILE* out, u32 start) {
     fprintf(out, "void fn_%08X(CPUState* ctx);\n", start);
-    fprintf(out, "void fn_%08X_direct(CPUState* ctx);\n", start);
+    fprintf(out, "int fn_%08X_direct(CPUState* ctx);\n", start);
 }
 
 bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
@@ -194,7 +194,7 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
     }
 
     if (ok) {
-        fprintf(out, "static inline void fn_%08X_impl(CPUState* ctx, int from_dispatch) {\n",
+        fprintf(out, "static inline int fn_%08X_impl(CPUState* ctx, int from_dispatch) {\n",
                 start);
         emit_declarations(out, &used);
         fprintf(out, "    if (!from_dispatch) goto label_%08X;\n", start);
@@ -206,7 +206,7 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
             if (cfg.entry_points[o + i])
                 fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
                         insts[i].address, insts[i].address);
-        fprintf(out, "    default: dolrecomp_find_chunk(ctx->pc)(ctx); return;\n");
+        fprintf(out, "    default: dolrecomp_find_chunk(ctx->pc)(ctx); return 0;\n");
         fprintf(out, "    }\n");
 
         for (u32 i = 0; i < count; i++) {
@@ -215,7 +215,7 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
                 u32 a = insts[i].address;
                 fprintf(out, "    if (ctx->idle_hook_pc == 0x%08Xu) {\n", a);
                 emit_flush(out, &used, "        ");
-                fprintf(out, "        if (ctx->idle_hook(ctx)) return;\n");
+                fprintf(out, "        if (ctx->idle_hook(ctx)) return 0;\n");
                 emit_reload(out, &used, "        ");
                 fprintf(out, "    }\n");
                 fprintf(out, "loopb_%08X:\n", a);
@@ -238,33 +238,37 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
         fprintf(out, "    goto fn_exit;\n");
 
         if (has_bclr) {
-            /* The chunk's return_dispatch: a bclr keeps running in the chunk
-             * when the return address is one of its local call returns and
-             * the budget allows. Only a dispatcher entry can be in that
-             * position; a direct call returns to its chunk call site, which
-             * performs the same checks itself. */
+            /* The chunk's return_dispatch, in the same order: budget check,
+             * then the return addresses it would jump to. A direct entry
+             * hands the rest to its caller (status 1), whose own return
+             * dispatch continues the same sequence; a dispatcher entry
+             * resumes the chunk for its other local returns. */
             fprintf(out, "return_dispatch_%08X:\n", start);
-            fprintf(out, "    if (!from_dispatch) goto fn_exit;\n");
             fprintf(out, "    if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) goto fn_exit;\n");
+            fprintf(out, "    if (!from_dispatch) goto fn_return;\n");
             if (chunk && chunk->return_target_count) {
                 fprintf(out, "    switch (ctx->pc) {\n");
                 for (u32 t = 0; t < chunk->return_target_count; t++)
                     fprintf(out, "    case 0x%08Xu:\n", chunk->return_targets[t]);
                 emit_flush(out, &used, "        ");
                 fprintf(out, "        func_%08X(ctx);\n", chunk->chunk_start);
-                fprintf(out, "        return;\n");
+                fprintf(out, "        return 0;\n");
                 fprintf(out, "    default: break;\n");
                 fprintf(out, "    }\n");
             }
             fprintf(out, "    goto fn_exit;\n");
+            fprintf(out, "fn_return:\n");
+            emit_flush(out, &used, "    ");
+            fprintf(out, "    return 1;\n");
         }
         fprintf(out, "fn_exit:\n");
         emit_flush(out, &used, "    ");
         fprintf(out, "fn_exit_raw:\n");
-        fprintf(out, "    return;\n");
+        fprintf(out, "    return 0;\n");
         fprintf(out, "}\n");
-        fprintf(out, "void fn_%08X(CPUState* ctx) { fn_%08X_impl(ctx, 1); }\n", start, start);
-        fprintf(out, "void fn_%08X_direct(CPUState* ctx) { fn_%08X_impl(ctx, 0); }\n\n",
+        fprintf(out, "void fn_%08X(CPUState* ctx) { (void)fn_%08X_impl(ctx, 1); }\n",
+                start, start);
+        fprintf(out, "int fn_%08X_direct(CPUState* ctx) { return fn_%08X_impl(ctx, 0); }\n\n",
                 start, start);
     }
 

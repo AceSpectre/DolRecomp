@@ -17,6 +17,7 @@ DECL(80004500)
 void func_80005000(CPUState*); void func_80006000(CPUState*);
 void fn_80006014(CPUState*);
 void func_80004600(CPUState*); void fn_80004608(CPUState*);
+int fn_80006014_direct(CPUState*);
 
 static void dispatch_pad_fn(CPUState* c) {
     if (c->pc >= FN_PAD_CHUNK + FN_PAD_LEAF_OFFSET && c->pc < FN_PAD_CHUNK + FN_PAD_COUNT * 4u)
@@ -143,6 +144,41 @@ static int check_pair(const char* what, u32 n, s64 per_trip) {
     return ok;
 }
 
+/* fn_X_direct contract: 1 when control reached the function's return
+ * dispatch (its bclr), with ctx->pc the return address; 0 when the chunk code
+ * would have returned to the dispatcher, with ctx->pc the resume point. */
+static int check_direct_status(void) {
+    static CPUState c;
+    if (!c.ram && !cpu_init(&c))
+        return 0;
+    int ok = 1;
+    cpu_reset(&c);
+    c.lr = LR_SENTINEL;
+    c.msr = 0x2000u;
+    c.gpr[3] = 1;
+    c.gpr[4] = 3;
+    c.downcount = 100000;
+    int status = fn_80006014_direct(&c);
+    if (status != 1 || c.pc != LR_SENTINEL || c.gpr[3] != 7u) {
+        fprintf(stderr, "direct_status/returns: status %d pc %08X r3 %u\n", status, c.pc,
+                c.gpr[3]);
+        ok = 0;
+    }
+    cpu_reset(&c);
+    c.lr = LR_SENTINEL;
+    c.msr = 0x2000u;
+    c.gpr[3] = 1;
+    c.gpr[4] = 1000000;
+    c.downcount = 64;
+    status = fn_80006014_direct(&c);
+    if (status != 0 || c.pc < FN_PAIR_FN + FN_PAIR_LEAF_OFFSET ||
+        c.pc >= FN_PAIR_FN + FN_PAIR_COUNT * 4u) {
+        fprintf(stderr, "direct_status/budget_exit: status %d pc %08X\n", status, c.pc);
+        ok = 0;
+    }
+    return ok;
+}
+
 int main(void) {
     int ok = 1;
     const Scenario plain = {7, 10, DATA, DATA + 0x80, 5, 1.5, -2.25, true, 100000, 0};
@@ -184,6 +220,8 @@ int main(void) {
     }
     ok &= check_pair("same_chunk_call", 3, 100000);
     ok &= check_pair("same_chunk_call_budget", 3000, 64);
+
+    ok &= check_direct_status();
 
     if (!ok)
         fprintf(stderr, "fn differential execution FAILED\n");
