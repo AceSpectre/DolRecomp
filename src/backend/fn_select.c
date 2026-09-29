@@ -15,6 +15,15 @@ const char* fn_verdict_name(FnVerdict verdict) {
     case FN_EXCLUDED: return "excluded";
     case FN_OUTSIDE_BRANCH: return "outside-branch";
     case FN_EMPTY: return "empty";
+    case FN_RECURSIVE: return "recursive";
+    case FN_COND_CALL: return "cond-call";
+    case FN_TOO_MANY_CALLS: return "too-many-calls";
+    case FN_CALLEE_REJECTED: return "callee-rejected";
+    case FN_DEEP_CHAIN: return "deep-chain";
+    case FN_EMIT_FAILED: return "emit";
+    case FN_SPANS_CHUNK: return "spans-chunk";
+    case FN_NO_SYMBOL: return "no-symbol";
+    case FN_VERDICT_COUNT: break;
     }
     return "?";
 }
@@ -23,8 +32,25 @@ static bool in_range(u32 addr, u32 start, u32 end) {
     return addr >= start && addr < end;
 }
 
-FnVerdict fn_select_leaf(const PPCInst* insts, u32 count, u32 start,
-                         const char* name, bool (*excluded)(u32 addr)) {
+static bool add_need(FnNeeds* needs, u32 target) {
+    for (u32 i = 0; i < needs->count; i++)
+        if (needs->targets[i] == target)
+            return true;
+    if (needs->count == FN_MAX_NEEDS)
+        return false;
+    u32 i = needs->count++;
+    while (i > 0 && needs->targets[i - 1] > target) {
+        needs->targets[i] = needs->targets[i - 1];
+        i--;
+    }
+    needs->targets[i] = target;
+    return true;
+}
+
+FnVerdict fn_select_function(const PPCInst* insts, u32 count, u32 start,
+                             u32 chunk_start, u32 chunk_end, const char* name,
+                             bool (*excluded)(u32 addr), FnNeeds* needs) {
+    needs->count = 0;
     if (count == 0)
         return FN_EMPTY;
     if (name && (strncmp(name, "__save", 6) == 0 || strncmp(name, "__restore", 9) == 0))
@@ -55,20 +81,22 @@ FnVerdict fn_select_leaf(const PPCInst* insts, u32 count, u32 start,
     }
     for (u32 i = 0; i < count; i++) {
         const PPCInst* in = &insts[i];
-        if (in->embedded_data)
+        if (in->embedded_data || (in->op != PPC_OP_B && in->op != PPC_OP_BC))
             continue;
-        bool branch = in->op == PPC_OP_B || in->op == PPC_OP_BC ||
-                      in->op == PPC_OP_BCLR || in->op == PPC_OP_BCCTR;
-        if (branch && in->lk)
-            return FN_NOT_LEAF;
-    }
-    for (u32 i = 0; i < count; i++) {
-        const PPCInst* in = &insts[i];
-        if (in->embedded_data)
+        const u32 t = in->branch_target;
+        if (in_range(t, start, end)) {
+            if (in->op == PPC_OP_B && in->lk && t == start)
+                return FN_RECURSIVE;
             continue;
-        if ((in->op == PPC_OP_B || in->op == PPC_OP_BC) &&
-            !in_range(in->branch_target, start, end))
-            return FN_OUTSIDE_BRANCH;
+        }
+        const bool same_chunk = in_range(t, chunk_start, chunk_end);
+        if (in->op == PPC_OP_BC) {
+            if (in->lk || same_chunk)
+                return FN_COND_CALL;
+            continue;
+        }
+        if (same_chunk && !add_need(needs, t))
+            return FN_TOO_MANY_CALLS;
     }
     /* Mid-entry: a global branch target inside the body that no branch of
      * this function explains must come from somewhere else. */

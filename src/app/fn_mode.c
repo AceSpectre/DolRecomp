@@ -45,10 +45,27 @@ static struct {
     FILE* file;
     u32 file_index;
     u32 in_file;
-    u32 verdicts[FN_EMPTY + 3]; /* + spans-chunk, no-symbol */
+    u32 verdicts[FN_VERDICT_COUNT];
 } g;
 
-enum { FN_SKIP_SPANS_CHUNK = FN_EMPTY + 1, FN_SKIP_NO_SYMBOL = FN_EMPTY + 2 };
+/* Until calls are emitted (M2), keep M1's selection: no linking branch and
+ * no direct branch leaving the function. */
+static bool m1_leaf_only(const PPCInst* insts, u32 count, u32 start) {
+    const u32 end = start + count * 4u;
+    for (u32 i = 0; i < count; i++) {
+        const PPCInst* in = &insts[i];
+        if (in->embedded_data)
+            continue;
+        bool branch = in->op == PPC_OP_B || in->op == PPC_OP_BC ||
+                      in->op == PPC_OP_BCLR || in->op == PPC_OP_BCCTR;
+        if (branch && in->lk)
+            return false;
+        if ((in->op == PPC_OP_B || in->op == PPC_OP_BC) &&
+            (in->branch_target < start || in->branch_target >= end))
+            return false;
+    }
+    return true;
+}
 
 static bool load_hex_list(const char* path, U32Vec* out) {
     FILE* f = fopen(path, "r");
@@ -146,18 +163,28 @@ bool fn_mode_section(const PPCInst* insts, u32 num_insts, u32 base_addr,
             continue;
         const DolRecompSymbol* sym = symbol_at(addr);
         if (!sym || sym->size < 4u || addr + sym->size > section_end) {
-            g.verdicts[FN_SKIP_NO_SYMBOL]++;
+            g.verdicts[FN_NO_SYMBOL]++;
             printf("fn: skip %08X: no-symbol\n", addr);
             continue;
         }
         u32 first = (addr - base_addr) / 4u;
         u32 count = sym->size / 4u;
         if (first / chunk_instructions != (first + count - 1u) / chunk_instructions) {
-            g.verdicts[FN_SKIP_SPANS_CHUNK]++;
+            g.verdicts[FN_SPANS_CHUNK]++;
             printf("fn: skip %08X %s: spans-chunk\n", addr, sym->name);
             continue;
         }
-        FnVerdict verdict = fn_select_leaf(insts + first, count, addr, sym->name, excluded);
+        u32 chunk_first = (first / chunk_instructions) * chunk_instructions;
+        u32 chunk_count = num_insts - chunk_first;
+        if (chunk_count > chunk_instructions)
+            chunk_count = chunk_instructions;
+        FnNeeds needs;
+        FnVerdict verdict = fn_select_function(insts + first, count, addr,
+                                               base_addr + chunk_first * 4u,
+                                               base_addr + (chunk_first + chunk_count) * 4u,
+                                               sym->name, excluded, &needs);
+        if (verdict == FN_OK && !m1_leaf_only(insts + first, count, addr))
+            verdict = FN_NOT_LEAF;
         if (verdict != FN_OK) {
             g.verdicts[verdict]++;
             printf("fn: skip %08X %s: %s\n", addr, sym->name, fn_verdict_name(verdict));
@@ -166,10 +193,6 @@ bool fn_mode_section(const PPCInst* insts, u32 num_insts, u32 base_addr,
 
         /* The containing chunk's local return targets, exactly as the chunk
          * emitter computes them (see fn_emitter.h). */
-        u32 chunk_first = (first / chunk_instructions) * chunk_instructions;
-        u32 chunk_count = num_insts - chunk_first;
-        if (chunk_count > chunk_instructions)
-            chunk_count = chunk_instructions;
         CFunctionCFG cfg;
         if (!c_function_cfg_build(&cfg, insts + chunk_first, chunk_count,
                                   base_addr + chunk_first * 4u))
@@ -193,7 +216,7 @@ bool fn_mode_section(const PPCInst* insts, u32 num_insts, u32 base_addr,
         bool ok = emit_fn_function(g.file, insts + first, count, addr, &chunk);
         free(targets.v);
         if (!ok) {
-            g.verdicts[FN_EMPTY]++;
+            g.verdicts[FN_EMIT_FAILED]++;
             printf("fn: skip %08X %s: emit\n", addr, sym->name);
             continue;
         }
@@ -217,13 +240,9 @@ void fn_mode_end(void) {
     if (g.file)
         fclose(g.file);
     printf("fn: %u converted of %u listed", g.verdicts[FN_OK], g.list.n);
-    for (u32 v = 1; v <= FN_EMPTY; v++)
+    for (u32 v = 1; v < FN_VERDICT_COUNT; v++)
         if (g.verdicts[v])
             printf(", %u %s", g.verdicts[v], fn_verdict_name((FnVerdict)v));
-    if (g.verdicts[FN_SKIP_SPANS_CHUNK])
-        printf(", %u spans-chunk", g.verdicts[FN_SKIP_SPANS_CHUNK]);
-    if (g.verdicts[FN_SKIP_NO_SYMBOL])
-        printf(", %u no-symbol", g.verdicts[FN_SKIP_NO_SYMBOL]);
     printf("\n");
     emitter_set_fn_set(NULL, 0);
     free(g.list.v);
