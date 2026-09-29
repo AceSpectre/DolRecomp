@@ -159,7 +159,7 @@ static int check_cold_companion_shape(void) {
     static const char* const expect[] = {
         /* index 2 is pure fall-through -- not a leader, not a return target --
          * yet the cold switch still covers it */
-        "    case 0x800040A8u: goto cold_800040A8;\n",
+        "    case 0x2u: goto cold_800040A8;\n",
         "cold_800040A8:\n    ctx->pc = 0x800040A8u;\n",
         /* index 1 is the backward branch's target, so it is a leader and gets
          * the same downcount charge the hot path makes */
@@ -198,18 +198,18 @@ static int check_hot_switch_thinning(void) {
 
     static const char* const expect[] = {
         /* chunk start */
-        "    case 0x800040E0u: goto label_800040E0;\n",
+        "    case 0x0u: goto label_800040E0;\n",
         /* the `bl`'s return address: the callee's blr dispatches here */
-        "    case 0x800040E4u: goto label_800040E4;\n",
+        "    case 0x1u: goto label_800040E4;\n",
         /* anything else lands in the cold companion */
         "    default:\n",
         "        func_800040E0_cold(ctx);\n",
     };
     static const char* const reject[] = {
         /* index 2 and 3 are reachable only by falling through index 1 */
-        "case 0x800040E8u:",
+        "goto label_800040E8;",
         "label_800040E8:",
-        "case 0x800040ECu:",
+        "goto label_800040EC;",
         "label_800040EC:",
     };
 

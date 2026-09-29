@@ -142,8 +142,8 @@ static void test_codegen_supports_jumptable(const char* code) {
     char needle[64];
     int all_cases_reentrant = 1;
     for (u32 i = 0; i < CASE_COUNT; i++) {
-        snprintf(needle, sizeof(needle), "case 0x%08Xu: goto label_%08X;",
-                 case_targets[i], case_targets[i]);
+        snprintf(needle, sizeof(needle), "case 0x%Xu: goto label_%08X;",
+                 (case_targets[i] - BASE) >> 2, case_targets[i]);
         if (!strstr(code, needle))
             all_cases_reentrant = 0;
     }

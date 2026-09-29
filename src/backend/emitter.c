@@ -497,6 +497,17 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "    return sh ? ((value << sh) | (value >> (32u - sh))) : value;\n"
         "}\n"
         "\n"
+        "/* Chunk switches index by instruction slot, not by raw pc: case\n"
+        " * values 4 bytes apart are too sparse over the byte range, so clang\n"
+        " * lowered them to a compare tree over small tables. Slots are\n"
+        " * consecutive, which gives one bounds check and one table jump. The\n"
+        " * rotate sends an unaligned or out-of-chunk pc to a value no case\n"
+        " * has, so it still reaches default. */\n"
+        "static inline u32 dolrecomp_pc_slot(u32 pc, u32 base) {\n"
+        "    u32 off = pc - base;\n"
+        "    return (off >> 2) | (off << 30);\n"
+        "}\n"
+        "\n"
         "static inline f32 dolrecomp_f32_from_bits(u32 bits) {\n"
         "    f32 value;\n"
         "    memcpy(&value, &bits, sizeof(value));\n"
@@ -1963,6 +1974,13 @@ static void emit_counted_loop(FILE* out, const PPCInst* insts,
     fprintf(out, "}\n\n");
 }
 
+/* Opens a switch over ctx->pc by instruction slot within the chunk (see
+ * dolrecomp_pc_slot in the generated header); its cases are
+ * (address - func_addr) >> 2. */
+static void emit_pc_switch(FILE* out, u32 func_addr) {
+    fprintf(out, "    switch (dolrecomp_pc_slot(ctx->pc, 0x%08Xu)) {\n", func_addr);
+}
+
 /* Cold resume companion. The dispatcher can enter a chunk at an address the
  * hot function has no case for: an `rfi` back into the middle of a block, a
  * `bctr` jump-table target, a saved lr resumed from somewhere else. Those
@@ -1983,10 +2001,10 @@ static void emit_function_cold(FILE* out, const PPCInst* insts,
                                const CFunctionCFG* cfg, u32 count,
                                u32 func_addr, u32 func_end) {
     fprintf(out, "static void func_%08X_cold(CPUState* ctx) {\n", func_addr);
-    fprintf(out, "    switch (ctx->pc) {\n");
+    emit_pc_switch(out, func_addr);
     for (u32 i = 0; i < count; i++) {
-        fprintf(out, "    case 0x%08Xu: goto cold_%08X;\n",
-                insts[i].address, insts[i].address);
+        fprintf(out, "    case 0x%Xu: goto cold_%08X;\n",
+                (insts[i].address - func_addr) >> 2, insts[i].address);
     }
     fprintf(out, "    default: return;\n");
     fprintf(out, "    }\n");
@@ -2036,12 +2054,12 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
      * Entries this set does not cover -- an `rfi` into the middle of a block,
      * a `bctr` jump-table target, an lr resumed from elsewhere -- go to the
      * cold companion, which handles any pc in the chunk. */
-    fprintf(out, "    switch (ctx->pc) {\n");
+    emit_pc_switch(out, func_addr);
     for (u32 i = 0; i < count; i++) {
         if (!cfg.entry_points[i])
             continue;
-        fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
-                insts[i].address, insts[i].address);
+        fprintf(out, "    case 0x%Xu: goto label_%08X;\n",
+                (insts[i].address - func_addr) >> 2, insts[i].address);
     }
     fprintf(out, "    default:\n");
     fprintf(out, "        DOLRECOMP_COUNT(dolrecomp_cold_entries);\n");
@@ -2091,11 +2109,11 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
         fprintf(out, "    return;\n");
         fprintf(out, "return_dispatch_%08X:\n", func_addr);
         fprintf(out, "    if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) return;\n");
-        fprintf(out, "    switch (ctx->pc) {\n");
+        emit_pc_switch(out, func_addr);
         for (u32 i = 0; i < count; ++i) {
             if (cfg.return_targets[i]) {
-                fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
-                        insts[i].address, insts[i].address);
+                fprintf(out, "    case 0x%Xu: goto label_%08X;\n",
+                        (insts[i].address - func_addr) >> 2, insts[i].address);
             }
         }
         fprintf(out, "    default: return;\n");
