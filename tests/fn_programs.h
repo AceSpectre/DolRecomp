@@ -76,6 +76,59 @@ static const unsigned fn_pad_words[FN_PAD_COUNT] = {
     0x4E800020u, /* blr */
 };
 
+/* Calls: T (leaf, before F so F's call to it is backward), F (calls T, U,
+ * cross-chunk G, F2 and F4), F2 (tail call to U), U (leaf), F3 (bl $+4, then
+ * bctrl to G), F4 (backward tail call to T). G is its own chunk at +0x100.
+ * The same words run at FN_CALLS_PLAIN (chunk code only) and FN_CALLS_FN
+ * (T, F, F2, U, F3, F4 converted); every branch is relative. */
+#define FN_CALLS_PLAIN 0x80007000u
+#define FN_CALLS_FN 0x80008000u
+#define FN_CALLS_COUNT 27u
+#define FN_CALLS_G_OFFSET 0x100u
+#define FN_CALLS_G_COUNT 4u
+#define FN_CALLS_F_OFFSET 0x10u
+#define FN_CALLS_F3_OFFSET 0x44u
+static const unsigned fn_calls_words[FN_CALLS_COUNT] = {
+    0x7C8903A6u, /* 0x00 T: mtctr r4 */
+    0x38630002u, /* 0x04 addi r3,r3,2 */
+    0x4200FFFCu, /* 0x08 bdnz -4 */
+    0x4E800020u, /* 0x0C blr */
+    0x7FE802A6u, /* 0x10 F: mflr r31 */
+    0x4BFFFFEDu, /* 0x14 bl T */
+    0x38630001u, /* 0x18 addi r3,r3,1 */
+    0x48000021u, /* 0x1C bl U */
+    0x480000E1u, /* 0x20 bl G */
+    0x48000011u, /* 0x24 bl F2 */
+    0x4800003Du, /* 0x28 bl F4 */
+    0x7FE803A6u, /* 0x2C mtlr r31 */
+    0x4E800020u, /* 0x30 blr */
+    0x38630003u, /* 0x34 F2: addi r3,r3,3 */
+    0x48000004u, /* 0x38 b U */
+    0x38630005u, /* 0x3C U: addi r3,r3,5 */
+    0x4E800020u, /* 0x40 blr */
+    0x7FC802A6u, /* 0x44 F3: mflr r30 */
+    0x48000005u, /* 0x48 bl +4 */
+    0x7D8802A6u, /* 0x4C mflr r12 */
+    0x398C00B4u, /* 0x50 addi r12,r12,0xB4 (-> G) */
+    0x7D8903A6u, /* 0x54 mtctr r12 */
+    0x4E800421u, /* 0x58 bctrl */
+    0x7FC803A6u, /* 0x5C mtlr r30 */
+    0x4E800020u, /* 0x60 blr */
+    0x38630007u, /* 0x64 F4: addi r3,r3,7 */
+    0x4BFFFF98u, /* 0x68 b T */
+};
+static const unsigned fn_calls_g_words[FN_CALLS_G_COUNT] = {
+    0x7CA903A6u, /* G: mtctr r5 */
+    0x38630064u, /* addi r3,r3,100 */
+    0x4200FFFCu, /* bdnz -4 */
+    0x4E800020u, /* blr */
+};
+/* Converted functions: offset and end offset within the chunk. */
+#define FN_CALLS_FN_COUNT 6u
+static const unsigned fn_calls_fn_offsets[FN_CALLS_FN_COUNT][2] = {
+    {0x00, 0x10}, {0x10, 0x34}, {0x34, 0x3C}, {0x3C, 0x44}, {0x44, 0x64}, {0x64, 0x6C},
+};
+
 #define FN_PROGRAM_COUNT ((unsigned)(sizeof(fn_programs) / sizeof(fn_programs[0])))
 
 #endif

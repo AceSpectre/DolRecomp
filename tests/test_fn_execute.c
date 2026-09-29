@@ -144,6 +144,65 @@ static int check_pair(const char* what, u32 n, s64 per_trip) {
     return ok;
 }
 
+void func_80007000(CPUState*); void func_80007100(CPUState*);
+void func_80008000(CPUState*); void func_80008100(CPUState*);
+void fn_80008000(CPUState*); void fn_80008010(CPUState*); void fn_80008034(CPUState*);
+void fn_8000803C(CPUState*); void fn_80008044(CPUState*); void fn_80008064(CPUState*);
+
+static void dispatch_calls_plain(CPUState* c) {
+    if (c->pc >= FN_CALLS_PLAIN + FN_CALLS_G_OFFSET)
+        func_80007100(c);
+    else
+        func_80007000(c);
+}
+
+static void dispatch_calls_fn(CPUState* c) {
+    static void (*const fns[FN_CALLS_FN_COUNT])(CPUState*) = {
+        fn_80008000, fn_80008010, fn_80008034, fn_8000803C, fn_80008044, fn_80008064,
+    };
+    u32 o = c->pc - FN_CALLS_FN;
+    if (o >= FN_CALLS_G_OFFSET) {
+        func_80008100(c);
+        return;
+    }
+    for (u32 k = 0; k < FN_CALLS_FN_COUNT; k++)
+        if (o >= fn_calls_fn_offsets[k][0] && o < fn_calls_fn_offsets[k][1]) {
+            fns[k](c);
+            return;
+        }
+    func_80008000(c);
+}
+
+/* Same words at two addresses: compare everything that does not hold an
+ * address (r12, r30, r31 and intermediate lr values do). */
+static int check_calls(const char* what, u32 entry_offset, u32 r4, u32 r5, s64 per_trip,
+                       u32 want_r3) {
+    static CPUState a, b;
+    if (!a.ram && (!cpu_init(&a) || !cpu_init(&b)))
+        return 0;
+    cpu_reset(&a);
+    cpu_reset(&b);
+    a.pc = FN_CALLS_PLAIN + entry_offset;
+    b.pc = FN_CALLS_FN + entry_offset;
+    a.lr = b.lr = LR_SENTINEL;
+    a.gpr[3] = b.gpr[3] = 1;
+    a.gpr[4] = b.gpr[4] = r4;
+    a.gpr[5] = b.gpr[5] = r5;
+    a.msr = b.msr = 0x2000u;
+    u32 ta = run(&a, dispatch_calls_plain, per_trip);
+    u32 tb = run(&b, dispatch_calls_fn, per_trip);
+    int ok = a.gpr[3] == b.gpr[3] && a.gpr[4] == b.gpr[4] && a.gpr[5] == b.gpr[5] &&
+             a.ctr == b.ctr && a.cr == b.cr && a.xer == b.xer && a.lr == b.lr &&
+             a.downcount == b.downcount && a.pc == b.pc && a.exception == b.exception &&
+             a.direct_depth == 0 && b.direct_depth == 0 && ta == tb && a.gpr[3] == want_r3;
+    if (!ok)
+        fprintf(stderr, "calls/%s: r3 %u/%u (want %u) ctr %u/%u downcount %lld/%lld "
+                "pc %08X/%08X trips %u/%u depth %u/%u\n", what, a.gpr[3], b.gpr[3], want_r3,
+                a.ctr, b.ctr, (long long)a.downcount, (long long)b.downcount, a.pc, b.pc,
+                ta, tb, (unsigned)a.direct_depth, (unsigned)b.direct_depth);
+    return ok;
+}
+
 /* fn_X_direct contract: 1 when control reached the function's return
  * dispatch (its bclr), with ctx->pc the return address; 0 when the chunk code
  * would have returned to the dispatcher, with ctx->pc the resume point. */
@@ -220,6 +279,21 @@ int main(void) {
     }
     ok &= check_pair("same_chunk_call", 3, 100000);
     ok &= check_pair("same_chunk_call_budget", 3000, 64);
+
+    /* F: r3 = 1 + 2*r4 (T) + 1 + 5 (U) + 100*r5 (G) + 3 + 5 (F2->U) + 7 + 2*r4 (F4->T) */
+    ok &= check_calls("F", FN_CALLS_F_OFFSET, 3, 2, 100000, 1u + 4u * 3u + 100u * 2u + 21u);
+    ok &= check_calls("F budget 64", FN_CALLS_F_OFFSET, 3000, 2000, 64,
+                      1u + 4u * 3000u + 100u * 2000u + 21u);
+    ok &= check_calls("F budget 16", FN_CALLS_F_OFFSET, 300, 200, 16,
+                      1u + 4u * 300u + 100u * 200u + 21u);
+    /* Every trip starts past the loop budget (256): the chunk's pre-call
+     * budget check on the backward bl T, and every other budget exit, fire
+     * on each trip, so progress is one block per trip. */
+    ok &= check_calls("F exhausted", FN_CALLS_F_OFFSET, 3, 2, -300,
+                      1u + 4u * 3u + 100u * 2u + 21u);
+    /* F3: bctrl to G: r3 = 1 + 100*r5 */
+    ok &= check_calls("F3 bctrl", FN_CALLS_F3_OFFSET, 3, 2, 100000, 1u + 100u * 2u);
+    ok &= check_calls("F3 bctrl budget 16", FN_CALLS_F3_OFFSET, 3, 2000, 16, 1u + 100u * 2000u);
 
     ok &= check_direct_status();
 

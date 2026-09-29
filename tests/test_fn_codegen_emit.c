@@ -32,6 +32,13 @@ int main(int argc, char** argv) {
         !function_list_add(&funcs, FN_PAIR_PLAIN, FN_PAIR_PLAIN + FN_PAIR_COUNT * 4u) ||
         !function_list_add(&funcs, FN_PAIR_FN, FN_PAIR_FN + FN_PAIR_COUNT * 4u))
         return 1;
+    if (!function_list_add(&funcs, FN_CALLS_PLAIN, FN_CALLS_PLAIN + FN_CALLS_COUNT * 4u) ||
+        !function_list_add(&funcs, FN_CALLS_PLAIN + FN_CALLS_G_OFFSET,
+                           FN_CALLS_PLAIN + FN_CALLS_G_OFFSET + FN_CALLS_G_COUNT * 4u) ||
+        !function_list_add(&funcs, FN_CALLS_FN, FN_CALLS_FN + FN_CALLS_COUNT * 4u) ||
+        !function_list_add(&funcs, FN_CALLS_FN + FN_CALLS_G_OFFSET,
+                           FN_CALLS_FN + FN_CALLS_G_OFFSET + FN_CALLS_G_COUNT * 4u))
+        return 1;
 
     emit_header(out);
     for (u32 i = 0; i < funcs.count; i++)
@@ -106,6 +113,46 @@ int main(int argc, char** argv) {
         if (!emit_fn_function(out, pad + leaf_index, FN_PAD_COUNT - leaf_index,
                               FN_PAD_CHUNK + FN_PAD_LEAF_OFFSET, &chunk))
             return 1;
+    }
+
+    /* Calls: the plain copy is chunk code only; in the fn copy T, F, F2, U,
+     * F3 and F4 are converted and the chunk's own call sites use them. */
+    for (u32 copy = 0; copy < 2; copy++) {
+        u32 base = copy ? FN_CALLS_FN : FN_CALLS_PLAIN;
+        PPCInst q[FN_CALLS_COUNT], g[FN_CALLS_G_COUNT];
+        for (u32 i = 0; i < FN_CALLS_COUNT; i++)
+            q[i] = ppc_decode(fn_calls_words[i], base + 4u * i);
+        for (u32 i = 0; i < FN_CALLS_G_COUNT; i++)
+            g[i] = ppc_decode(fn_calls_g_words[i], base + FN_CALLS_G_OFFSET + 4u * i);
+        u32 starts[FN_CALLS_FN_COUNT];
+        for (u32 k = 0; k < FN_CALLS_FN_COUNT; k++)
+            starts[k] = base + fn_calls_fn_offsets[k][0];
+        if (copy)
+            emitter_set_fn_set(starts, FN_CALLS_FN_COUNT);
+        if (!emit_function(out, q, FN_CALLS_COUNT, base) ||
+            !emit_function(out, g, FN_CALLS_G_COUNT, base + FN_CALLS_G_OFFSET))
+            return 1;
+        if (copy) {
+            CFunctionCFG cfg;
+            if (!c_function_cfg_build(&cfg, q, FN_CALLS_COUNT, base))
+                return 1;
+            u32 targets[FN_CALLS_COUNT], target_count = 0;
+            for (u32 i = 0; i < FN_CALLS_COUNT; i++)
+                if (cfg.return_targets[i])
+                    targets[target_count++] = q[i].address;
+            c_function_cfg_destroy(&cfg);
+            FnChunkContext chunk = {base, targets, target_count, q, FN_CALLS_COUNT};
+            for (u32 k = 0; k < FN_CALLS_FN_COUNT; k++) {
+                u32 first = fn_calls_fn_offsets[k][0] / 4u;
+                u32 n = (fn_calls_fn_offsets[k][1] - fn_calls_fn_offsets[k][0]) / 4u;
+                emit_fn_prototype(out, starts[k]);
+                if (!emit_fn_function(out, q + first, n, starts[k], &chunk)) {
+                    fprintf(stderr, "fn emit failed for calls+0x%X\n", fn_calls_fn_offsets[k][0]);
+                    return 1;
+                }
+            }
+        }
+        emitter_set_fn_set(NULL, 0);
     }
 
     emit_footer(out);

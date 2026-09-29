@@ -108,6 +108,51 @@ static void replace_same_length(char* text, const char* from, const char* to) {
         memcpy(p, to, n);
 }
 
+typedef enum {
+    FN_INST_TEXT,
+    FN_INST_CALL_LOCAL,
+    FN_INST_CALL_CROSS,
+    FN_INST_TAIL_LOCAL
+} FnInstKind;
+
+/* Branches that leave the function need the chunk's view: a same-chunk
+ * target is a goto there (the callee is inlined), which here becomes a call
+ * to the converted callee; a cross-chunk call keeps the chunk's guarded
+ * dolrecomp_direct_call. Everything else is the captured chunk text. */
+static FnInstKind classify(const PPCInst* in, u32 start, u32 end, u32 cstart, u32 cend) {
+    if (in->embedded_data || in->op != PPC_OP_B)
+        return FN_INST_TEXT;
+    const u32 t = in->branch_target;
+    if (t >= start && t < end)
+        return FN_INST_TEXT;
+    const bool same_chunk = t >= cstart && t < cend;
+    if (in->lk)
+        return same_chunk ? FN_INST_CALL_LOCAL : FN_INST_CALL_CROSS;
+    return same_chunk ? FN_INST_TAIL_LOCAL : FN_INST_TEXT;
+}
+
+/* The chunk's pre-branch budget check on a backward same-chunk call or tail
+ * call: leave with pc at the target, exactly as the chunk returns there. */
+static void emit_budget_exit(FILE* out, u32 target) {
+    fprintf(out, "    if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) {\n");
+    fprintf(out, "        ctx->pc = 0x%08Xu;\n", target);
+    fprintf(out, "        goto fn_exit;\n");
+    fprintf(out, "    }\n");
+}
+
+/* Where the chunk would goto the callee's label, call its converted form:
+ * status 0 leaves (the chunk would have returned somewhere inside it), 1 runs
+ * this function's return dispatch, as the chunk's did after the callee's
+ * bclr. */
+static void emit_local_call(FILE* out, const FnUsed* u, u32 target, u32 start) {
+    emit_flush(out, u, "    ");
+    fprintf(out, "    { int fn_%08X_direct(CPUState* ctx); "
+                 "if (!fn_%08X_direct(ctx)) goto fn_exit_raw; }\n",
+            target, target);
+    emit_reload(out, u, "    ");
+    fprintf(out, "    goto return_dispatch_%08X;\n", start);
+}
+
 void emit_fn_prototype(FILE* out, u32 start) {
     fprintf(out, "void fn_%08X(CPUState* ctx);\n", start);
     fprintf(out, "int fn_%08X_direct(CPUState* ctx);\n", start);
@@ -137,9 +182,12 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
     char** texts = (char**)calloc(count, sizeof(char*));
     FnRewriteInfo* infos = (FnRewriteInfo*)calloc(count, sizeof(FnRewriteInfo));
     u32* loop_header_of = (u32*)malloc(count * sizeof(u32));
-    bool ok = texts && infos && loop_header_of;
+    FnInstKind* kinds = (FnInstKind*)calloc(count, sizeof(FnInstKind));
+    bool* tail_exit = (bool*)calloc(count, sizeof(bool));
+    bool ok = texts && infos && loop_header_of && kinds && tail_exit;
     FnUsed used = {0};
-    bool has_bclr = false;
+    bool has_return_dispatch = false;
+    const u32 cend = cstart + ccount * 4u;
 
     if (ok) {
         for (u32 i = 0; i < count; i++)
@@ -160,6 +208,24 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
             in_loop_until = cfg.loop_ends[o + i] - o;
         bool in_loop = in_loop_until != UINT32_MAX && i <= in_loop_until;
         bool fp_guard = in_loop || !(prev_fpu && !cfg.entry_points[o + i]);
+        kinds[i] = classify(&insts[i], start, end, cstart, cend);
+        if (kinds[i] != FN_INST_TEXT) {
+            const u32 t = insts[i].branch_target;
+            if (kinds[i] != FN_INST_CALL_CROSS && !emitter_fn_contains_start(t)) {
+                ok = false; /* a same-chunk callee that is not converted */
+                break;
+            }
+            if (kinds[i] != FN_INST_TAIL_LOCAL)
+                used.spr |= FN_SPR_LR;
+            if (kinds[i] == FN_INST_TAIL_LOCAL)
+                tail_exit[i] = t <= insts[i].address &&
+                    !c_function_cfg_can_loop_directly(&cfg, cinsts, cstart, o + i);
+            has_return_dispatch |= kinds[i] != FN_INST_CALL_CROSS;
+            prev_fpu = false;
+            if (in_loop && i == in_loop_until)
+                in_loop_until = UINT32_MAX;
+            continue;
+        }
         bool direct_backedge = loop_header_of[i] != UINT32_MAX ||
             c_function_cfg_can_loop_directly(&cfg, cinsts, cstart, o + i);
         char* raw = capture_instruction(&insts[i], start, end, direct_backedge,
@@ -187,7 +253,8 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
         used.fpr |= infos[i].fpr_used;
         used.ps1 |= infos[i].ps1_used;
         used.spr |= infos[i].spr_used;
-        has_bclr |= !insts[i].embedded_data && insts[i].op == PPC_OP_BCLR;
+        has_return_dispatch |= !insts[i].embedded_data &&
+            (insts[i].op == PPC_OP_BCLR || (insts[i].op == PPC_OP_BCCTR && insts[i].lk));
         prev_fpu = !insts[i].embedded_data && ppc_op_uses_fpu(insts[i].op);
         if (in_loop && i == in_loop_until)
             in_loop_until = UINT32_MAX;
@@ -224,12 +291,50 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
                 fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
             if (cfg.leaders[o + i] && cfg.block_cycles[o + i] != 0)
                 fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[o + i]);
-            if (infos[i].impure) {
+            switch (kinds[i]) {
+            case FN_INST_CALL_LOCAL: {
+                const u32 t = insts[i].branch_target;
+                fprintf(out, "    glr = 0x%08Xu;\n", insts[i].address + 4u);
+                if (t <= insts[i].address)
+                    emit_budget_exit(out, t);
+                emit_local_call(out, &used, t, start);
+                break;
+            }
+            case FN_INST_CALL_CROSS: {
+                const u32 t = insts[i].branch_target, cont = insts[i].address + 4u;
+                fprintf(out, "    glr = 0x%08Xu;\n", cont);
                 emit_flush(out, &used, "    ");
-                fputs(texts[i], out);
-                emit_reload(out, &used, "    ");
-            } else {
-                fputs(texts[i], out);
+                fprintf(out, "    if (dolrecomp_direct_call(ctx, 0x%08Xu) &&\n", t);
+                fprintf(out, "        !ctx->exception &&\n");
+                fprintf(out, "        ctx->pc == 0x%08Xu &&\n", cont);
+                fprintf(out, "        ctx->downcount > DOLRECOMP_IDLE_PARK_THRESHOLD) {\n");
+                emit_reload(out, &used, "        ");
+                fprintf(out, "        goto label_%08X;\n", cont);
+                fprintf(out, "    }\n");
+                fprintf(out, "    goto fn_exit_raw;\n");
+                break;
+            }
+            case FN_INST_TAIL_LOCAL: {
+                const u32 t = insts[i].branch_target;
+                if (tail_exit[i]) {
+                    fprintf(out, "    ctx->pc = 0x%08Xu;\n", t);
+                    fprintf(out, "    goto fn_exit;\n");
+                    break;
+                }
+                if (t <= insts[i].address)
+                    emit_budget_exit(out, t);
+                emit_local_call(out, &used, t, start);
+                break;
+            }
+            case FN_INST_TEXT:
+                if (infos[i].impure) {
+                    emit_flush(out, &used, "    ");
+                    fputs(texts[i], out);
+                    emit_reload(out, &used, "    ");
+                } else {
+                    fputs(texts[i], out);
+                }
+                break;
             }
             if (loop_header_of[i] != UINT32_MAX)
                 fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address + 4u);
@@ -237,7 +342,7 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
         fprintf(out, "    ctx->pc = 0x%08Xu;\n", end);
         fprintf(out, "    goto fn_exit;\n");
 
-        if (has_bclr) {
+        if (has_return_dispatch) {
             /* The chunk's return_dispatch, in the same order: budget check,
              * then the return addresses it would jump to. A direct entry
              * hands the rest to its caller (status 1), whose own return
@@ -245,11 +350,29 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
              * resumes the chunk for its other local returns. */
             fprintf(out, "return_dispatch_%08X:\n", start);
             fprintf(out, "    if (ctx->downcount <= -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) goto fn_exit;\n");
+            bool any_internal = false;
+            for (u32 i = 0; i < count; i++)
+                any_internal |= cfg.return_targets[o + i] != 0;
+            if (any_internal) {
+                /* The chunk's return_dispatch jumps to these from any caller;
+                 * the locals are current on every path that gets here. */
+                fprintf(out, "    switch (ctx->pc) {\n");
+                for (u32 i = 0; i < count; i++)
+                    if (cfg.return_targets[o + i])
+                        fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
+                                insts[i].address, insts[i].address);
+                fprintf(out, "    default: break;\n");
+                fprintf(out, "    }\n");
+            }
             fprintf(out, "    if (!from_dispatch) goto fn_return;\n");
-            if (chunk && chunk->return_target_count) {
+            u32 external = 0;
+            for (u32 t = 0; chunk && t < chunk->return_target_count; t++)
+                external += chunk->return_targets[t] < start || chunk->return_targets[t] >= end;
+            if (external) {
                 fprintf(out, "    switch (ctx->pc) {\n");
                 for (u32 t = 0; t < chunk->return_target_count; t++)
-                    fprintf(out, "    case 0x%08Xu:\n", chunk->return_targets[t]);
+                    if (chunk->return_targets[t] < start || chunk->return_targets[t] >= end)
+                        fprintf(out, "    case 0x%08Xu:\n", chunk->return_targets[t]);
                 emit_flush(out, &used, "        ");
                 fprintf(out, "        func_%08X(ctx);\n", chunk->chunk_start);
                 fprintf(out, "        return 0;\n");
@@ -277,6 +400,8 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
     free(texts);
     free(infos);
     free(loop_header_of);
+    free(kinds);
+    free(tail_exit);
     c_function_cfg_destroy(&cfg);
     return ok;
 }
