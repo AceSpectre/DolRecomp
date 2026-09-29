@@ -130,6 +130,7 @@ add_library(dr_backend STATIC
     src/backend/c_cfg.c
     src/backend/fn_rewrite.c
     src/backend/fn_select.c
+    src/backend/fn_closure.c
     src/backend/fn_emitter.c
     src/backend/emitter.c
     src/backend/dispatch.c
@@ -214,6 +215,10 @@ add_test(NAME fn_rewrite COMMAND test_fn_rewrite)
 add_executable(test_fn_select tests/test_fn_select.c)
 target_link_libraries(test_fn_select PRIVATE dr_backend)
 add_test(NAME fn_select COMMAND test_fn_select)
+
+add_executable(test_fn_closure tests/test_fn_closure.c)
+target_link_libraries(test_fn_closure PRIVATE dr_backend)
+add_test(NAME fn_closure COMMAND test_fn_closure)
 
 add_executable(test_c_cfg tests/test_c_cfg.c)
 target_link_libraries(test_c_cfg PRIVATE dr_backend)
