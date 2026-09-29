@@ -181,7 +181,8 @@ bool fn_mode_section(const PPCInst* insts, u32 num_insts, u32 base_addr,
                 return false;
             }
         c_function_cfg_destroy(&cfg);
-        FnChunkContext chunk = {base_addr + chunk_first * 4u, targets.v, targets.n};
+        FnChunkContext chunk = {base_addr + chunk_first * 4u, targets.v, targets.n,
+                                insts + chunk_first, chunk_count};
 
         if ((!g.file || g.in_file == FN_PER_FILE) &&
             !open_next_file(chunks_dir, chunks_label, include_name, manifest)) {

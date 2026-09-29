@@ -28,7 +28,8 @@ int main(int argc, char** argv) {
         if (!function_list_add(&funcs, fn_programs[p].addr,
                                fn_programs[p].addr + fn_programs[p].count * 4u))
             return 1;
-    if (!function_list_add(&funcs, FN_PAIR_PLAIN, FN_PAIR_PLAIN + FN_PAIR_COUNT * 4u) ||
+    if (!function_list_add(&funcs, FN_PAD_CHUNK, FN_PAD_CHUNK + FN_PAD_COUNT * 4u) ||
+        !function_list_add(&funcs, FN_PAIR_PLAIN, FN_PAIR_PLAIN + FN_PAIR_COUNT * 4u) ||
         !function_list_add(&funcs, FN_PAIR_FN, FN_PAIR_FN + FN_PAIR_COUNT * 4u))
         return 1;
 
@@ -42,6 +43,7 @@ int main(int argc, char** argv) {
     for (u32 p = 0; p < FN_PROGRAM_COUNT; p++)
         emit_fn_prototype(out, fn_programs[p].addr);
     emit_fn_prototype(out, FN_PAIR_FN + FN_PAIR_LEAF_OFFSET);
+    emit_fn_prototype(out, FN_PAD_CHUNK + FN_PAD_LEAF_OFFSET);
 
     for (u32 p = 0; p < FN_PROGRAM_COUNT; p++) {
         const FnProgram* prog = &fn_programs[p];
@@ -84,10 +86,25 @@ int main(int argc, char** argv) {
             if (cfg.return_targets[i])
                 targets[target_count++] = pair[i].address;
         c_function_cfg_destroy(&cfg);
-        FnChunkContext chunk = {base, targets, target_count};
+        FnChunkContext chunk = {base, targets, target_count, pair, FN_PAIR_COUNT};
         u32 leaf_index = FN_PAIR_LEAF_OFFSET / 4u;
         if (!emit_fn_function(out, pair + leaf_index, FN_PAIR_COUNT - leaf_index,
                               leaf, &chunk))
+            return 1;
+    }
+
+    {
+        PPCInst pad[FN_PAD_COUNT];
+        for (u32 i = 0; i < FN_PAD_COUNT; i++) {
+            pad[i] = ppc_decode(fn_pad_words[i], FN_PAD_CHUNK + 4u * i);
+            pad[i].embedded_data = fn_pad_words[i] == 0u;
+        }
+        if (!emit_function(out, pad, FN_PAD_COUNT, FN_PAD_CHUNK))
+            return 1;
+        u32 leaf_index = FN_PAD_LEAF_OFFSET / 4u;
+        FnChunkContext chunk = {FN_PAD_CHUNK, NULL, 0, pad, FN_PAD_COUNT};
+        if (!emit_fn_function(out, pad + leaf_index, FN_PAD_COUNT - leaf_index,
+                              FN_PAD_CHUNK + FN_PAD_LEAF_OFFSET, &chunk))
             return 1;
     }
 

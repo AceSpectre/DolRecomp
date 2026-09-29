@@ -21,6 +21,12 @@ typedef struct {
     u32 chunk_start;            /* containing chunk: func_<chunk_start> */
     const u32* return_targets;  /* that chunk's local return targets */
     u32 return_target_count;
+    /* The whole containing chunk. Leaders, block costs, entry points and
+     * loops come from the chunk's CFG, restricted to the function, so the
+     * converted code charges and resumes exactly where the chunk would.
+     * NULL: the function is its own chunk (tests). */
+    const PPCInst* chunk_insts;
+    u32 chunk_count;
 } FnChunkContext;
 
 /* Emits fn_<start> and fn_<start>_direct for [start, start + 4 * count).

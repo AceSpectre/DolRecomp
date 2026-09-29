@@ -16,6 +16,14 @@ DECL(80004500)
 
 void func_80005000(CPUState*); void func_80006000(CPUState*);
 void fn_80006014(CPUState*);
+void func_80004600(CPUState*); void fn_80004608(CPUState*);
+
+static void dispatch_pad_fn(CPUState* c) {
+    if (c->pc >= FN_PAD_CHUNK + FN_PAD_LEAF_OFFSET && c->pc < FN_PAD_CHUNK + FN_PAD_COUNT * 4u)
+        fn_80004608(c);
+    else
+        func_80004600(c);
+}
 
 /* The fn copy's dispatcher: converted range -> fn, rest -> chunk. */
 static void dispatch_pair_fn(CPUState* c) {
@@ -161,6 +169,19 @@ int main(void) {
                           0x80004208u};
     ok &= check(2, "odd_entry_falls_back", &mid);
 
+    {
+        /* Dispatcher entry at a leaf start the chunk CFG does not treat as a
+         * leader (padding before it): cold path in both. */
+        static CPUState a, b;
+        if (!cpu_init(&a) || !cpu_init(&b))
+            return 1;
+        a.pc = b.pc = FN_PAD_CHUNK + FN_PAD_LEAF_OFFSET;
+        a.lr = b.lr = LR_SENTINEL;
+        a.msr = b.msr = 0x2000u;
+        u32 ta = run(&a, func_80004600, 100000);
+        u32 tb = run(&b, dispatch_pad_fn, 100000);
+        ok &= same("pad_entry/cold_start", &a, &b, ta, tb);
+    }
     ok &= check_pair("same_chunk_call", 3, 100000);
     ok &= check_pair("same_chunk_call_budget", 3000, 64);
 

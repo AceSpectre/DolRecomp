@@ -118,8 +118,20 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
     if (count == 0 || !ends_unconditionally(insts, count))
         return false;
     const u32 end = start + count * 4u;
+    /* Analyse the containing chunk, as the chunk emitter does, and view it
+     * through the function's window: o is the function's first index in it. */
+    const PPCInst* cinsts = insts;
+    u32 ccount = count, cstart = start;
+    if (chunk && chunk->chunk_insts) {
+        cinsts = chunk->chunk_insts;
+        ccount = chunk->chunk_count;
+        cstart = chunk->chunk_start;
+    }
+    if (start < cstart || end > cstart + ccount * 4u)
+        return false;
+    const u32 o = (start - cstart) / 4u;
     CFunctionCFG cfg;
-    if (!c_function_cfg_build(&cfg, insts, count, start))
+    if (!c_function_cfg_build(&cfg, cinsts, ccount, cstart))
         return false;
 
     char** texts = (char**)calloc(count, sizeof(char*));
@@ -133,8 +145,9 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
         for (u32 i = 0; i < count; i++)
             loop_header_of[i] = UINT32_MAX;
         for (u32 i = 0; i < count; i++)
-            if (cfg.loop_ends[i] != UINT32_MAX)
-                loop_header_of[cfg.loop_ends[i]] = i;
+            if (cfg.loop_ends[o + i] != UINT32_MAX &&
+                cfg.loop_ends[o + i] - o < count)
+                loop_header_of[cfg.loop_ends[o + i] - o] = i;
     }
 
     /* Pass 1: capture and rewrite every instruction's text. The FP guard
@@ -143,12 +156,12 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
     bool prev_fpu = false;
     u32 in_loop_until = UINT32_MAX;
     for (u32 i = 0; ok && i < count; i++) {
-        if (cfg.loop_ends[i] != UINT32_MAX)
-            in_loop_until = cfg.loop_ends[i];
+        if (cfg.loop_ends[o + i] != UINT32_MAX)
+            in_loop_until = cfg.loop_ends[o + i] - o;
         bool in_loop = in_loop_until != UINT32_MAX && i <= in_loop_until;
-        bool fp_guard = in_loop || !(prev_fpu && !cfg.entry_points[i]);
+        bool fp_guard = in_loop || !(prev_fpu && !cfg.entry_points[o + i]);
         bool direct_backedge = loop_header_of[i] != UINT32_MAX ||
-            c_function_cfg_can_loop_directly(&cfg, insts, start, i);
+            c_function_cfg_can_loop_directly(&cfg, cinsts, cstart, o + i);
         char* raw = capture_instruction(&insts[i], start, end, direct_backedge,
                                         fp_guard);
         if (!raw) {
@@ -186,9 +199,11 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
         emit_declarations(out, &used);
         fprintf(out, "    if (!from_dispatch) goto label_%08X;\n", start);
         fprintf(out, "    switch (ctx->pc) {\n");
-        fprintf(out, "    case 0x%08Xu: goto label_%08X;\n", start, start);
-        for (u32 i = 1; i < count; i++)
-            if (cfg.entry_points[i])
+        /* Only the chunk's own entry points resume here; any other pc (the
+         * start included, when padding keeps it from being a leader) takes
+         * the chunk's cold path, exactly as it would without conversion. */
+        for (u32 i = 0; i < count; i++)
+            if (cfg.entry_points[o + i])
                 fprintf(out, "    case 0x%08Xu: goto label_%08X;\n",
                         insts[i].address, insts[i].address);
         fprintf(out, "    default: dolrecomp_find_chunk(ctx->pc)(ctx); return;\n");
@@ -196,7 +211,7 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
 
         for (u32 i = 0; i < count; i++) {
             fprintf(out, "label_%08X:\n", insts[i].address);
-            if (cfg.loop_ends[i] != UINT32_MAX) {
+            if (cfg.loop_ends[o + i] != UINT32_MAX) {
                 u32 a = insts[i].address;
                 fprintf(out, "    if (ctx->idle_hook_pc == 0x%08Xu) {\n", a);
                 emit_flush(out, &used, "        ");
@@ -205,10 +220,10 @@ bool emit_fn_function(FILE* out, const PPCInst* insts, u32 count, u32 start,
                 fprintf(out, "    }\n");
                 fprintf(out, "loopb_%08X:\n", a);
             }
-            if (cfg.materialize_pc[i])
+            if (cfg.materialize_pc[o + i])
                 fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
-            if (cfg.leaders[i] && cfg.block_cycles[i] != 0)
-                fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[i]);
+            if (cfg.leaders[o + i] && cfg.block_cycles[o + i] != 0)
+                fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[o + i]);
             if (infos[i].impure) {
                 emit_flush(out, &used, "    ");
                 fputs(texts[i], out);

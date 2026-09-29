@@ -61,6 +61,21 @@ static const unsigned fn_pair_words[FN_PAIR_COUNT] = {
     0x4E800020u, /* blr */
 };
 
+/* A leaf preceded by alignment padding in its chunk. The padding word is
+ * embedded data, so it does not end a block: in the chunk's CFG the leaf's
+ * first instruction is not a leader, and a dispatcher entry there takes the
+ * chunk's cold path. The converted leaf must do exactly the same. */
+#define FN_PAD_CHUNK 0x80004600u
+#define FN_PAD_LEAF_OFFSET 0x8u
+#define FN_PAD_COUNT 5u
+static const unsigned fn_pad_words[FN_PAD_COUNT] = {
+    0x4E800020u, /* blr (end of the previous function) */
+    0x00000000u, /* padding (embedded data) */
+    0x38630001u, /* leaf: addi r3,r3,1 */
+    0x38630001u, /* addi r3,r3,1 */
+    0x4E800020u, /* blr */
+};
+
 #define FN_PROGRAM_COUNT ((unsigned)(sizeof(fn_programs) / sizeof(fn_programs[0])))
 
 #endif
