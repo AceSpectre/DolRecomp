@@ -569,6 +569,17 @@ void emit_header_for_cpu(FILE* out, DolRecompCPU cpu) {
         "    bits = (bits & keep_mask) + (bits & round);\n"
         "    return dolrecomp_f64_from_bits(bits);\n"
         "}\n"
+        /* Single-precision fused multiply-add, for operands the emitter has
+         * proven hold single-precision values (see sp_known in emitter.c):
+         * then force25 is the identity and fmasingle's double FMA plus its
+         * double-rounding nudge is exactly one correctly rounded f32 FMA. */
+        "#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))\n"
+        "static inline f64 dolrecomp_sp_fma(f64 a, f64 c, f64 b) {\n"
+        "    return (f64)_mm_cvtss_f32(_mm_fmadd_ss(_mm_set_ss((f32)a), _mm_set_ss((f32)c), _mm_set_ss((f32)b)));\n"
+        "}\n"
+        "#else\n"
+        "static inline f64 dolrecomp_sp_fma(f64 a, f64 c, f64 b) { return (f64)fmaf((f32)a, (f32)c, (f32)b); }\n"
+        "#endif\n"
         "static inline f64 dolrecomp_ps_fmasingle(f64 a, f64 c, f64 addend) {\n"
         "    f64 result = dolrecomp_dr_fma(a, c, addend);\n"
         "    u64 bits = dolrecomp_f64_to_bits(result);\n"
@@ -597,6 +608,99 @@ void emit_header(FILE* out) {
 
 void emit_footer(FILE* out) {
     fprintf(out, "\n#endif /* RECOMP_GENERATED_H */\n\n// end\n");
+}
+
+/* ---- known-single tracking -------------------------------------------------
+ * Within one straight-line run of the hot function the emitter knows which FPR
+ * lanes hold a value exactly representable as f32 -- results of single and
+ * paired-single ops, lfs and psq_l. For those operands Gekko's paired rounding
+ * collapses: force_25_bit is the identity (an f32 mantissa has 24 bits), and
+ * fmasingle (a double FMA plus a nudge that makes the later f32 rounding
+ * single) is exactly one correctly rounded f32 FMA. This is Dolphin's JIT
+ * "known single" register typing, done statically.
+ *
+ * The state is per emission pass: cleared at every label (anything can jump
+ * there), at every control transfer (a callee or handler may rewrite FPRs) and
+ * whenever tracking is off -- the cold companion, counted loops and standalone
+ * emits never use it. Clearing is always safe; only setting needs care. */
+/* Thread-local: codegen emits chunks on parallel worker threads (-j). */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define DOLRECOMP_TLS __declspec(thread)
+#else
+#define DOLRECOMP_TLS _Thread_local
+#endif
+static DOLRECOMP_TLS bool g_sp_track;
+static DOLRECOMP_TLS u64 g_sp_known; /* bit r: fpr[r] (ps0); bit 32 + r: ps1[r] */
+
+static bool sp0(u32 r) { return g_sp_track && (g_sp_known >> r & 1u); }
+static bool sp1(u32 r) { return g_sp_track && (g_sp_known >> (32u + r) & 1u); }
+
+static void sp_set(u32 r, bool ps0, bool ps1) {
+    g_sp_known &= ~((1ull << r) | (1ull << (32u + r)));
+    g_sp_known |= (ps0 ? 1ull << r : 0) | (ps1 ? 1ull << (32u + r) : 0);
+}
+
+/* The lane state after inst, given the state before it. */
+static void sp_update(const PPCInst* inst) {
+    const u32 d = inst->rD;
+    switch (inst->op) {
+    case PPC_OP_B: case PPC_OP_BC: case PPC_OP_BCLR: case PPC_OP_BCCTR:
+    case PPC_OP_SC: case PPC_OP_RFI: case PPC_OP_TW: case PPC_OP_TWI:
+    case PPC_OP_MTMSR: case PPC_OP_UNKNOWN:
+        g_sp_known = 0;
+        return;
+    /* single results in both lanes */
+    case PPC_OP_LFS: case PPC_OP_LFSU: case PPC_OP_LFSX: case PPC_OP_LFSUX:
+    case PPC_OP_PSQ_L: case PPC_OP_PSQ_LU: case PPC_OP_PSQ_LX:
+    case PPC_OP_PSQ_LUX:
+    case PPC_OP_FADDS: case PPC_OP_FSUBS: case PPC_OP_FMULS: case PPC_OP_FDIVS:
+    case PPC_OP_FRSP:
+    case PPC_OP_PS_ADD: case PPC_OP_PS_SUB: case PPC_OP_PS_MUL:
+    case PPC_OP_PS_DIV: case PPC_OP_PS_MADD: case PPC_OP_PS_MSUB:
+    case PPC_OP_PS_NMADD: case PPC_OP_PS_NMSUB: case PPC_OP_PS_MULS0:
+    case PPC_OP_PS_MULS1: case PPC_OP_PS_MADDS0: case PPC_OP_PS_MADDS1:
+    case PPC_OP_PS_SUM0: case PPC_OP_PS_SUM1: case PPC_OP_PS_RES:
+    case PPC_OP_PS_RSQRTE: case PPC_OP_PS_MERGE00: case PPC_OP_PS_MERGE01:
+    case PPC_OP_PS_MERGE10: case PPC_OP_PS_MERGE11: case PPC_OP_PS_NEG:
+    case PPC_OP_PS_ABS: case PPC_OP_PS_NABS:
+        sp_set(d, true, true);
+        return;
+    case PPC_OP_PS_MR:
+        sp_set(d, sp0(inst->rB), sp1(inst->rB));
+        return;
+    /* ps0 only; ps1 keeps its state */
+    case PPC_OP_FMR: case PPC_OP_FNEG: case PPC_OP_FABS: case PPC_OP_FNABS:
+        sp_set(d, sp0(inst->rB), sp1(d));
+        return;
+    /* no FPR written */
+    case PPC_OP_STFIWX: case PPC_OP_STFS: case PPC_OP_STFSU: case PPC_OP_STFSX:
+    case PPC_OP_STFSUX: case PPC_OP_STFD: case PPC_OP_STFDU: case PPC_OP_STFDX:
+    case PPC_OP_STFDUX: case PPC_OP_PSQ_ST: case PPC_OP_PSQ_STU:
+    case PPC_OP_PSQ_STX: case PPC_OP_PSQ_STUX: case PPC_OP_FCMPO:
+    case PPC_OP_FCMPU: case PPC_OP_PS_CMPO0: case PPC_OP_PS_CMPO1:
+    case PPC_OP_PS_CMPU0: case PPC_OP_PS_CMPU1: case PPC_OP_MTFSB0:
+    case PPC_OP_MTFSB1: case PPC_OP_MTFSF: case PPC_OP_MTFSFI:
+    case PPC_OP_MCRFS:
+        return;
+    default:
+        /* Any other FP op (double arithmetic, lfd, fctiw, fsel, mffs, the
+         * scalar fused single ops whose helper can leave rD unwritten, ...)
+         * may leave rD holding anything. Integer ops touch no FPR. */
+        if (ppc_op_uses_fpu(inst->op))
+            sp_set(d, false, false);
+        return;
+    }
+}
+
+/* The C multiplicand of a single/paired multiply: force_25_bit unless the
+ * lane is known single. */
+static const char* sp_c(char* buf, size_t n, bool known, const char* lane,
+                        u32 r) {
+    if (known)
+        snprintf(buf, n, "ctx->%s[%u]", lane, r);
+    else
+        snprintf(buf, n, "dolrecomp_ps_force25(ctx->%s[%u])", lane, r);
+    return buf;
 }
 
 /* `cold` selects the lowering used by the cold resume companion (see
@@ -1101,10 +1205,13 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
                 inst->rD, inst->rD, inst->rA, inst->rB);
         break;
 
-    case PPC_OP_FMULS:
-        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] * dolrecomp_ps_force25(ctx->fpr[%u]));\n",
-                inst->rD, inst->rD, inst->rA, inst->rC);
+    case PPC_OP_FMULS: {
+        char c0[64];
+        fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] * %s);\n",
+                inst->rD, inst->rD, inst->rA,
+                sp_c(c0, sizeof(c0), sp0(inst->rC), "fpr", inst->rC));
         break;
+    }
 
     case PPC_OP_FDIVS:
         fprintf(out, "    ctx->fpr[%u] = ctx->ps1[%u] = (f64)(f32)(ctx->fpr[%u] / ctx->fpr[%u]);\n",
@@ -1291,12 +1398,17 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
 
-    case PPC_OP_PS_MUL:
-        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * dolrecomp_ps_force25(ctx->fpr[%u])); "
-                     "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] * dolrecomp_ps_force25(ctx->ps1[%u]));\n",
-                inst->rD, inst->rA, inst->rC, inst->rD, inst->rA, inst->rC);
+    case PPC_OP_PS_MUL: {
+        char c0[64], c1[64];
+        fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * %s); "
+                     "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] * %s);\n",
+                inst->rD, inst->rA,
+                sp_c(c0, sizeof(c0), sp0(inst->rC), "fpr", inst->rC),
+                inst->rD, inst->rA,
+                sp_c(c1, sizeof(c1), sp1(inst->rC), "ps1", inst->rC));
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
+    }
 
     case PPC_OP_PS_DIV:
         fprintf(out, "    ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] / ctx->fpr[%u]); "
@@ -1326,11 +1438,20 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
          * NaN. Locals hold both lanes so any rD/source aliasing is safe. */
         int sub = (inst->op == PPC_OP_PS_MSUB || inst->op == PPC_OP_PS_NMSUB);
         int neg = (inst->op == PPC_OP_PS_NMADD || inst->op == PPC_OP_PS_NMSUB);
+        /* Per lane: all three operands known single -> one f32 FMA; else the
+         * Gekko path, minus force25 when only C is known. */
+        bool all0 = sp0(inst->rA) && sp0(inst->rC) && sp0(inst->rB);
+        bool all1 = sp1(inst->rA) && sp1(inst->rC) && sp1(inst->rB);
+        char c0[64], c1[64];
         fprintf(out,
-                "    { f64 p0 = dolrecomp_ps_fmasingle(ctx->fpr[%u], dolrecomp_ps_force25(ctx->fpr[%u]), %sctx->fpr[%u]); "
-                "f64 p1 = dolrecomp_ps_fmasingle(ctx->ps1[%u], dolrecomp_ps_force25(ctx->ps1[%u]), %sctx->ps1[%u]); ",
-                inst->rA, inst->rC, sub ? "-" : "", inst->rB,
-                inst->rA, inst->rC, sub ? "-" : "", inst->rB);
+                "    { f64 p0 = %s(ctx->fpr[%u], %s, %sctx->fpr[%u]); "
+                "f64 p1 = %s(ctx->ps1[%u], %s, %sctx->ps1[%u]); ",
+                all0 ? "dolrecomp_sp_fma" : "dolrecomp_ps_fmasingle", inst->rA,
+                sp_c(c0, sizeof(c0), sp0(inst->rC), "fpr", inst->rC),
+                sub ? "-" : "", inst->rB,
+                all1 ? "dolrecomp_sp_fma" : "dolrecomp_ps_fmasingle", inst->rA,
+                sp_c(c1, sizeof(c1), sp1(inst->rC), "ps1", inst->rC),
+                sub ? "-" : "", inst->rB);
         if (neg)
             fprintf(out, "if (!isnan(p0)) p0 = -p0; if (!isnan(p1)) p1 = -p1; ");
         fprintf(out, "ctx->fpr[%u] = (f64)(f32)p0; ctx->ps1[%u] = (f64)(f32)p1; }\n",
@@ -1392,66 +1513,58 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
      * in cpu.c byte-for-byte, minus the FPRF update the inlined scalar ops
      * also omit. */
     case PPC_OP_PS_MULS0:
-        fprintf(out, "    { f64 s = dolrecomp_ps_force25(ctx->fpr[%u]); "
+    case PPC_OP_PS_MULS1: {
+        bool lane1 = inst->op == PPC_OP_PS_MULS1;
+        bool known = lane1 ? sp1(inst->rC) : sp0(inst->rC);
+        char c[64];
+        fprintf(out, "    { f64 s = %s; "
                      "ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * s); "
                      "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] * s); }\n",
-                inst->rC, inst->rD, inst->rA, inst->rD, inst->rA);
+                sp_c(c, sizeof(c), known, lane1 ? "ps1" : "fpr", inst->rC),
+                inst->rD, inst->rA, inst->rD, inst->rA);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
-
-    case PPC_OP_PS_MULS1:
-        fprintf(out, "    { f64 s = dolrecomp_ps_force25(ctx->ps1[%u]); "
-                     "ctx->fpr[%u] = (f64)(f32)(ctx->fpr[%u] * s); "
-                     "ctx->ps1[%u] = (f64)(f32)(ctx->ps1[%u] * s); }\n",
-                inst->rC, inst->rD, inst->rA, inst->rD, inst->rA);
-        if (inst->rc) emit_set_cr1_from_fpscr(out);
-        break;
+    }
 
     case PPC_OP_PS_MADDS0:
-        fprintf(out, "    { f64 s = dolrecomp_ps_force25(ctx->fpr[%u]); "
-                     "ctx->fpr[%u] = (f64)(f32)dolrecomp_ps_fmasingle(ctx->fpr[%u], s, ctx->fpr[%u]); "
-                     "ctx->ps1[%u] = (f64)(f32)dolrecomp_ps_fmasingle(ctx->ps1[%u], s, ctx->ps1[%u]); }\n",
-                inst->rC, inst->rD, inst->rA, inst->rB, inst->rD, inst->rA, inst->rB);
+    case PPC_OP_PS_MADDS1: {
+        bool lane1 = inst->op == PPC_OP_PS_MADDS1;
+        bool known = lane1 ? sp1(inst->rC) : sp0(inst->rC);
+        bool all0 = known && sp0(inst->rA) && sp0(inst->rB);
+        bool all1 = known && sp1(inst->rA) && sp1(inst->rB);
+        char c[64];
+        fprintf(out, "    { f64 s = %s; "
+                     "ctx->fpr[%u] = (f64)(f32)%s(ctx->fpr[%u], s, ctx->fpr[%u]); "
+                     "ctx->ps1[%u] = (f64)(f32)%s(ctx->ps1[%u], s, ctx->ps1[%u]); }\n",
+                sp_c(c, sizeof(c), known, lane1 ? "ps1" : "fpr", inst->rC),
+                inst->rD, all0 ? "dolrecomp_sp_fma" : "dolrecomp_ps_fmasingle",
+                inst->rA, inst->rB, inst->rD,
+                all1 ? "dolrecomp_sp_fma" : "dolrecomp_ps_fmasingle",
+                inst->rA, inst->rB);
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
-
-    case PPC_OP_PS_MADDS1:
-        fprintf(out, "    { f64 s = dolrecomp_ps_force25(ctx->ps1[%u]); "
-                     "ctx->fpr[%u] = (f64)(f32)dolrecomp_ps_fmasingle(ctx->fpr[%u], s, ctx->fpr[%u]); "
-                     "ctx->ps1[%u] = (f64)(f32)dolrecomp_ps_fmasingle(ctx->ps1[%u], s, ctx->ps1[%u]); }\n",
-                inst->rC, inst->rD, inst->rA, inst->rB, inst->rD, inst->rA, inst->rB);
-        if (inst->rc) emit_set_cr1_from_fpscr(out);
-        break;
+    }
 
     /* ps_merge reads both sources before writing rD: when rD aliases rA or
      * rB, writing ctx->fpr[rD] first would corrupt the second read. */
+    /* A source lane already known single needs no rounding. */
     case PPC_OP_PS_MERGE00:
-        fprintf(out, "    { f64 mrg_a = ctx->fpr[%u], mrg_b = ctx->fpr[%u];\n", inst->rA, inst->rB);
-        fprintf(out, "      ctx->fpr[%u] = dolrecomp_ps_round(mrg_a);\n", inst->rD);
-        fprintf(out, "      ctx->ps1[%u] = dolrecomp_ps_round(mrg_b); }\n", inst->rD);
-        if (inst->rc) emit_set_cr1_from_fpscr(out);
-        break;
-
     case PPC_OP_PS_MERGE01:
-        fprintf(out, "    { f64 mrg_a = ctx->fpr[%u], mrg_b = ctx->ps1[%u];\n", inst->rA, inst->rB);
-        fprintf(out, "      ctx->fpr[%u] = dolrecomp_ps_round(mrg_a);\n", inst->rD);
-        fprintf(out, "      ctx->ps1[%u] = dolrecomp_ps_round(mrg_b); }\n", inst->rD);
-        if (inst->rc) emit_set_cr1_from_fpscr(out);
-        break;
-
     case PPC_OP_PS_MERGE10:
-        fprintf(out, "    { f64 mrg_a = ctx->ps1[%u], mrg_b = ctx->fpr[%u];\n", inst->rA, inst->rB);
-        fprintf(out, "      ctx->fpr[%u] = dolrecomp_ps_round(mrg_a);\n", inst->rD);
-        fprintf(out, "      ctx->ps1[%u] = dolrecomp_ps_round(mrg_b); }\n", inst->rD);
+    case PPC_OP_PS_MERGE11: {
+        bool a1 = inst->op == PPC_OP_PS_MERGE10 || inst->op == PPC_OP_PS_MERGE11;
+        bool b1 = inst->op == PPC_OP_PS_MERGE01 || inst->op == PPC_OP_PS_MERGE11;
+        bool ka = a1 ? sp1(inst->rA) : sp0(inst->rA);
+        bool kb = b1 ? sp1(inst->rB) : sp0(inst->rB);
+        fprintf(out, "    { f64 mrg_a = ctx->%s[%u], mrg_b = ctx->%s[%u];\n",
+                a1 ? "ps1" : "fpr", inst->rA, b1 ? "ps1" : "fpr", inst->rB);
+        fprintf(out, "      ctx->fpr[%u] = %s(mrg_a);\n", inst->rD,
+                ka ? "" : "dolrecomp_ps_round");
+        fprintf(out, "      ctx->ps1[%u] = %s(mrg_b); }\n", inst->rD,
+                kb ? "" : "dolrecomp_ps_round");
         if (inst->rc) emit_set_cr1_from_fpscr(out);
         break;
-
-    case PPC_OP_PS_MERGE11:
-        fprintf(out, "    { f64 mrg_a = ctx->ps1[%u], mrg_b = ctx->ps1[%u];\n", inst->rA, inst->rB);
-        fprintf(out, "      ctx->fpr[%u] = dolrecomp_ps_round(mrg_a);\n", inst->rD);
-        fprintf(out, "      ctx->ps1[%u] = dolrecomp_ps_round(mrg_b); }\n", inst->rD);
-        if (inst->rc) emit_set_cr1_from_fpscr(out);
-        break;
+    }
 
     case PPC_OP_PS_CMPU0:
     case PPC_OP_PS_CMPO0:
@@ -2078,10 +2191,17 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
      * exception, but that arrives through the cold companion, which guards
      * every FP op. See ppc_fp_available in cpu.h. */
     bool prev_fpu = false;
+    /* Known-single lanes (see sp_update): only this hot pass tracks them,
+     * and a label -- an entry from anywhere -- forgets everything. */
+    g_sp_track = true;
+    g_sp_known = 0;
     for (u32 i = 0; i < count; i++) {
-        if (cfg.entry_points[i])
+        if (cfg.entry_points[i]) {
             fprintf(out, "label_%08X:\n", insts[i].address);
+            g_sp_known = 0;
+        }
         if (cfg.loop_ends[i] != UINT32_MAX) {
+            g_sp_known = 0;
             u32 continuation = insts[cfg.loop_ends[i]].address + 4u;
             fprintf(out, "    loop_%08X(ctx);\n", insts[i].address);
             if (continuation < func_end) {
@@ -2102,7 +2222,13 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
             c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
             has_local_returns, emit_fp_guard, false);
         prev_fpu = !insts[i].embedded_data && ppc_op_uses_fpu(insts[i].op);
+        if (insts[i].embedded_data)
+            g_sp_known = 0;
+        else
+            sp_update(&insts[i]);
     }
+    g_sp_track = false;
+    g_sp_known = 0;
 
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", func_end);
     if (has_local_returns) {
