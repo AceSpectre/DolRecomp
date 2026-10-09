@@ -249,6 +249,38 @@ extern bool (*dolrecomp_wgpipe_write)(CPUState* cpu, u32 ea, u64 value, u8 size)
 #define DOLRECOMP_LC_FAST_HIT(cpu, addr, size) \
     ((u32)((addr) - DOLRECOMP_LC_BASE) <= (u32)sizeof((cpu)->lc) - (size))
 
+/* Base-register proofs (emitter, hot pass): a block checks a base register
+ * once -- the stack pointer or a small-data base -- and then addresses
+ * memory off it with no per-access test or call. dolrecomp_base_host returns
+ * the host offset that turns any guest address within DOLRECOMP_BASE_MARGIN
+ * of `base` into a host pointer, or 0 when that range is not wholly inside
+ * MEM1 or MEM2 or when a store could need the slow path (write journal,
+ * outstanding reservation); the block then resumes in the cold companion,
+ * which does every access the ordinary way. */
+#define DOLRECOMP_BASE_MARGIN 0x20000u
+static inline uintptr_t dolrecomp_base_host(const CPUState* cpu, u32 base) {
+    if (cpu->journal_active || cpu->reserve_valid)
+        return 0;
+    u32 o = base - GC_RAM_BASE;
+    if (o >= DOLRECOMP_BASE_MARGIN &&
+        o <= cpu->ram_size - DOLRECOMP_BASE_MARGIN)
+        return (uintptr_t)cpu->ram - GC_RAM_BASE;
+    o = base - WII_MEM2_BASE;
+    if (cpu->mem2 && o >= DOLRECOMP_BASE_MARGIN &&
+        o <= cpu->mem2_size - DOLRECOMP_BASE_MARGIN)
+        return (uintptr_t)cpu->mem2 - WII_MEM2_BASE;
+    return 0;
+}
+#define DOLRECOMP_HB(hb, ea) ((u8*)((hb) + (uintptr_t)(u32)(ea)))
+static inline u64 dolrecomp_hb_read64(uintptr_t hb, u32 ea) { return read_be64(DOLRECOMP_HB(hb, ea)); }
+static inline u32 dolrecomp_hb_read32(uintptr_t hb, u32 ea) { return read_be32(DOLRECOMP_HB(hb, ea)); }
+static inline u16 dolrecomp_hb_read16(uintptr_t hb, u32 ea) { return read_be16(DOLRECOMP_HB(hb, ea)); }
+static inline u8 dolrecomp_hb_read8(uintptr_t hb, u32 ea) { return *DOLRECOMP_HB(hb, ea); }
+static inline void dolrecomp_hb_write64(uintptr_t hb, u32 ea, u64 v) { write_be64(DOLRECOMP_HB(hb, ea), v); }
+static inline void dolrecomp_hb_write32(uintptr_t hb, u32 ea, u32 v) { write_be32(DOLRECOMP_HB(hb, ea), v); }
+static inline void dolrecomp_hb_write16(uintptr_t hb, u32 ea, u16 v) { write_be16(DOLRECOMP_HB(hb, ea), v); }
+static inline void dolrecomp_hb_write8(uintptr_t hb, u32 ea, u8 v) { *DOLRECOMP_HB(hb, ea) = v; }
+
 #ifdef DOLRECOMP_FLAT_GUEST_MEMORY
 #define DOLRECOMP_FLAT_FAST_HIT(cpu, addr, size) \
     (DOLRECOMP_MEM_FAST_HIT((cpu), (addr), (size)) || \
@@ -522,8 +554,10 @@ static inline u32 dolrecomp_psq_f32_store_bits(f64 v) {
  * misalignment and disabled PSE/LSQE fall through to the out-of-line slow
  * path, which remains the single definition of the semantics. The gqr index
  * is a call-site constant in generated code, so the GQR fetch folds. */
-static inline bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w,
-                                u8 gqr, bool indexed, u32 cia) {
+/* The fast paths alone: true when they did the access. They cannot raise,
+ * so generated code checks ctx->exception only after the slow path. */
+static inline bool dolrecomp_psq_load_fast(CPUState* cpu, u8 frD, u32 ea,
+                                           bool w, u8 gqr, bool indexed) {
     if ((cpu->hid2 & PPC_HID2_PSE) &&
         (indexed || (cpu->hid2 & PPC_HID2_LSQE)) &&
         ((cpu->gqr[gqr & 7u] >> 16) & 7u) == 0 && (ea & 3u) == 0) {
@@ -539,11 +573,11 @@ static inline bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w,
         }
         return true;
     }
-    return ppc_psq_load_slow(cpu, frD, ea, w, gqr, indexed, cia);
+    return false;
 }
 
-static inline bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w,
-                                 u8 gqr, bool indexed, u32 cia) {
+static inline bool dolrecomp_psq_store_fast(CPUState* cpu, u8 frS, u32 ea,
+                                            bool w, u8 gqr, bool indexed) {
     if ((cpu->hid2 & PPC_HID2_PSE) &&
         (indexed || (cpu->hid2 & PPC_HID2_LSQE)) &&
         (cpu->gqr[gqr & 7u] & 7u) == 0 && (ea & 3u) == 0) {
@@ -552,7 +586,19 @@ static inline bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w,
             mem_write32(cpu, ea + 4u, dolrecomp_psq_f32_store_bits(cpu->ps1[frS]));
         return true;
     }
-    return ppc_psq_store_slow(cpu, frS, ea, w, gqr, indexed, cia);
+    return false;
+}
+
+static inline bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w,
+                                u8 gqr, bool indexed, u32 cia) {
+    return dolrecomp_psq_load_fast(cpu, frD, ea, w, gqr, indexed) ||
+           ppc_psq_load_slow(cpu, frD, ea, w, gqr, indexed, cia);
+}
+
+static inline bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w,
+                                 u8 gqr, bool indexed, u32 cia) {
+    return dolrecomp_psq_store_fast(cpu, frS, ea, w, gqr, indexed) ||
+           ppc_psq_store_slow(cpu, frS, ea, w, gqr, indexed, cia);
 }
 u32 ppc_eciwx(CPUState* cpu, u32 ea, u32 cia);
 void ppc_ecowx(CPUState* cpu, u32 ea, u32 value, u32 cia);

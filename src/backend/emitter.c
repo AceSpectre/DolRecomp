@@ -103,13 +103,143 @@ static void emit_xform_ea(FILE* out, u8 ra, u8 rb, bool update) {
     }
 }
 
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#define DOLRECOMP_TLS __declspec(thread)
+#else
+#define DOLRECOMP_TLS _Thread_local
+#endif
+/* ---- base-register proofs (hot pass only; see dolrecomp_base_host) ----
+ * r1 (stack), r2 and r13 (small-data bases) address most loads and stores.
+ * Within a block the first access off one emits a check that sets hbN and
+ * bails to the cold companion at that instruction if it fails (the hot path
+ * charged the whole block's cycles at its leader and the cold companion
+ * charges only at leaders, so resuming there is exact). Later accesses off
+ * the same base use hbN directly, as long as the base moved by at most
+ * g_hb_delta through addi / update-form accesses and the access stays inside
+ * DOLRECOMP_BASE_MARGIN. A label, any other write to the base, or an
+ * instruction that can change the reservation/journal or run arbitrary host
+ * code drops the proof. */
+static DOLRECOMP_TLS bool g_hb_track;
+static DOLRECOMP_TLS u32 g_hb_func;
+static DOLRECOMP_TLS u32 g_hb_proven;   /* bit r: hb<r> valid */
+static DOLRECOMP_TLS s32 g_hb_delta[32]; /* base moved since the check */
+
+static bool hb_reg(u32 r) { return r == 1 || r == 2 || r == 13; }
+
+static void hb_reset(void) { g_hb_proven = 0; }
+
+static bool hb_is_update_dform(PPCOpcode op) {
+    switch (op) {
+    case PPC_OP_LWZU: case PPC_OP_LBZU: case PPC_OP_LHZU: case PPC_OP_LHAU:
+    case PPC_OP_STWU: case PPC_OP_STBU: case PPC_OP_STHU:
+    case PPC_OP_LFSU: case PPC_OP_LFDU: case PPC_OP_STFSU: case PPC_OP_STFDU:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The proof state after inst. */
+static void hb_update(const PPCInst* inst) {
+    if (!g_hb_track)
+        return;
+    switch (inst->op) {
+    case PPC_OP_B: case PPC_OP_BC: case PPC_OP_BCLR: case PPC_OP_BCCTR:
+    case PPC_OP_SC: case PPC_OP_RFI: case PPC_OP_TW: case PPC_OP_TWI:
+    case PPC_OP_MTMSR: case PPC_OP_MTSPR: case PPC_OP_MFSPR:
+    case PPC_OP_UNKNOWN: case PPC_OP_LWARX: case PPC_OP_STWCX:
+    case PPC_OP_LMW: case PPC_OP_LSWI: case PPC_OP_LSWX:
+    case PPC_OP_DCBZ: case PPC_OP_DCBZ_L: case PPC_OP_DCBI:
+        hb_reset();
+        return;
+    /* no general-purpose register written */
+    case PPC_OP_STW: case PPC_OP_STB: case PPC_OP_STH:
+    case PPC_OP_STWX: case PPC_OP_STBX: case PPC_OP_STHX:
+    case PPC_OP_STWBRX: case PPC_OP_STHBRX: case PPC_OP_STMW:
+    case PPC_OP_CMP: case PPC_OP_CMPI: case PPC_OP_CMPL: case PPC_OP_CMPLI:
+        return;
+    case PPC_OP_ADDI:
+        if (inst->rD == inst->rA && hb_reg(inst->rD) &&
+            (g_hb_proven >> inst->rD & 1u)) {
+            g_hb_delta[inst->rD] += inst->simm;
+            return;
+        }
+        break;
+    default:
+        break;
+    }
+    if (hb_is_update_dform(inst->op) && hb_reg(inst->rA)) {
+        /* rA advanced by simm; a load's rD is never rA (invalid form) */
+        if (g_hb_proven >> inst->rA & 1u)
+            g_hb_delta[inst->rA] += inst->simm;
+        if (inst->rD != inst->rA)
+            g_hb_proven &= ~(1u << inst->rD);
+        return;
+    }
+    if (ppc_op_uses_fpu(inst->op)) {
+        /* FP ops write no GPR, except the update forms (handled above and
+         * below: an indexed update writes rA) */
+        switch (inst->op) {
+        case PPC_OP_LFSUX: case PPC_OP_LFDUX: case PPC_OP_STFSUX:
+        case PPC_OP_STFDUX: case PPC_OP_PSQ_LU: case PPC_OP_PSQ_LUX:
+        case PPC_OP_PSQ_STU: case PPC_OP_PSQ_STUX:
+            g_hb_proven &= ~(1u << inst->rA);
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+    g_hb_proven &= ~((1u << inst->rD) | (1u << inst->rA));
+}
+
+/* For a D-form access of `size` bytes off inst->rA: the hb variable to use
+ * (emitting the check first if the block has not proven it), or NULL for
+ * the ordinary helper path. */
+static const char* hb_for_access(FILE* out, const PPCInst* inst, u32 size) {
+    static const char* names[32] = {[1] = "hb1", [2] = "hb2", [13] = "hb13"};
+    const u32 r = inst->rA;
+    if (!g_hb_track || !hb_reg(r))
+        return NULL;
+    s64 reach = (s64)g_hb_delta[r] + inst->simm;
+    if (reach < 0)
+        reach = -reach;
+    if (!(g_hb_proven >> r & 1u) ||
+        reach + (s64)size > (s64)(0x20000 - 8)) {
+        fprintf(out, "    hb%u = dolrecomp_base_host(ctx, ctx->gpr[%u]);\n", r, r);
+        fprintf(out, "    if (!hb%u) { ctx->pc = 0x%08Xu; func_%08X_cold(ctx); return; }\n",
+                r, inst->address, g_hb_func);
+        g_hb_proven |= 1u << r;
+        g_hb_delta[r] = 0;
+    }
+    return names[r];
+}
+
+/* "mem_readN(ctx, ea)" inside expr, rewritten to read through hb. */
+static void emit_hb_expr(FILE* out, const char* expr, const char* hb) {
+    const char* at = hb ? strstr(expr, "mem_read") : NULL;
+    if (!at) {
+        fputs(expr, out);
+        return;
+    }
+    const char* args = strstr(at, "(ctx, ");
+    fprintf(out, "%.*sdolrecomp_hb_%.*s(%s, %s", (int)(at - expr), expr,
+            (int)(args - at - 4), at + 4, hb, args + 6);
+}
+
 static void emit_load(FILE* out, const PPCInst* inst, const char* read_expr,
                       bool update) {
+    const u32 size = strstr(read_expr, "read32") ? 4 :
+                     strstr(read_expr, "read16") ? 2 : 1;
+    const char* hb = hb_for_access(out, inst, size);
     fprintf(out, "    {\n");
     fprintf(out, "        u32 ea = ");
     emit_dform_ea(out, inst->rA, inst->simm, update);
     fprintf(out, ";\n");
-    fprintf(out, "        ctx->gpr[%u] = %s;\n", inst->rD, read_expr);
+    fprintf(out, "        ctx->gpr[%u] = ", inst->rD);
+    emit_hb_expr(out, read_expr, hb);
+    fprintf(out, ";\n");
     if (update) {
         fprintf(out, "        ctx->gpr[%u] = ea;\n", inst->rA);
     }
@@ -131,12 +261,19 @@ static void emit_loadx(FILE* out, const PPCInst* inst, const char* read_expr,
 
 static void emit_store(FILE* out, const PPCInst* inst, const char* write_func,
                        const char* cast_type, bool update) {
+    const u32 size = strstr(write_func, "32") ? 4 :
+                     strstr(write_func, "16") ? 2 : 1;
+    const char* hb = hb_for_access(out, inst, size);
     fprintf(out, "    {\n");
     fprintf(out, "        u32 ea = ");
     emit_dform_ea(out, inst->rA, inst->simm, update);
     fprintf(out, ";\n");
-    fprintf(out, "        %s(ctx, ea, (%s)ctx->gpr[%u]);\n",
-            write_func, cast_type, inst->rS);
+    if (hb)
+        fprintf(out, "        dolrecomp_hb_%s(%s, ea, (%s)ctx->gpr[%u]);\n",
+                write_func + 4, hb, cast_type, inst->rS);
+    else
+        fprintf(out, "        %s(ctx, ea, (%s)ctx->gpr[%u]);\n",
+                write_func, cast_type, inst->rS);
     if (update) {
         fprintf(out, "        ctx->gpr[%u] = ea;\n", inst->rA);
     }
@@ -159,17 +296,21 @@ static void emit_storex(FILE* out, const PPCInst* inst, const char* write_func,
 
 static void emit_fload(FILE* out, const PPCInst* inst, bool single,
                        bool update) {
+    const char* hb = hb_for_access(out, inst, single ? 4 : 8);
     fprintf(out, "    {\n");
     fprintf(out, "        u32 ea = ");
     emit_dform_ea(out, inst->rA, inst->simm, update);
     fprintf(out, ";\n");
     if (single) {
-        fprintf(out, "        f64 value = (f64)dolrecomp_f32_from_bits(mem_read32(ctx, ea));\n");
+        fprintf(out, "        f64 value = (f64)dolrecomp_f32_from_bits(");
+        emit_hb_expr(out, "mem_read32(ctx, ea)", hb);
+        fprintf(out, ");\n");
         fprintf(out, "        ctx->fpr[%u] = value;\n", inst->rD);
         fprintf(out, "        ctx->ps1[%u] = value;\n", inst->rD);
     } else {
-        fprintf(out, "        ctx->fpr[%u] = dolrecomp_f64_from_bits(mem_read64(ctx, ea));\n",
-                inst->rD);
+        fprintf(out, "        ctx->fpr[%u] = dolrecomp_f64_from_bits(", inst->rD);
+        emit_hb_expr(out, "mem_read64(ctx, ea)", hb);
+        fprintf(out, ");\n");
     }
     if (update) {
         fprintf(out, "        ctx->gpr[%u] = ea;\n", inst->rA);
@@ -199,13 +340,20 @@ static void emit_floadx(FILE* out, const PPCInst* inst, bool single,
 
 static void emit_fstore(FILE* out, const PPCInst* inst, bool single,
                         bool update) {
+    const char* hb = hb_for_access(out, inst, single ? 4 : 8);
     fprintf(out, "    {\n");
     fprintf(out, "        u32 ea = ");
     emit_dform_ea(out, inst->rA, inst->simm, update);
     fprintf(out, ";\n");
-    if (single) {
+    if (single && hb) {
+        fprintf(out, "        dolrecomp_hb_write32(%s, ea, dolrecomp_f32_to_bits((f32)ctx->fpr[%u]));\n",
+                hb, inst->rS);
+    } else if (single) {
         fprintf(out, "        mem_write32(ctx, ea, dolrecomp_f32_to_bits((f32)ctx->fpr[%u]));\n",
                 inst->rS);
+    } else if (hb) {
+        fprintf(out, "        dolrecomp_hb_write64(%s, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]));\n",
+                hb, inst->rS);
     } else {
         fprintf(out, "        mem_write64(ctx, ea, dolrecomp_f64_to_bits(ctx->fpr[%u]));\n",
                 inst->rS);
@@ -245,10 +393,17 @@ static void emit_psq_load(FILE* out, const PPCInst* inst, bool indexed,
         emit_dform_ea(out, inst->rA, inst->simm, update);
     }
     fprintf(out, ";\n");
-    fprintf(out, "        ppc_psq_load(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
+    /* Only the slow path can raise, so only it is followed by the exception
+     * test (a return, which would otherwise stop the compiler keeping guest
+     * state in registers across every psq_l). */
+    fprintf(out, "        if (!dolrecomp_psq_load_fast(ctx, %uu, ea, %s, %uu, %s)) {\n",
+            inst->rD, inst->w ? "true" : "false", inst->i,
+            indexed ? "true" : "false");
+    fprintf(out, "            ppc_psq_load_slow(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
             inst->rD, inst->w ? "true" : "false", inst->i,
             indexed ? "true" : "false", inst->address);
-    fprintf(out, "        if (ctx->exception) return;\n");
+    fprintf(out, "            if (ctx->exception) return;\n");
+    fprintf(out, "        }\n");
     if (update) {
         fprintf(out, "        ctx->gpr[%u] = ea;\n", inst->rA);
     }
@@ -265,10 +420,14 @@ static void emit_psq_store(FILE* out, const PPCInst* inst, bool indexed,
         emit_dform_ea(out, inst->rA, inst->simm, update);
     }
     fprintf(out, ";\n");
-    fprintf(out, "        ppc_psq_store(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
+    fprintf(out, "        if (!dolrecomp_psq_store_fast(ctx, %uu, ea, %s, %uu, %s)) {\n",
+            inst->rS, inst->w ? "true" : "false", inst->i,
+            indexed ? "true" : "false");
+    fprintf(out, "            ppc_psq_store_slow(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
             inst->rS, inst->w ? "true" : "false", inst->i,
             indexed ? "true" : "false", inst->address);
-    fprintf(out, "        if (ctx->exception) return;\n");
+    fprintf(out, "            if (ctx->exception) return;\n");
+    fprintf(out, "        }\n");
     if (update) {
         fprintf(out, "        ctx->gpr[%u] = ea;\n", inst->rA);
     }
@@ -634,6 +793,19 @@ static DOLRECOMP_TLS u64 g_sp_known; /* bit r: fpr[r] (ps0); bit 32 + r: ps1[r] 
 
 static bool sp0(u32 r) { return g_sp_track && (g_sp_known >> r & 1u); }
 static bool sp1(u32 r) { return g_sp_track && (g_sp_known >> (32u + r) & 1u); }
+
+/* Instructions that may change MSR[FP] (directly, or through an exception,
+ * rfi or a helper that runs arbitrary host code) before falling through. */
+static bool fp_resets(PPCOpcode op) {
+    switch (op) {
+    case PPC_OP_SC: case PPC_OP_RFI: case PPC_OP_TW: case PPC_OP_TWI:
+    case PPC_OP_MTMSR: case PPC_OP_MTSPR: case PPC_OP_MFSPR:
+    case PPC_OP_UNKNOWN:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static void sp_set(u32 r, bool ps0, bool ps1) {
     g_sp_known &= ~((1ull << r) | (1ull << (32u + r)));
@@ -2156,6 +2328,8 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     emit_function_cold(out, insts, &cfg, count, func_addr, func_end);
 
     fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
+    fprintf(out, "    uintptr_t hb1 = 0, hb2 = 0, hb13 = 0;\n");
+    fprintf(out, "    (void)hb1; (void)hb2; (void)hb13;\n");
     /* Entry switch, cases only for addresses control can arrive at from
      * outside this function: the chunk start, block leaders, return addresses,
      * and addresses some other chunk branches to (cfg->entry_points). Every
@@ -2181,24 +2355,31 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     fprintf(out, "    }\n");
 
     /* FP-availability guard hoist: ppc_fp_available is emitted before every FP
-     * op. Within a straight-line run of FP ops it is redundant -- MSR[FP] is
-     * unchanged by any FP op, so if the run's first guard passed, later ops in
-     * the run see FP available. We may drop op i's guard only if it cannot be
+     * op. Within a basic block it is redundant after the first one -- MSR[FP]
+     * changes only through mtmsr, an exception or rfi (sc, tw, rfi, mtmsr, and
+     * the helper-run mtspr/mfspr/unknown instructions, after which fp_known
+     * resets), so if one guard passed, later FP ops in the block see FP
+     * available. Every block leader is an entry point and resets it too. We may drop op i's guard only if it cannot be
      * entered except by falling through the (guarded) FP op before it: not a
      * an entry point, i.e. the entry switch has no case for it. (Entry points
      * are a superset of the leaders and return targets this used to test.)
      * The dispatcher can still re-enter here after an FP-unavailable / DSI
      * exception, but that arrives through the cold companion, which guards
      * every FP op. See ppc_fp_available in cpu.h. */
-    bool prev_fpu = false;
+    bool fp_known = false;
     /* Known-single lanes (see sp_update): only this hot pass tracks them,
      * and a label -- an entry from anywhere -- forgets everything. */
     g_sp_track = true;
     g_sp_known = 0;
+    g_hb_track = !getenv("DOLRECOMP_NO_BASE_PROOF");
+    g_hb_func = func_addr;
+    hb_reset();
     for (u32 i = 0; i < count; i++) {
         if (cfg.entry_points[i]) {
             fprintf(out, "label_%08X:\n", insts[i].address);
             g_sp_known = 0;
+            fp_known = false;
+            hb_reset();
         }
         if (cfg.loop_ends[i] != UINT32_MAX) {
             g_sp_known = 0;
@@ -2209,25 +2390,33 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
                         continuation, continuation);
             }
             fprintf(out, "    return;\n");
-            prev_fpu = false;
+            fp_known = false;
+            hb_reset();
             continue;
         }
         if (cfg.materialize_pc[i])
             fprintf(out, "    ctx->pc = 0x%08Xu;\n", insts[i].address);
         if (cfg.leaders[i] && cfg.block_cycles[i] != 0)
             fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[i]);
-        bool emit_fp_guard = !(prev_fpu && !cfg.entry_points[i]);
+        bool emit_fp_guard = !(fp_known && !cfg.entry_points[i]);
         emit_instruction_with_range(
             out, &insts[i], func_addr, func_end,
             c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
             has_local_returns, emit_fp_guard, false);
-        prev_fpu = !insts[i].embedded_data && ppc_op_uses_fpu(insts[i].op);
-        if (insts[i].embedded_data)
+        if (insts[i].embedded_data || fp_resets(insts[i].op))
+            fp_known = false;
+        else if (ppc_op_uses_fpu(insts[i].op))
+            fp_known = true;
+        if (insts[i].embedded_data) {
             g_sp_known = 0;
-        else
+            hb_reset();
+        } else {
             sp_update(&insts[i]);
+            hb_update(&insts[i]);
+        }
     }
     g_sp_track = false;
+    g_hb_track = false;
     g_sp_known = 0;
 
     fprintf(out, "    ctx->pc = 0x%08Xu;\n", func_end);
