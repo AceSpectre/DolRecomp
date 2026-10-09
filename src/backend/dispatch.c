@@ -237,9 +237,32 @@ void emit_dispatch_helpers_fn(FILE* out, const FunctionList* funcs, u32 entry_po
     fprintf(out, "\nstatic inline int dolrecomp_call(CPUState* ctx, u32 address) {\n");
     fprintf(out, "    u32 alias;\n");
     fprintf(out, "    ctx->pc = address;\n");
+    /* Direct table first (see g_dolrecomp_dispatch in cpu.h): a hit is a pc
+     * with no replacement build, no host-call target and a known function,
+     * exactly what the chain below would reach. */
+    fprintf(out, "#if !defined(DOLRECOMP_ENABLE_REPLACEMENTS)\n");
+    fprintf(out, "    {\n");
+    fprintf(out, "        DolRecompDispatchFn* table = g_dolrecomp_dispatch;\n");
+    fprintf(out, "        u32 off = address - DOLRECOMP_DISPATCH_BASE;\n");
+    fprintf(out, "        if (table && off < DOLRECOMP_DISPATCH_SPAN) {\n");
+    fprintf(out, "            DolRecompDispatchFn fn = table[off >> 2];\n");
+    fprintf(out, "            if (fn && !(off & 3u)) { fn(ctx); return 1; }\n");
+    fprintf(out, "        }\n");
+    fprintf(out, "    }\n");
+    fprintf(out, "#endif\n");
     fprintf(out, "    if (dolrecomp_dispatch_replacement(ctx, address)) return 1;\n");
     fprintf(out, "    if (ctx->host_call && ppc_host_call(ctx, address)) return 1;\n");
-    fprintf(out, "    if (dolrecomp_call_original(ctx, address)) return 1;\n");
+    fprintf(out, "    {\n");
+    fprintf(out, "        DolRecompFunction fn = dolrecomp_find_original_cached(address);\n");
+    fprintf(out, "        if (fn) {\n");
+    fprintf(out, "#if !defined(DOLRECOMP_ENABLE_REPLACEMENTS)\n");
+    fprintf(out, "            dolrecomp_dispatch_fill(ctx, address, fn);\n");
+    fprintf(out, "#endif\n");
+    fprintf(out, "            ctx->pc = address;\n");
+    fprintf(out, "            fn(ctx);\n");
+    fprintf(out, "            return 1;\n");
+    fprintf(out, "        }\n");
+    fprintf(out, "    }\n");
     fprintf(out, "    if (dolrecomp_physical_pc_alias(ctx, address, &alias)) {\n");
     fprintf(out, "        ctx->pc = alias;\n");
     fprintf(out, "        if (dolrecomp_dispatch_replacement(ctx, alias)) return 1;\n");

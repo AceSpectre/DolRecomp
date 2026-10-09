@@ -537,6 +537,22 @@ void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia);
 bool ppc_spr_known(u16 spr);
 void ppc_rfi(CPUState* cpu, u32 cia);
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia);
+/* Direct dispatch table: the recompiled function for each guest pc in
+ * [DOLRECOMP_DISPATCH_BASE, +SPAN), one slot per instruction, NULL when
+ * unknown or when the pc may have a host-call target. The generated
+ * dolrecomp_call tries it before the host-call filter and the chunk lookup,
+ * and fills it (dolrecomp_dispatch_fill) only for pcs the host-call filter
+ * says have no target, so it changes no behaviour. The runtime clears a slot
+ * when it adds a host-call target (dolrecomp_dispatch_forget); republishing
+ * the filter clears the table. NULL table: disabled (DOLRECOMP_NO_DISPATCH_TABLE
+ * in the environment, or not yet allocated). */
+typedef void (*DolRecompDispatchFn)(CPUState* ctx);
+#define DOLRECOMP_DISPATCH_BASE 0x80000000u
+#define DOLRECOMP_DISPATCH_SPAN 0x00500000u
+extern DolRecompDispatchFn* g_dolrecomp_dispatch;
+void dolrecomp_dispatch_fill(const CPUState* cpu, u32 address, DolRecompDispatchFn fn);
+void dolrecomp_dispatch_forget(u32 address);
+
 bool ppc_psq_load_slow(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
 bool ppc_psq_store_slow(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
 

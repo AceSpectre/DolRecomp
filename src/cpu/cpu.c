@@ -582,12 +582,58 @@ static const u32* g_hc_l1;
 static u32 g_hc_base;
 static u32 g_hc_span;
 
+DolRecompDispatchFn* g_dolrecomp_dispatch;
+static int g_dispatch_disabled = -1;
+
 void ppc_set_host_call_filter(const u32* filter, const u32* l1, u32 base,
                               u32 span) {
     g_hc_filter = filter;
     g_hc_base = base;
     g_hc_span = span;
     g_hc_l1 = l1; /* published last: a reader that sees l1 sees the rest */
+    if (g_dolrecomp_dispatch)
+        memset(g_dolrecomp_dispatch, 0,
+               (DOLRECOMP_DISPATCH_SPAN >> 2) * sizeof(DolRecompDispatchFn));
+}
+
+void dolrecomp_dispatch_forget(u32 address) {
+    const u32 off = address - DOLRECOMP_DISPATCH_BASE;
+    if (g_dolrecomp_dispatch && off < DOLRECOMP_DISPATCH_SPAN)
+        g_dolrecomp_dispatch[off >> 2] = NULL;
+}
+
+/* Cache fn for address when the dispatcher would reach it with nothing
+ * before it: no host-call target per the filter (or no host_call at all). */
+void dolrecomp_dispatch_fill(const CPUState* cpu, u32 address,
+                             DolRecompDispatchFn fn) {
+    const u32 off = address - DOLRECOMP_DISPATCH_BASE;
+    if (off >= DOLRECOMP_DISPATCH_SPAN || (off & 3u))
+        return;
+    if (cpu->host_call) {
+        const u32* l1 = g_hc_l1;
+        if (!l1)
+            return; /* gate off: every entry must reach host_call */
+        const u32 hoff = address - g_hc_base;
+        if (hoff >= g_hc_span)
+            return; /* outside the filter: host_call is always asked */
+        const u32 page = hoff >> 12, slot = hoff >> 2;
+        if (((l1[page >> 5] >> (page & 31u)) & 1u) &&
+            ((g_hc_filter[slot >> 5] >> (slot & 31u)) & 1u))
+            return; /* has a target */
+    }
+    if (!g_dolrecomp_dispatch) {
+        if (g_dispatch_disabled < 0)
+            g_dispatch_disabled = getenv("DOLRECOMP_NO_DISPATCH_TABLE") != NULL;
+        if (g_dispatch_disabled)
+            return;
+        g_dolrecomp_dispatch = calloc(DOLRECOMP_DISPATCH_SPAN >> 2,
+                                      sizeof(DolRecompDispatchFn));
+        if (!g_dolrecomp_dispatch) {
+            g_dispatch_disabled = 1;
+            return;
+        }
+    }
+    g_dolrecomp_dispatch[off >> 2] = fn;
 }
 
 bool ppc_host_call(CPUState* cpu, u32 address) {

@@ -97,8 +97,11 @@ int main(void) {
                  "if (ctx->host_call && ppc_host_call(ctx, alias)) return 1;") != NULL &&
           strstr(code, "if (dolrecomp_call_original(ctx, alias)) return 1;") != NULL,
           "public dispatcher retries physical MEM1 aliases");
-    check(strstr(code, "if (dolrecomp_call_original(ctx, address)) return 1;") != NULL,
+    check(strstr(code, "DolRecompFunction fn = dolrecomp_find_original_cached(address);") != NULL &&
+          strstr(code, "dolrecomp_dispatch_fill(ctx, address, fn);") != NULL,
           "public dispatcher can fall back to original code");
+    check(strstr(code, "DolRecompDispatchFn fn = table[off >> 2];") != NULL,
+          "public dispatcher tries the direct table first");
 
     free(code);
     printf("DISPATCH,total,%d passed %d failed\n", pass_count, fail_count);
