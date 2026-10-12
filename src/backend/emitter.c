@@ -129,6 +129,68 @@ static bool hb_reg(u32 r) { return r == 1 || r == 2 || r == 13; }
 
 static void hb_reset(void) { g_hb_proven = 0; }
 
+/* GPRs inst may write; all ones when it can write several or arbitrary ones
+ * (or the reservation that store proofs depend on). Precise for the common
+ * forms so that `addi rD, r13, x` does not count as writing r13. */
+static u32 hb_writes(const PPCInst* inst) {
+    switch (inst->op) {
+    case PPC_OP_LWARX: case PPC_OP_STWCX: case PPC_OP_LMW:
+    case PPC_OP_LSWI: case PPC_OP_LSWX: case PPC_OP_UNKNOWN:
+        return 0xFFFFFFFFu;
+    case PPC_OP_STW: case PPC_OP_STB: case PPC_OP_STH: case PPC_OP_STMW:
+    case PPC_OP_STWX: case PPC_OP_STBX: case PPC_OP_STHX:
+    case PPC_OP_STWBRX: case PPC_OP_STHBRX: case PPC_OP_STSWI:
+    case PPC_OP_STSWX: case PPC_OP_STFIWX:
+    case PPC_OP_CMP: case PPC_OP_CMPI: case PPC_OP_CMPL: case PPC_OP_CMPLI:
+    case PPC_OP_B: case PPC_OP_BC: case PPC_OP_BCLR: case PPC_OP_BCCTR:
+    case PPC_OP_TW: case PPC_OP_TWI: case PPC_OP_SC: case PPC_OP_RFI:
+    case PPC_OP_MTSPR: case PPC_OP_MTCRF: case PPC_OP_MTMSR:
+    case PPC_OP_MTSR: case PPC_OP_MTSRIN:
+    case PPC_OP_CRAND: case PPC_OP_CRANDC: case PPC_OP_CREQV:
+    case PPC_OP_CRNAND: case PPC_OP_CRNOR: case PPC_OP_CROR:
+    case PPC_OP_CRORC: case PPC_OP_CRXOR: case PPC_OP_MCRF: case PPC_OP_MCRXR:
+    case PPC_OP_DCBZ: case PPC_OP_DCBZ_L: case PPC_OP_DCBST: case PPC_OP_DCBF:
+    case PPC_OP_DCBTST: case PPC_OP_DCBT: case PPC_OP_DCBI: case PPC_OP_ICBI:
+    case PPC_OP_SYNC: case PPC_OP_EIEIO: case PPC_OP_ISYNC:
+    case PPC_OP_TLBIE: case PPC_OP_TLBSYNC: case PPC_OP_ECOWX:
+        return 0;
+    case PPC_OP_ADDI: case PPC_OP_ADDIS: case PPC_OP_ADDIC:
+    case PPC_OP_ADDIC_DOT: case PPC_OP_SUBFIC: case PPC_OP_MULLI:
+    case PPC_OP_ADD: case PPC_OP_ADDO: case PPC_OP_ADDC: case PPC_OP_ADDCO:
+    case PPC_OP_ADDE: case PPC_OP_ADDEO: case PPC_OP_ADDME: case PPC_OP_ADDMEO:
+    case PPC_OP_ADDZE: case PPC_OP_ADDZEO: case PPC_OP_SUBF: case PPC_OP_SUBFO:
+    case PPC_OP_SUBFC: case PPC_OP_SUBFCO: case PPC_OP_SUBFE:
+    case PPC_OP_SUBFEO: case PPC_OP_SUBFME: case PPC_OP_SUBFMEO:
+    case PPC_OP_SUBFZE: case PPC_OP_SUBFZEO: case PPC_OP_NEG: case PPC_OP_NEGO:
+    case PPC_OP_MULLW: case PPC_OP_MULLWO: case PPC_OP_MULHW:
+    case PPC_OP_MULHWU: case PPC_OP_DIVW: case PPC_OP_DIVWO: case PPC_OP_DIVWU:
+    case PPC_OP_DIVWUO:
+    case PPC_OP_LWZ: case PPC_OP_LBZ: case PPC_OP_LHZ: case PPC_OP_LHA:
+    case PPC_OP_LWZX: case PPC_OP_LBZX: case PPC_OP_LHZX: case PPC_OP_LHAX:
+    case PPC_OP_LWBRX: case PPC_OP_LHBRX: case PPC_OP_ECIWX:
+    case PPC_OP_MFSPR: case PPC_OP_MFCR: case PPC_OP_MFMSR: case PPC_OP_MFTB:
+    case PPC_OP_MFSR: case PPC_OP_MFSRIN:
+        return 1u << inst->rD;
+    default:
+        break;
+    }
+    if (ppc_op_uses_fpu(inst->op)) {
+        switch (inst->op) {
+        case PPC_OP_LFSU: case PPC_OP_LFDU: case PPC_OP_STFSU: case PPC_OP_STFDU:
+        case PPC_OP_LFSUX: case PPC_OP_LFDUX: case PPC_OP_STFSUX:
+        case PPC_OP_STFDUX: case PPC_OP_PSQ_LU: case PPC_OP_PSQ_LUX:
+        case PPC_OP_PSQ_STU: case PPC_OP_PSQ_STUX:
+            return 1u << inst->rA;
+        default:
+            return 0;
+        }
+    }
+    /* update-form integer accesses, logical/rotate/shift (rA), and anything
+     * else: both fields */
+    return (1u << inst->rD) | (1u << inst->rA);
+}
+
+
 static bool hb_is_update_dform(PPCOpcode op) {
     switch (op) {
     case PPC_OP_LWZU: case PPC_OP_LBZU: case PPC_OP_LHZU: case PPC_OP_LHAU:
@@ -191,7 +253,9 @@ static void hb_update(const PPCInst* inst) {
         }
         return;
     }
-    g_hb_proven &= ~((1u << inst->rD) | (1u << inst->rA));
+    /* only the registers the instruction actually writes (a load off r1
+     * writes rD, not r1) */
+    g_hb_proven &= ~hb_writes(inst);
 }
 
 /* For a D-form access of `size` bytes off inst->rA: the hb variable to use
@@ -214,6 +278,28 @@ static const char* hb_for_access(FILE* out, const PPCInst* inst, u32 size) {
         g_hb_delta[r] = 0;
     }
     return names[r];
+}
+
+
+/* ---- psq plain-float proofs (hot pass only; see dolrecomp_psq_plain) ----
+ * pq[k] holds dolrecomp_psq_plain for combination k = gqr | store << 3 |
+ * indexed << 4, computed by the first psq access of a block that uses it.
+ * Like the base proofs it lives only within a block: labels, loop helpers
+ * and instructions that may change GQRs or HID2 (mtspr, mtmsr, sc, rfi,
+ * unknown) forget it. */
+static DOLRECOMP_TLS u32 g_pq_known;
+
+static u32 pq_index(const PPCInst* inst, bool store, bool indexed) {
+    return (inst->i & 7u) | (store ? 8u : 0u) | (indexed ? 16u : 0u);
+}
+
+static void pq_prepare(FILE* out, const PPCInst* inst, bool store, bool indexed) {
+    const u32 k = pq_index(inst, store, indexed);
+    if (g_pq_known >> k & 1u)
+        return;
+    fprintf(out, "    pq[%u] = dolrecomp_psq_plain(ctx, %uu, %s, %s);\n", k,
+            inst->i & 7u, store ? "true" : "false", indexed ? "true" : "false");
+    g_pq_known |= 1u << k;
 }
 
 /* "mem_readN(ctx, ea)" inside expr, rewritten to read through hb. */
@@ -385,6 +471,12 @@ static void emit_fstorex(FILE* out, const PPCInst* inst, bool single,
 
 static void emit_psq_load(FILE* out, const PPCInst* inst, bool indexed,
                           bool update) {
+    const char* hb = NULL;
+    if (g_hb_track) {
+        pq_prepare(out, inst, false, indexed);
+        if (!indexed)
+            hb = hb_for_access(out, inst, 8);
+    }
     fprintf(out, "    {\n");
     fprintf(out, "        u32 ea = ");
     if (indexed) {
@@ -393,10 +485,28 @@ static void emit_psq_load(FILE* out, const PPCInst* inst, bool indexed,
         emit_dform_ea(out, inst->rA, inst->simm, update);
     }
     fprintf(out, ";\n");
+    if (g_hb_track) {
+        /* plain floats proven for this block: only alignment is per access */
+        fprintf(out, "        if (pq[%u] && !(ea & 3u)) {\n",
+                pq_index(inst, false, indexed));
+        fprintf(out, "            ctx->fpr[%u] = (f64)dolrecomp_f32_from_bits(", inst->rD);
+        emit_hb_expr(out, "mem_read32(ctx, ea)", hb);
+        fprintf(out, ");\n");
+        if (inst->w) {
+            fprintf(out, "            ctx->ps1[%u] = 1.0;\n", inst->rD);
+        } else {
+            fprintf(out, "            ctx->ps1[%u] = (f64)dolrecomp_f32_from_bits(", inst->rD);
+            emit_hb_expr(out, "mem_read32(ctx, ea + 4u)", hb);
+            fprintf(out, ");\n");
+        }
+        fprintf(out, "        } else ");
+    } else {
+        fprintf(out, "        ");
+    }
     /* Only the slow path can raise, so only it is followed by the exception
      * test (a return, which would otherwise stop the compiler keeping guest
      * state in registers across every psq_l). */
-    fprintf(out, "        if (!dolrecomp_psq_load_fast(ctx, %uu, ea, %s, %uu, %s)) {\n",
+    fprintf(out, "if (!dolrecomp_psq_load_fast(ctx, %uu, ea, %s, %uu, %s)) {\n",
             inst->rD, inst->w ? "true" : "false", inst->i,
             indexed ? "true" : "false");
     fprintf(out, "            ppc_psq_load_slow(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
@@ -412,6 +522,12 @@ static void emit_psq_load(FILE* out, const PPCInst* inst, bool indexed,
 
 static void emit_psq_store(FILE* out, const PPCInst* inst, bool indexed,
                            bool update) {
+    const char* hb = NULL;
+    if (g_hb_track) {
+        pq_prepare(out, inst, true, indexed);
+        if (!indexed)
+            hb = hb_for_access(out, inst, 8);
+    }
     fprintf(out, "    {\n");
     fprintf(out, "        u32 ea = ");
     if (indexed) {
@@ -420,7 +536,28 @@ static void emit_psq_store(FILE* out, const PPCInst* inst, bool indexed,
         emit_dform_ea(out, inst->rA, inst->simm, update);
     }
     fprintf(out, ";\n");
-    fprintf(out, "        if (!dolrecomp_psq_store_fast(ctx, %uu, ea, %s, %uu, %s)) {\n",
+    if (g_hb_track) {
+        fprintf(out, "        if (pq[%u] && !(ea & 3u)) {\n",
+                pq_index(inst, true, indexed));
+        if (hb)
+            fprintf(out, "            dolrecomp_hb_write32(%s, ea, dolrecomp_psq_f32_store_bits(ctx->fpr[%u]));\n",
+                    hb, inst->rS);
+        else
+            fprintf(out, "            mem_write32(ctx, ea, dolrecomp_psq_f32_store_bits(ctx->fpr[%u]));\n",
+                    inst->rS);
+        if (!inst->w) {
+            if (hb)
+                fprintf(out, "            dolrecomp_hb_write32(%s, ea + 4u, dolrecomp_psq_f32_store_bits(ctx->ps1[%u]));\n",
+                        hb, inst->rS);
+            else
+                fprintf(out, "            mem_write32(ctx, ea + 4u, dolrecomp_psq_f32_store_bits(ctx->ps1[%u]));\n",
+                        inst->rS);
+        }
+        fprintf(out, "        } else ");
+    } else {
+        fprintf(out, "        ");
+    }
+    fprintf(out, "if (!dolrecomp_psq_store_fast(ctx, %uu, ea, %s, %uu, %s)) {\n",
             inst->rS, inst->w ? "true" : "false", inst->i,
             indexed ? "true" : "false");
     fprintf(out, "            ppc_psq_store_slow(ctx, %uu, ea, %s, %uu, %s, 0x%08Xu);\n",
@@ -2330,6 +2467,7 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
     fprintf(out, "    uintptr_t hb1 = 0, hb2 = 0, hb13 = 0;\n");
     fprintf(out, "    (void)hb1; (void)hb2; (void)hb13;\n");
+    fprintf(out, "    bool pq[32]; (void)pq;\n");
     /* Entry switch, cases only for addresses control can arrive at from
      * outside this function: the chunk start, block leaders, return addresses,
      * and addresses some other chunk branches to (cfg->entry_points). Every
@@ -2374,12 +2512,14 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     g_hb_track = !getenv("DOLRECOMP_NO_BASE_PROOF");
     g_hb_func = func_addr;
     hb_reset();
+    g_pq_known = 0;
     for (u32 i = 0; i < count; i++) {
         if (cfg.entry_points[i]) {
             fprintf(out, "label_%08X:\n", insts[i].address);
             g_sp_known = 0;
             fp_known = false;
             hb_reset();
+            g_pq_known = 0;
         }
         if (cfg.loop_ends[i] != UINT32_MAX) {
             g_sp_known = 0;
@@ -2392,6 +2532,7 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
             fprintf(out, "    return;\n");
             fp_known = false;
             hb_reset();
+            g_pq_known = 0;
             continue;
         }
         if (cfg.materialize_pc[i])
@@ -2403,8 +2544,10 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
             out, &insts[i], func_addr, func_end,
             c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
             has_local_returns, emit_fp_guard, false);
-        if (insts[i].embedded_data || fp_resets(insts[i].op))
+        if (insts[i].embedded_data || fp_resets(insts[i].op)) {
             fp_known = false;
+            g_pq_known = 0;
+        }
         else if (ppc_op_uses_fpu(insts[i].op))
             fp_known = true;
         if (insts[i].embedded_data) {

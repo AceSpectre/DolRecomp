@@ -605,6 +605,19 @@ static inline bool dolrecomp_psq_store_fast(CPUState* cpu, u8 frS, u32 ea,
     return false;
 }
 
+/* Whether psq accesses through GQR `gqr` are plain floats right now: the
+ * fast-path conditions above minus the alignment test. Generated code asks
+ * once per block (GQRs and HID2 change only through mtspr) and then does
+ * aligned accesses inline. */
+static inline bool dolrecomp_psq_plain(const CPUState* cpu, u32 gqr,
+                                       bool store, bool indexed) {
+    if (!(cpu->hid2 & PPC_HID2_PSE) ||
+        (!indexed && !(cpu->hid2 & PPC_HID2_LSQE)))
+        return false;
+    const u32 g = cpu->gqr[gqr & 7u];
+    return store ? (g & 7u) == 0 : ((g >> 16) & 7u) == 0;
+}
+
 static inline bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w,
                                 u8 gqr, bool indexed, u32 cia) {
     return dolrecomp_psq_load_fast(cpu, frD, ea, w, gqr, indexed) ||
