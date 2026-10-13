@@ -2277,6 +2277,12 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         case 919: fprintf(out, "    ctx->gpr[%u] = ctx->gqr[7];\n", inst->rD); break;
         case 282: fprintf(out, "    ctx->gpr[%u] = ctx->ear;\n", inst->rD); break;
         case 920: fprintf(out, "    ctx->gpr[%u] = ctx->hid2;\n", inst->rD); break;
+        case 922: case 923: /* DMAU/DMAL: see MTSPR */
+            fprintf(out, "    ctx->gpr[%u] = ppc_mfspr(ctx, %uu, 0x%08Xu);\n",
+                    inst->rD, inst->spr, inst->address);
+            fprintf(out, "    if (!ctx->exception) ctx->pc = 0x%08Xu;\n", inst->address + 4u);
+            fprintf(out, "    return;\n");
+            break;
         default:
             fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
                     inst->raw, inst->address);
@@ -2302,6 +2308,17 @@ static void emit_instruction_with_range(FILE* out, const PPCInst* inst,
         case 918: fprintf(out, "    ctx->gqr[6] = ctx->gpr[%u];\n", inst->rS); break;
         case 919: fprintf(out, "    ctx->gqr[7] = ctx->gpr[%u];\n", inst->rS); break;
         case 920: fprintf(out, "    ctx->hid2 = ctx->gpr[%u];\n", inst->rS); break;
+        case 922: case 923:
+            /* Locked-cache DMA (LCLoadBlocks/LCStoreBlocks, nw4r::g3d's
+             * matrix staging): call the helper directly instead of decoding
+             * the instruction again in the fallback. Still a return to the
+             * dispatcher, exactly as the fallback did: the host loop counts
+             * those round trips, so keeping them keeps guest timing. */
+            fprintf(out, "    ppc_mtspr(ctx, %uu, ctx->gpr[%u], 0x%08Xu);\n",
+                    inst->spr, inst->rS, inst->address);
+            fprintf(out, "    if (!ctx->exception) ctx->pc = 0x%08Xu;\n", inst->address + 4u);
+            fprintf(out, "    return;\n");
+            break;
         default:
             fprintf(out, "    ppc_fallback_instruction(ctx, 0x%08Xu, 0x%08Xu);\n",
                     inst->raw, inst->address);

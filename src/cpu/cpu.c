@@ -904,7 +904,31 @@ void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
                             load ? "mem->lc" : "lc->mem", mem_addr, lc_addr,
                             lines * 32u, mem_read32(cpu, lc_addr));
             }
-            for (u32 i = 0; i < lines * 32u; i += 4) {
+            const u32 bytes = lines * 32u;
+#ifndef DOLRECOMP_FLAT_GUEST_MEMORY
+            /* Bulk copy when every word of the loop below would take the
+             * inline fast path both ways: the whole span in the locked cache
+             * and in cached MEM1 or MEM2, no write journal, no reservation.
+             * The two never overlap, so the bytes match the word loop. */
+            if (!cpu->journal_active && !cpu->reserve_valid &&
+                DOLRECOMP_LC_FAST_HIT(cpu, lc_addr, bytes)) {
+                u8* mem = NULL;
+                if (DOLRECOMP_MEM_FAST_HIT(cpu, mem_addr, bytes))
+                    mem = cpu->ram + (mem_addr - GC_RAM_BASE);
+                else if (DOLRECOMP_MEM2_FAST_HIT(cpu, mem_addr, bytes))
+                    mem = cpu->mem2 + (mem_addr - WII_MEM2_BASE);
+                if (mem) {
+                    u8* lc = cpu->lc + (lc_addr - DOLRECOMP_LC_BASE);
+                    if (load)
+                        memcpy(lc, mem, bytes);
+                    else
+                        memcpy(mem, lc, bytes);
+                    cpu->spr[923] &= ~2u;
+                    return;
+                }
+            }
+#endif
+            for (u32 i = 0; i < bytes; i += 4) {
                 if (load)
                     mem_write32(cpu, lc_addr + i, mem_read32(cpu, mem_addr + i));
                 else
