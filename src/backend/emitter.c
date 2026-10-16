@@ -302,6 +302,291 @@ static void pq_prepare(FILE* out, const PPCInst* inst, bool store, bool indexed)
     g_pq_known |= 1u << k;
 }
 
+/* ---- R1: block-local guest register caching (hot pass, opt-in) ----
+ * GPRs, CR, XER, CTR and LR live in C locals (grN, gcr, gxer, gctr, glr)
+ * within a block. Each instruction's C text is rewritten: the first
+ * instruction touching a register loads it from ctx, writes go to the local
+ * and mark it dirty, and every way out -- return, goto, the cold companion,
+ * the instruction fallback -- first stores the dirty locals back. Helpers on
+ * the r1_safe_call list touch guest memory, FPRs or MSR but never these
+ * registers (MMIO handlers included), so they are not barriers; any other
+ * call taking ctx makes the instruction a barrier: dirty locals are stored,
+ * it runs on ctx as before, and the cache starts over. A block ends by
+ * storing back, so every label and loop helper sees ctx as the truth.
+ * On for every hot function by default; DOLRECOMP_R1 = "off" disables it and
+ * a comma list of hot function addresses (hex) limits it to those (A/B). */
+#define R1_KEYS 36u /* gpr0-31, cr, xer, ctr, lr */
+static DOLRECOMP_TLS bool g_r1_on;
+static DOLRECOMP_TLS u64 g_r1_loaded;
+static DOLRECOMP_TLS u64 g_r1_dirty;
+static DOLRECOMP_TLS FILE* g_r1_tmp;
+static DOLRECOMP_TLS char* g_r1_buf;
+static DOLRECOMP_TLS size_t g_r1_cap;
+
+static bool r1_enabled_for(u32 func_addr) {
+    const char* e = getenv("DOLRECOMP_R1");
+    if (!e || !*e || !strcmp(e, "all"))
+        return true;
+    if (!strcmp(e, "off"))
+        return false;
+    while (*e) {
+        char* end;
+        unsigned long a = strtoul(e, &end, 16);
+        if (end == e)
+            break;
+        if ((u32)a == func_addr)
+            return true;
+        e = *end == ',' ? end + 1 : end;
+    }
+    return false;
+}
+
+static void r1_names(u32 k, char* field, char* local) {
+    static const char* f[] = {"ctx->cr", "ctx->xer", "ctx->ctr", "ctx->lr"};
+    static const char* l[] = {"gcr", "gxer", "gctr", "glr"};
+    if (k < 32) {
+        sprintf(field, "ctx->gpr[%u]", k);
+        sprintf(local, "gr%u", k);
+    } else {
+        strcpy(field, f[k - 32]);
+        strcpy(local, l[k - 32]);
+    }
+}
+
+static void r1_put_stores(FILE* out, u64 set) {
+    char f[24], l[16];
+    for (u32 k = 0; k < R1_KEYS; k++) {
+        if (set >> k & 1u) {
+            r1_names(k, f, l);
+            fprintf(out, "%s = %s; ", f, l);
+        }
+    }
+}
+
+/* Store the dirty locals at a block boundary and forget the cache. */
+static void r1_block_end(FILE* out) {
+    if (g_r1_on && g_r1_dirty) {
+        fprintf(out, "    ");
+        r1_put_stores(out, g_r1_dirty);
+        fprintf(out, "\n");
+    }
+    g_r1_loaded = g_r1_dirty = 0;
+}
+
+static bool r1_ident(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+/* A guest-register reference at p: its key (length in *len), or -1. */
+static int r1_match(const char* p, size_t* len) {
+    if (strncmp(p, "ctx->", 5) != 0)
+        return -1;
+    const char* q = p + 5;
+    const char* e;
+    int k;
+    if (!strncmp(q, "gpr[", 4)) {
+        char* end;
+        unsigned long n = strtoul(q + 4, &end, 10);
+        if (end == q + 4 || *end != ']' || n > 31)
+            return -1;
+        k = (int)n;
+        e = end + 1;
+    } else if (!strncmp(q, "cr", 2)) {
+        k = 32; e = q + 2;
+    } else if (!strncmp(q, "xer", 3)) {
+        k = 33; e = q + 3;
+    } else if (!strncmp(q, "ctr", 3)) {
+        k = 34; e = q + 3;
+    } else if (!strncmp(q, "lr", 2)) {
+        k = 35; e = q + 2;
+    } else {
+        return -1;
+    }
+    if (k >= 32 && r1_ident(*e))
+        return -1;
+    *len = (size_t)(e - p);
+    return k;
+}
+
+static bool r1_is_write(const char* a) {
+    while (*a == ' ')
+        a++;
+    if (a[0] == '=' && a[1] != '=')
+        return true;
+    if (a[0] && strchr("+-|&^*/%", a[0]) && a[1] == '=')
+        return true;
+    if ((a[0] == '<' || a[0] == '>') && a[1] == a[0] && a[2] == '=')
+        return true;
+    return (a[0] == '+' && a[1] == '+') || (a[0] == '-' && a[1] == '-');
+}
+
+/* Calls taking ctx that never read or write the cached registers. */
+static bool r1_safe_call(const char* name, size_t n) {
+    static const char* prefixes[] = {
+        "mem_read", "mem_write", "dolrecomp_hb_", "dolrecomp_base_host",
+        "dolrecomp_psq_", "ppc_psq_load_slow", "ppc_psq_store_slow",
+        "ppc_fp_available", "ppc_fma", "ppc_fctiw", "dolrecomp_pc_slot"};
+    for (size_t i = 0; i < sizeof prefixes / sizeof *prefixes; i++) {
+        size_t m = strlen(prefixes[i]);
+        if (n >= m && !strncmp(name, prefixes[i], m))
+            return true;
+    }
+    return false;
+}
+
+/* Calls that leave the function (always followed by return): stores go in
+ * front of them. */
+static bool r1_exit_call(const char* name, size_t n) {
+    return (n == 19 && !strncmp(name, "func_", 5) && !strncmp(name + 13, "_cold", 5)) ||
+           (n == 24 && !strncmp(name, "ppc_fallback_instruction", 24));
+}
+
+/* Copy one statement starting at p (through its ';') wrapped in the stores. */
+static size_t r1_wrap_stmt(FILE* out, const char* p, u64 stores) {
+    const char* semi = strchr(p, ';');
+    size_t n = semi ? (size_t)(semi - p) + 1 : strlen(p);
+    fprintf(out, "{ ");
+    r1_put_stores(out, stores);
+    fwrite(p, 1, n, out);
+    fprintf(out, " }");
+    return n;
+}
+
+/* Emit one instruction's C text (n bytes) through the register cache. */
+static void r1_emit(FILE* out, const char* t, size_t n) {
+    u64 touched = 0, writes = 0;
+    bool barrier = false;
+    for (size_t i = 0; i < n;) {
+        size_t len;
+        int k;
+        if (t[i] == '/' && t[i + 1] == '/') {
+            while (i < n && t[i] != '\n')
+                i++;
+            continue;
+        }
+        if ((k = r1_match(t + i, &len)) >= 0) {
+            touched |= 1ull << k;
+            if (r1_is_write(t + i + len))
+                writes |= 1ull << k;
+            i += len;
+            continue;
+        }
+        /* ctx->gpr[r] with a computed index (lmw/stmw loops): the cache
+         * cannot follow it, so the instruction runs on ctx. */
+        if (!strncmp(t + i, "ctx->gpr", 8)) {
+            barrier = true;
+            i += 8;
+            continue;
+        }
+        if (t[i] == '(' && !strncmp(t + i + 1, "ctx", 3) &&
+            (t[i + 4] == ',' || t[i + 4] == ')')) {
+            /* a call passing ctx: find the callee name before the '(' */
+            size_t e = i;
+            while (e > 0 && t[e - 1] == ' ')
+                e--;
+            size_t s = e;
+            while (s > 0 && r1_ident(t[s - 1]))
+                s--;
+            const bool via_pointer = s >= 2 && t[s - 1] == '>' && t[s - 2] == '-';
+            if (via_pointer || s == e ||
+                (!r1_safe_call(t + s, e - s) && !r1_exit_call(t + s, e - s)))
+                barrier = true;
+        }
+        i++;
+    }
+    if (barrier) {
+        if (g_r1_dirty) {
+            fprintf(out, "    ");
+            r1_put_stores(out, g_r1_dirty);
+            fprintf(out, "\n");
+        }
+        fwrite(t, 1, n, out);
+        g_r1_loaded = g_r1_dirty = 0;
+        return;
+    }
+    const u64 need = touched & ~g_r1_loaded;
+    if (need) {
+        char f[24], l[16];
+        fprintf(out, "    ");
+        for (u32 k = 0; k < R1_KEYS; k++) {
+            if (need >> k & 1u) {
+                r1_names(k, f, l);
+                fprintf(out, "%s = %s; ", l, f);
+            }
+        }
+        fprintf(out, "\n");
+    }
+    g_r1_loaded |= touched;
+    g_r1_dirty |= writes;
+    /* Every cached register touched here was loaded first, so storing one
+     * the instruction writes only later on stores its unchanged value. */
+    const u64 stores = g_r1_dirty;
+    for (size_t i = 0; i < n;) {
+        size_t len;
+        int k;
+        if (t[i] == '/' && t[i + 1] == '/') {
+            size_t s = i;
+            while (i < n && t[i] != '\n')
+                i++;
+            fwrite(t + s, 1, i - s, out);
+            continue;
+        }
+        if ((k = r1_match(t + i, &len)) >= 0) {
+            char f[24], l[16];
+            r1_names((u32)k, f, l);
+            fputs(l, out);
+            i += len;
+            continue;
+        }
+        if (r1_ident(t[i]) && (i == 0 || (!r1_ident(t[i - 1]) && t[i - 1] != '>'))) {
+            size_t s = i;
+            while (i < n && r1_ident(t[i]))
+                i++;
+            const size_t m = i - s;
+            if ((m == 6 && !strncmp(t + s, "return", 6)) ||
+                (m == 4 && !strncmp(t + s, "goto", 4)) ||
+                r1_exit_call(t + s, m)) {
+                i = s + r1_wrap_stmt(out, t + s, stores);
+                continue;
+            }
+            fwrite(t + s, 1, m, out);
+            continue;
+        }
+        fputc(t[i], out);
+        i++;
+    }
+}
+
+/* Emit instruction text captured in g_r1_tmp (from offset 0). */
+static void r1_flush_tmp(FILE* out) {
+    long n = ftell(g_r1_tmp);
+    if (n <= 0)
+        return;
+    if ((size_t)n + 1 > g_r1_cap) {
+        g_r1_cap = (size_t)n * 2 + 1;
+        g_r1_buf = realloc(g_r1_buf, g_r1_cap);
+    }
+    fseek(g_r1_tmp, 0, SEEK_SET);
+    size_t got = fread(g_r1_buf, 1, (size_t)n, g_r1_tmp);
+    g_r1_buf[got] = 0;
+    fseek(g_r1_tmp, 0, SEEK_SET);
+    r1_emit(out, g_r1_buf, got);
+}
+
+static FILE* r1_tmp(void) {
+    if (!g_r1_tmp) {
+        char path[512];
+        const char* dir = getenv("TEMP");
+        if (!dir) dir = getenv("TMPDIR");
+        if (!dir) dir = ".";
+        snprintf(path, sizeof path, "%s/dolrecomp_r1_%llx.tmp", dir,
+                 (unsigned long long)(uintptr_t)&g_r1_on);
+        g_r1_tmp = fopen(path, "w+b");
+    }
+    return g_r1_tmp;
+}
+
 /* "mem_readN(ctx, ea)" inside expr, rewritten to read through hb. */
 static void emit_hb_expr(FILE* out, const char* expr, const char* hb) {
     const char* at = hb ? strstr(expr, "mem_read") : NULL;
@@ -2484,6 +2769,15 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     fprintf(out, "void func_%08X(CPUState* ctx) {\n", func_addr);
     fprintf(out, "    uintptr_t hb1 = 0, hb2 = 0, hb13 = 0;\n");
     fprintf(out, "    (void)hb1; (void)hb2; (void)hb13;\n");
+    g_r1_on = r1_enabled_for(func_addr) && r1_tmp() != NULL;
+    g_r1_loaded = g_r1_dirty = 0;
+    if (g_r1_on) {
+        /* R1 register cache: set by a block before use, dead across labels */
+        fprintf(out, "    u32 gcr, gxer, gctr, glr");
+        for (u32 r = 0; r < 32; r++)
+            fprintf(out, ", gr%u", r);
+        fprintf(out, ";\n");
+    }
     fprintf(out, "    bool pq[32]; (void)pq;\n");
     /* Entry switch, cases only for addresses control can arrive at from
      * outside this function: the chunk start, block leaders, return addresses,
@@ -2532,6 +2826,7 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
     g_pq_known = 0;
     for (u32 i = 0; i < count; i++) {
         if (cfg.entry_points[i]) {
+            r1_block_end(out);
             fprintf(out, "label_%08X:\n", insts[i].address);
             g_sp_known = 0;
             fp_known = false;
@@ -2541,6 +2836,7 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
         if (cfg.loop_ends[i] != UINT32_MAX) {
             g_sp_known = 0;
             u32 continuation = insts[cfg.loop_ends[i]].address + 4u;
+            r1_block_end(out);
             fprintf(out, "    loop_%08X(ctx);\n", insts[i].address);
             if (continuation < func_end) {
                 fprintf(out, "    if (ctx->pc == 0x%08Xu) goto label_%08X;\n",
@@ -2558,9 +2854,11 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
             fprintf(out, "    ctx->downcount -= %u;\n", cfg.block_cycles[i]);
         bool emit_fp_guard = !(fp_known && !cfg.entry_points[i]);
         emit_instruction_with_range(
-            out, &insts[i], func_addr, func_end,
+            g_r1_on ? g_r1_tmp : out, &insts[i], func_addr, func_end,
             c_function_cfg_can_loop_directly(&cfg, insts, func_addr, i),
             has_local_returns, emit_fp_guard, false);
+        if (g_r1_on)
+            r1_flush_tmp(out);
         if (insts[i].embedded_data || fp_resets(insts[i].op)) {
             fp_known = false;
             g_pq_known = 0;
@@ -2575,6 +2873,8 @@ bool emit_function(FILE* out, const PPCInst* insts, u32 count, u32 func_addr) {
             hb_update(&insts[i]);
         }
     }
+    r1_block_end(out);
+    g_r1_on = false;
     g_sp_track = false;
     g_hb_track = false;
     g_sp_known = 0;

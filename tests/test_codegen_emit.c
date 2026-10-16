@@ -217,6 +217,45 @@ static int check_hot_switch_thinning(void) {
                             "\nvoid func_800040E0(", NULL, expect, 4, reject, 4);
 }
 
+/* R1 register caching cannot follow lmw/stmw (a loop over ctx->gpr[r]), so
+ * the cached r31 must be stored before stmw reads ctx and reloaded after lmw
+ * writes it. Without that, stmw saved a stale r31 and lmw's restored value was
+ * overwritten by the stale local at the block exit (cold boot jumped to 0). */
+static int check_r1_multiword_barrier(void) {
+    PPCInst body[5];
+    body[0] = ppc_decode(0x3BFF0001u, BASE + 0x1140); /* addi r31,r31,1  */
+    body[1] = ppc_decode(0xBFC10008u, BASE + 0x1144); /* stmw r30,8(r1)  */
+    body[2] = ppc_decode(0xBBC10008u, BASE + 0x1148); /* lmw  r30,8(r1)  */
+    body[3] = ppc_decode(0x3BFF0001u, BASE + 0x114C); /* addi r31,r31,1  */
+    body[4] = ppc_decode(0x4E800020u, BASE + 0x1150); /* blr             */
+
+    char* text = emit_to_text(body, 5, BASE + 0x1140);
+    if (!text)
+        return 0;
+    char* hot = text_slice(text, "\nvoid func_80004140(", NULL);
+    int ok = 0;
+    if (hot) {
+        const char* stmw = strstr(hot, "// 80004144: stmw");
+        const char* lmw = stmw ? strstr(stmw, "// 80004148: lmw") : NULL;
+        const char* add2 = lmw ? strstr(lmw, "// 8000414C: addi") : NULL;
+        const char* first_add = strstr(hot, "// 80004140: addi");
+        if (first_add && stmw && lmw && add2) {
+            /* gr31 is in use (R1 is on), stored between the first addi and
+             * stmw, and reloaded between lmw and the second addi */
+            const char* store = strstr(first_add, "ctx->gpr[31] = gr31;");
+            const char* reload = strstr(lmw, "gr31 = ctx->gpr[31];");
+            ok = store && store < stmw && reload && reload < add2;
+        }
+        if (!ok)
+            fputs(hot, stderr);
+    }
+    if (!ok)
+        fprintf(stderr, "r1 lmw/stmw barrier: r31 not stored/reloaded around them\n");
+    free(hot);
+    free(text);
+    return ok;
+}
+
 static const u32 opcode_raws[] = {
     0x1C64FFF9, 0x20850001, 0x38610010, 0x3084FFFF,
     0x34A5FFFF, 0x3CA01234, 0x2C03FFFF, 0x28038000,
@@ -317,7 +356,8 @@ int main(int argc, char** argv) {
     }
 
     if (!check_direct_call_shape() || !check_cold_companion_shape() ||
-        !check_hot_switch_thinning()) {
+        !check_hot_switch_thinning() ||
+        !check_r1_multiword_barrier()) {
         free(insts);
         if (out != stdout) fclose(out);
         return 1;
