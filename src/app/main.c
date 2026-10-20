@@ -60,7 +60,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "error: --map currently supports DOL input only\n");
         return 1;
     }
-    if (!titleless_mode && !database_titles_available()) {
+    /* The database only helps guess a mode when no usable title id is
+     * given; an explicit one keeps Wii mode either way. */
+    if (!titleless_mode && !database_titles_available() &&
+        !(title_id_arg && is_title_id_length_valid(title_id_arg) &&
+          is_title_id(title_id_arg))) {
         print_database_missing_notice();
         effective_gamecube_mode = 1;
         titleless_mode = 1;
