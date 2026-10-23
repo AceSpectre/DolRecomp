@@ -3310,8 +3310,19 @@ static void test_branches_cr_spr(CPUState* cpu) {
     for (size_t i = 0; i < sizeof(gekko_rw_sprs) / sizeof(gekko_rw_sprs[0]); i++) {
         u16 spr = gekko_rw_sprs[i];
         u32 value = 0xA5000000u ^ ((u32)spr << 8) ^ (u32)i;
+        if (spr == 923)
+            value &= ~2u; /* DMAL's DMA_T starts a transfer and self-clears */
         check_spr_roundtrip(cpu, spr, value);
     }
+
+    /* DMA_T runs the locked-cache transfer at once and reads back clear. */
+    cpu_reset(cpu);
+    cpu->gpr[10] = 0;
+    exec_raw(cpu, make_xfx(467, 10, 922), BASE);
+    cpu->gpr[10] = 0xE0000000u | 2u | (1u << 2); /* 1 line, lc -> mem */
+    exec_raw(cpu, make_xfx(467, 10, 923), BASE + 4);
+    exec_raw(cpu, make_xfx(339, 11, 923), BASE + 8);
+    check_eq(cpu->gpr[11], 0xE0000000u | (1u << 2), "mfspr DMAL reads DMA_T clear");
 
     cpu_reset(cpu);
     exec_raw(cpu, make_xfx(339, 10, 287), BASE);
